@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, CRON_DIR
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -465,7 +465,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        try:
+            from langfuse import get_client as _lf_get
+            _lf_get().flush()
+        except Exception:
+            pass
+        return True, output, final_response, None, result.get("messages", [])
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -489,7 +494,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {traceback.format_exc()}
 ```
 """
-        return False, output, "", error_msg
+        return False, output, "", error_msg, []
 
     finally:
         # Clean up injected env vars so they don't leak to other jobs
@@ -554,6 +559,32 @@ def tick(verbose: bool = True) -> int:
 
         executed = 0
         for job in due_jobs:
+            # ── Myah: fire run-started webhook ────────────────────────────
+            _webhook_url_s = os.getenv("MYAH_PLATFORM_WEBHOOK_URL", "")
+            _user_id_s = os.getenv("MYAH_USER_ID", "")
+            _token_s = os.getenv("MYAH_AGENT_TOKEN", os.getenv("API_SERVER_KEY", ""))
+            if _webhook_url_s and _user_id_s:
+                try:
+                    import urllib.request as _urs
+                    import json as _jsons
+                    _ps = _jsons.dumps({
+                        "user_id": _user_id_s,
+                        "job_id": job["id"],
+                        "job_name": job.get("name", job["id"]),
+                    }).encode()
+                    _rqs = _urs.Request(
+                        f"{_webhook_url_s}/api/v1/processes/webhook/run-started",
+                        data=_ps,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {_token_s}",
+                        },
+                        method="POST",
+                    )
+                    _urs.urlopen(_rqs, timeout=3)
+                except Exception:
+                    pass
+            # ────────────────────────────────────────────────────────────
             try:
                 # For recurring jobs (cron/interval), advance next_run_at to the
                 # next future occurrence BEFORE execution.  This way, if the
@@ -561,7 +592,7 @@ def tick(verbose: bool = True) -> int:
                 # One-shot jobs are left alone so they can retry on restart.
                 advance_next_run(job["id"])
 
-                success, output, final_response, error = run_job(job)
+                success, output, final_response, error, _run_messages = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -583,6 +614,37 @@ def tick(verbose: bool = True) -> int:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
                 mark_job_run(job["id"], success, error)
+
+                # ── Myah: real-time run-complete webhook ───────────────────────
+                _webhook_url = os.getenv("MYAH_PLATFORM_WEBHOOK_URL", "")
+                _user_id = os.getenv("MYAH_USER_ID", "")
+                _token = os.getenv("MYAH_AGENT_TOKEN", os.getenv("API_SERVER_KEY", ""))
+                if _webhook_url and _user_id:
+                    try:
+                        import urllib.request as _ur
+                        import json as _json
+                        _payload = _json.dumps({
+                            "user_id": _user_id,
+                            "job_id": job["id"],
+                            "job_name": job.get("name", job["id"]),
+                            "response": deliver_content if success else f"⚠ Job failed: {error}",
+                            "status": "ok" if success else "error",
+                            "ran_at": _hermes_now().isoformat(),
+                            "tool_calls_log": [m for m in _run_messages if m.get("role") in ("assistant", "tool") and (m.get("tool_calls") or m.get("role") == "tool")],
+                        }).encode()
+                        _req = _ur.Request(
+                            f"{_webhook_url}/api/v1/processes/webhook/run-complete",
+                            data=_payload,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {_token}",
+                            },
+                            method="POST",
+                        )
+                        _ur.urlopen(_req, timeout=5)
+                    except Exception as _we:
+                        logger.debug("Webhook delivery failed: %s", _we)
+                # ────────────────────────────────────────────────────────────
                 executed += 1
 
             except Exception as e:

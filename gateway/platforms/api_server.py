@@ -381,6 +381,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        step_callback=None,
+        status_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -402,18 +406,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
+        # Full observability — quiet_mode off so all tool activity is logged
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
-            quiet_mode=True,
-            verbose_logging=False,
+            quiet_mode=False,
+            verbose_logging=True,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback,
+            step_callback=step_callback,
+            status_callback=status_callback,
         )
         return agent
 
@@ -501,6 +510,9 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
+        # Stash metadata for Langfuse context propagation in _run_agent
+        self._last_request_metadata = body.get("metadata", {})
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -516,14 +528,40 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(name, preview, args):
-                """Inject tool progress into the SSE stream for Open WebUI."""
+            def _on_tool_progress(name: str, preview: str, args: dict) -> None:
+                """Push a lightweight progress event into the SSE stream."""
                 if name.startswith("_"):
                     return  # Skip internal events (_thinking)
-                from agent.display import get_tool_emoji
-                emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                _stream_q.put({
+                    "_event_type": "tool.event",
+                    "object": "tool.event",
+                    "type": "progress",
+                    "name": name,
+                    "preview": (preview or "")[:200],
+                })
+
+            def _on_tool_start(call_id: str, name: str, args: dict) -> None:
+                """Push a structured tool-start event into the SSE stream."""
+                _stream_q.put({
+                    "_event_type": "tool.event",
+                    "object": "tool.event",
+                    "type": "start",
+                    "call_id": call_id,
+                    "name": name,
+                    "args": args,
+                })
+
+            def _on_tool_complete(call_id: str, name: str, args: dict, result: Any) -> None:
+                """Push a structured tool-complete event into the SSE stream."""
+                _stream_q.put({
+                    "_event_type": "tool.event",
+                    "object": "tool.event",
+                    "type": "complete",
+                    "call_id": call_id,
+                    "name": name,
+                    "args": args,
+                    "result": result,
+                })
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -535,6 +573,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                tool_start_callback=_on_tool_start,
+                tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
             ))
 
@@ -645,6 +685,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
+                                if isinstance(delta, dict) and delta.get("_event_type") == "tool.event":
+                                    event_data = {k: v for k, v in delta.items() if k != "_event_type"}
+                                    await response.write(f"data: {json.dumps(event_data, default=str)}\n\n".encode())
+                                    continue
                                 content_chunk = {
                                     "id": completion_id, "object": "chat.completion.chunk",
                                     "created": created, "model": model,
@@ -659,6 +703,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is None:  # End of stream sentinel
                     break
 
+                # ── Myah: structured tool.event — emit as a separate SSE line ──
+                if isinstance(delta, dict) and delta.get("_event_type") == "tool.event":
+                    event_data = {k: v for k, v in delta.items() if k != "_event_type"}
+                    await response.write(f"data: {json.dumps(event_data, default=str)}\n\n".encode())
+                    continue
+                # ─────────────────────────────────────────────────────────────────
+
                 content_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
@@ -668,11 +719,43 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception:
                 pass
+
+            # ── Myah: emit render_* tool_calls_log in final chunk ─────────────
+            if isinstance(result, dict):
+                _all_msgs = result.get("messages", [])
+                _render_tools = [
+                    m for m in _all_msgs
+                    if (m.get("role") == "assistant" and any(
+                        tc.get("function", {}).get("name", "").startswith("render_")
+                        for tc in (m.get("tool_calls") or [])
+                    )) or (
+                        m.get("role") == "tool"
+                        and any(
+                            prev.get("role") == "assistant"
+                            and any(
+                                tc.get("id") == m.get("tool_call_id")
+                                and tc.get("function", {}).get("name", "").startswith("render_")
+                                for tc in (prev.get("tool_calls") or [])
+                            )
+                            for prev in _all_msgs
+                        )
+                    )
+                ]
+                if _render_tools:
+                    _tc_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                        "tool_calls_log": _render_tools,
+                    }
+                    await response.write(f"data: {json.dumps(_tc_chunk, default=str)}\n\n".encode())
+            # ─────────────────────────────────────────────────────────────────
 
             # Finish chunk
             finish_chunk = {
@@ -916,16 +999,28 @@ class APIServerAdapter(BasePlatformAdapter):
     _CRON_AVAILABLE = False
     try:
         from cron.jobs import (
-            list_jobs as _cron_list,
-            get_job as _cron_get,
-            create_job as _cron_create,
-            update_job as _cron_update,
-            remove_job as _cron_remove,
-            pause_job as _cron_pause,
-            resume_job as _cron_resume,
-            trigger_job as _cron_trigger,
+            list_jobs as _cron_list_fn,
+            get_job as _cron_get_fn,
+            create_job as _cron_create_fn,
+            update_job as _cron_update_fn,
+            remove_job as _cron_remove_fn,
+            pause_job as _cron_pause_fn,
+            resume_job as _cron_resume_fn,
+            trigger_job as _cron_trigger_fn,
         )
         _CRON_AVAILABLE = True
+        # Wrap in staticmethod so Python's descriptor protocol does not inject
+        # `self` as a positional arg when called via instance (e.g. self._cron_list(...)).
+        # Without this, every call raises:
+        #   "list_jobs() got multiple values for argument 'include_disabled'"
+        _cron_list = staticmethod(_cron_list_fn)
+        _cron_get = staticmethod(_cron_get_fn)
+        _cron_create = staticmethod(_cron_create_fn)
+        _cron_update = staticmethod(_cron_update_fn)
+        _cron_remove = staticmethod(_cron_remove_fn)
+        _cron_pause = staticmethod(_cron_pause_fn)
+        _cron_resume = staticmethod(_cron_resume_fn)
+        _cron_trigger = staticmethod(_cron_trigger_fn)
     except ImportError:
         pass
 
@@ -1207,6 +1302,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        step_callback=None,
+        status_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -1219,8 +1318,28 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        Langfuse context is propagated from the calling async context into the
+        thread executor so all LLM + tool spans are nested under the request trace.
         """
+        import contextvars as _cv
+
         loop = asyncio.get_event_loop()
+
+        _req_metadata = getattr(self, "_last_request_metadata", {}) or {}
+
+        try:
+            from langfuse import propagate_attributes as _lf_prop, get_client as _lf_get
+            _lf_ctx = _lf_prop(
+                session_id=_req_metadata.get("session_id") or None,
+                user_id=_req_metadata.get("user_id") or None,
+                tags=["hermes", "myah"],
+                metadata={"chat_id": _req_metadata.get("chat_id", "")},
+            )
+        except Exception:
+            import contextlib
+            _lf_ctx = contextlib.nullcontext()
+            _lf_get = None
 
         def _run():
             agent = self._create_agent(
@@ -1228,10 +1347,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                step_callback=step_callback,
+                status_callback=status_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
-            result = agent.run_conversation(
+
+            try:
+                from langfuse import observe as _lf_obs
+                _conv_fn = _lf_obs(as_type="agent", name="hermes-conversation")(agent.run_conversation)
+            except Exception:
+                _conv_fn = agent.run_conversation
+
+            result = _conv_fn(
                 user_message=user_message,
                 conversation_history=conversation_history,
             )
@@ -1240,9 +1370,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
             }
+            if _lf_get is not None:
+                try:
+                    _lf_get().flush()
+                except Exception:
+                    pass
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        with _lf_ctx:
+            _ctx_snapshot = _cv.copy_context()
+            return await loop.run_in_executor(None, lambda: _ctx_snapshot.run(_run))
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

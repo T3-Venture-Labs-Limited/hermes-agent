@@ -40,7 +40,7 @@ import weakref
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
-from openai import OpenAI
+from langfuse.openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path

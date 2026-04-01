@@ -330,7 +330,7 @@ CRONJOB_SCHEMA = {
     "name": "cronjob",
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
-Use action='create' to schedule a new job from a prompt or one or more skills.
+Use action='create' to schedule a new job. REQUIRED: 'prompt' (full task instruction) and 'schedule' (e.g. '10m', 'every 1h', '0 9 * * *'). Both must always be provided.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
@@ -356,11 +356,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "prompt": {
                 "type": "string",
-                "description": "For create: the full self-contained prompt. If skill or skills are also provided, this becomes the task instruction paired with those skills."
+                "description": "REQUIRED for create. The full self-contained task prompt the cron agent will execute. Must describe exactly what to do and what to include in the final response."
             },
             "schedule": {
                 "type": "string",
-                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp"
+                "description": "REQUIRED for create. Schedule: '10m', 'every 30m', 'every 2h', '0 9 * * *', etc."
             },
             "name": {
                 "type": "string",

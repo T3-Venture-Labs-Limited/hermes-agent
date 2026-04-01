@@ -64,6 +64,8 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Generative UI — render interactive components inline in chat
+    "render_ui", "render_custom",
 ]
 
 
@@ -281,6 +283,8 @@ TOOLSETS = {
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
             # Honcho memory tools (gated on honcho being active via check_fn)
             "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
+            # Generative UI — render interactive components inline in chat
+            "render_ui", "render_custom",
         ],
         "includes": []
     },
