@@ -563,6 +563,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": result,
                 })
 
+            def _on_step(iteration: int, prev_tools: list) -> None:
+                """Log each agent loop iteration to Langfuse as a point-in-time event."""
+                logger.debug("agent:step iteration=%d tools=%s", iteration, prev_tools)
+                try:
+                    from langfuse import get_client as _lf_get
+                    _lf_get().create_event(
+                        name="agent:step",
+                        input={"iteration": iteration, "tools_called": prev_tools},
+                    )
+                except Exception:
+                    pass
+
+            def _on_status(event_type: str, message: str) -> None:
+                """Log agent lifecycle and context-pressure events to Langfuse."""
+                logger.debug("agent:status type=%s message=%s", event_type, message[:120] if message else "")
+                try:
+                    from langfuse import get_client as _lf_get
+                    _lf_get().create_event(
+                        name=f"agent:{event_type}",
+                        input={"message": message},
+                        level="DEFAULT" if event_type == "lifecycle" else "WARNING",
+                    )
+                except Exception:
+                    pass
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -575,6 +600,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                step_callback=_on_step,
+                status_callback=_on_status,
                 agent_ref=agent_ref,
             ))
 
