@@ -210,6 +210,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "render_ui": {
+        "description": "Generative UI — render interactive components inline in chat (dashboards, forms, approvals, tables)",
+        "tools": ["render_ui", "render_custom"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
