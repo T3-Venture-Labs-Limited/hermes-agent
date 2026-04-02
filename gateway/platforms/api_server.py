@@ -597,7 +597,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._last_request_metadata.get(k)
         }
         if _corr:
-            logger.bind(**_corr).debug('Chat completion request received')
+            # Use Loguru directly — stdlib logger.bind() does not exist
+            from loguru import logger as _llogger
+            _llogger.bind(**_corr).debug('Chat completion request received')
 
         # Resolve a persistent Honcho manager for this chat session so the
         # Honcho peer/session objects are reused across requests.  Without this
