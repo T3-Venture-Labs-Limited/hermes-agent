@@ -51,7 +51,7 @@ RENDER_UI_SCHEMA = {
                     'kpi_dashboard → {metrics, chart, table}; '
                     'approval_card → {title, action, rationale, risks, options}; '
                     'triage_table → {items, actions}; '
-                    'form_wizard → {steps, currentStep}; '
+                    'form_wizard → {steps: [{label, fields: [{name, label, type, hint}]}], currentStep: 0} — currentStep is 0-indexed, always start with currentStep: 0; '
                     'env_vars_form → {service, description, fields}; '
                     'comparison_view → {options}; '
                     'activity_feed → {entries, actions}; '
