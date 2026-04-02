@@ -575,6 +575,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Stash metadata for Langfuse context propagation in _run_agent
         self._last_request_metadata = body.get("metadata", {})
+        # Bind correlation ID to all log lines for this request
+        _corr = {
+            k: self._last_request_metadata.get(k, '')
+            for k in ('message_id', 'chat_id', 'user_id')
+            if self._last_request_metadata.get(k)
+        }
+        if _corr:
+            logger.bind(**_corr).debug('Chat completion request received')
 
         # Resolve a persistent Honcho manager for this chat session so the
         # Honcho peer/session objects are reused across requests.  Without this
@@ -1449,7 +1457,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=_req_metadata.get("session_id") or None,
                 user_id=_req_metadata.get("user_id") or None,
                 tags=["hermes", "myah"],
-                metadata={"chat_id": _req_metadata.get("chat_id", "")},
+                metadata={
+                    "chat_id": _req_metadata.get("chat_id", ""),
+                    "message_id": _req_metadata.get("message_id", ""),
+                },
             )
         except Exception:
             import contextlib
