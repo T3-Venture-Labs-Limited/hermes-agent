@@ -300,6 +300,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Persistent Honcho session managers, keyed by chat_id.
+        # Reusing the same manager across requests avoids 2-3 blocking Honcho
+        # API round-trips (peer lookup + session.context()) on every message,
+        # which was causing 60-70s latency on simple exchanges.
+        self._honcho_managers: Dict[str, Any] = {}
+        self._honcho_configs: Dict[str, Any] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -372,6 +378,44 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
+    # Honcho manager pool
+    # ------------------------------------------------------------------
+
+    def _get_or_create_honcho_manager(self, chat_id: str):
+        """Return a persistent (manager, config) pair for this chat session.
+
+        Mirrors gateway.run._get_or_create_gateway_honcho so Honcho peer and
+        session objects are created once per chat and reused across requests.
+        Without this, every message triggers 2-3 blocking Honcho API calls
+        (peer lookup + session.context) before the agent starts thinking.
+        """
+        if chat_id in self._honcho_managers:
+            return self._honcho_managers[chat_id], self._honcho_configs.get(chat_id)
+
+        try:
+            from honcho_integration.client import HonchoClientConfig, get_honcho_client
+            from honcho_integration.session import HonchoSessionManager
+
+            hcfg = HonchoClientConfig.from_global_config()
+            if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+                logger.debug("Honcho disabled or not configured — skipping manager pool for %s", chat_id)
+                return None, hcfg
+
+            client = get_honcho_client(hcfg)
+            manager = HonchoSessionManager(
+                honcho=client,
+                config=hcfg,
+                context_tokens=hcfg.context_tokens,
+            )
+            self._honcho_managers[chat_id] = manager
+            self._honcho_configs[chat_id] = hcfg
+            logger.debug("Honcho manager created for chat_id=%s", chat_id)
+            return manager, hcfg
+        except Exception as e:
+            logger.debug("Honcho manager init failed for chat_id=%s: %s", chat_id, e)
+            return None, None
+
+    # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
 
@@ -379,6 +423,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        honcho_manager: Any = None,
+        honcho_config: Any = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -393,6 +439,10 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        honcho_manager/honcho_config should come from _get_or_create_honcho_manager
+        so that Honcho peer and session objects are reused across requests rather
+        than re-initialised (and their caches discarded) on every message.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
@@ -417,6 +467,8 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            honcho_manager=honcho_manager,
+            honcho_config=honcho_config,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -513,6 +565,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # Stash metadata for Langfuse context propagation in _run_agent
         self._last_request_metadata = body.get("metadata", {})
 
+        # Resolve a persistent Honcho manager for this chat session so the
+        # Honcho peer/session objects are reused across requests.  Without this
+        # each message triggers 3 blocking Honcho API round-trips before the
+        # agent starts thinking, adding ~60-70s of latency per message.
+        _chat_id = self._last_request_metadata.get("chat_id", "") or session_id
+        _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_chat_id)
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -596,6 +655,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                honcho_manager=_honcho_manager,
+                honcho_config=_honcho_config,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
@@ -617,6 +678,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                honcho_manager=_honcho_manager,
+                honcho_config=_honcho_config,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -903,12 +966,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # Run the agent (with Idempotency-Key support)
         session_id = str(uuid.uuid4())
 
+        # Resolve persistent Honcho manager — use conversation/previous_response_id
+        # as the stable key so the same session gets the same manager across turns.
+        _resp_chat_id = (
+            body.get("metadata", {}).get("chat_id")
+            or conversation
+            or previous_response_id
+            or session_id
+        )
+        _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_resp_chat_id)
+
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                honcho_manager=_honcho_manager,
+                honcho_config=_honcho_config,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1327,6 +1402,8 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        honcho_manager: Any = None,
+        honcho_config: Any = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -1372,6 +1449,8 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                honcho_manager=honcho_manager,
+                honcho_config=honcho_config,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
