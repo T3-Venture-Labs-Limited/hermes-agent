@@ -575,6 +575,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Stash metadata for Langfuse context propagation in _run_agent
         self._last_request_metadata = body.get("metadata", {})
+
+        # ── Myah: extract OTEL trace context from W3C traceparent header ──────────
+        # The platform backend (with OTEL+HTTPX) injects this automatically.
+        # Format: 00-{trace_id}-{parent_span_id}-{flags}
+        # We extract trace_id for log correlation and Langfuse metadata.
+        _otel_trace_id = ''
+        _traceparent = request.headers.get('traceparent', '')
+        if _traceparent:
+            _tp_parts = _traceparent.split('-')
+            if len(_tp_parts) >= 3:
+                _otel_trace_id = _tp_parts[1]
+        # ─────────────────────────────────────────────────────────────────────────
+
+        if _otel_trace_id:
+            logger.debug('Request trace context received', extra={'otel_trace_id': _otel_trace_id})
         # Bind correlation ID to all log lines for this request
         _corr = {
             k: self._last_request_metadata.get(k, '')
@@ -683,6 +698,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 step_callback=_on_step,
                 status_callback=_on_status,
                 agent_ref=agent_ref,
+                otel_trace_id=_otel_trace_id,
             ))
 
             return await self._write_sse_chat_completion(
@@ -699,6 +715,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 honcho_manager=_honcho_manager,
                 honcho_config=_honcho_config,
+                otel_trace_id=_otel_trace_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1430,6 +1447,7 @@ class APIServerAdapter(BasePlatformAdapter):
         step_callback=None,
         status_callback=None,
         agent_ref: Optional[list] = None,
+        otel_trace_id: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1460,6 +1478,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 metadata={
                     "chat_id": _req_metadata.get("chat_id", ""),
                     "message_id": _req_metadata.get("message_id", ""),
+                    # Link from Langfuse → Grafana Tempo: copy the OTEL trace_id into
+                    # Langfuse metadata so you can search Tempo from a Langfuse trace.
+                    "otel_trace_id": otel_trace_id,
                 },
             )
         except Exception:
@@ -1506,6 +1527,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         with _lf_ctx:
+            # Log the OTEL trace ID for Grafana→Langfuse navigation.
+            # The Langfuse trace ID is NOT available here — it's created inside _run()
+            # when the @observe decorator activates, which runs in the thread executor.
+            # The reverse link (Langfuse→Grafana) works via otel_trace_id in Langfuse
+            # metadata above — from a Langfuse trace, look up otel_trace_id to find
+            # the corresponding Grafana Tempo trace.
+            if otel_trace_id:
+                logger.debug('Agent conversation starting', extra={'otel_trace_id': otel_trace_id})
+
             _ctx_snapshot = _cv.copy_context()
             return await loop.run_in_executor(None, lambda: _ctx_snapshot.run(_run))
 
