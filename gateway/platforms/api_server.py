@@ -33,6 +33,17 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+# ── Myah: structured logging setup ─────────────────────────────────────────
+# Must run before any Hermes module imports their own loggers.
+try:
+    from logging_setup import setup_logging as _setup_logging, setup_sentry as _setup_sentry
+    _setup_logging()
+    _setup_sentry()
+except Exception as _e:
+    import logging as _logging
+    _logging.warning(f'logging_setup failed, using stdlib fallback: {_e}')
+# ────────────────────────────────────────────────────────────────────────────
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
