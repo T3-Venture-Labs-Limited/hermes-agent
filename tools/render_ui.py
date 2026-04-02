@@ -1,0 +1,138 @@
+"""Render UI Tool — generative UI components rendered inline in chat.
+
+Emits a structured declarative payload that the frontend translates into
+interactive visual components (dashboards, forms, approval cards, tables,
+activity feeds, etc.).  Two variants are registered:
+
+  render_ui     — named composition templates with typed data bindings
+  render_custom — freeform block arrays for one-off layouts
+
+The agent should prefer render_ui when one of the known compositions fits;
+fall back to render_custom when the desired layout doesn't map to any template.
+"""
+
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# ── Schema definitions ────────────────────────────────────────────────────────
+
+RENDER_UI_SCHEMA = {
+    'name': 'render_ui',
+    'description': (
+        'Render an interactive UI component inline in the chat. '
+        'Use a named composition template (render_ui) for common layouts, '
+        'or render_custom for freeform block arrays. '
+        'The component appears visually in the conversation immediately.\n\n'
+        'Always call render_ui when showing dashboards, approval requests, '
+        'structured data tables, multi-step forms, or any content that would '
+        'benefit from a richer visual presentation than plain text.'
+    ),
+    'parameters': {
+        'type': 'object',
+        'properties': {
+            'composition': {
+                'type': 'string',
+                'description': (
+                    'The composition template to render. '
+                    'Known compositions: kpi_dashboard, approval_card, triage_table, '
+                    'form_wizard, env_vars_form, comparison_view, activity_feed, email_reply. '
+                    'Custom compositions may be defined by skills.'
+                ),
+            },
+            'data': {
+                'type': 'object',
+                'description': (
+                    'Template data used to populate the composition. '
+                    'The keys depend on the chosen composition. '
+                    'Examples: '
+                    'kpi_dashboard → {metrics, chart, table}; '
+                    'approval_card → {title, action, rationale, risks, options}; '
+                    'triage_table → {items, actions}; '
+                    'form_wizard → {steps, currentStep}; '
+                    'env_vars_form → {service, description, fields}; '
+                    'comparison_view → {options}; '
+                    'activity_feed → {entries, actions}; '
+                    'email_reply → {subject, from, from_email, original_message, draft_reply, reply_actions}.'
+                ),
+            },
+            'title': {
+                'type': 'string',
+                'description': 'Optional title shown above the rendered component.',
+            },
+        },
+        'required': ['composition', 'data'],
+    },
+}
+
+RENDER_CUSTOM_SCHEMA = {
+    'name': 'render_custom',
+    'description': (
+        'Render a freeform UI component from an explicit block array. '
+        'Use when no named composition fits the desired layout. '
+        'For standard layouts prefer render_ui instead.'
+    ),
+    'parameters': {
+        'type': 'object',
+        'properties': {
+            'blocks': {
+                'type': 'array',
+                'description': (
+                    'Array of block objects. '
+                    'Supported block types: text, alert, badge, table, form, '
+                    'actions, card, columns, entries, metrics, chart, stepper, '
+                    'avatar, divider.'
+                ),
+                'items': {'type': 'object'},
+            },
+            'title': {
+                'type': 'string',
+                'description': 'Optional title shown above the component.',
+            },
+        },
+        'required': ['blocks'],
+    },
+}
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+def _render_ui_handler(args: dict, **kw) -> str:
+    """Emit a [RENDER_UI]…[/RENDER_UI] sentinel that the platform middleware
+    intercepts and converts into a declarative UI state snapshot.
+
+    Returning the raw args as JSON inside the sentinel lets the middleware
+    call expand_composition() on the platform side where the full composition
+    registry lives.
+    """
+    payload = json.dumps(args, ensure_ascii=False)
+    return f'[RENDER_UI]{payload}[/RENDER_UI]'
+
+
+def _render_custom_handler(args: dict, **kw) -> str:
+    """Emit a [RENDER_UI] sentinel for a freeform block array."""
+    payload = json.dumps(args, ensure_ascii=False)
+    return f'[RENDER_UI]{payload}[/RENDER_UI]'
+
+
+# ── Registry ──────────────────────────────────────────────────────────────────
+
+from tools.registry import registry  # noqa: E402 — must come after function defs
+
+registry.register(
+    name='render_ui',
+    toolset='render_ui',
+    schema=RENDER_UI_SCHEMA,
+    handler=_render_ui_handler,
+    emoji='🎨',
+)
+
+registry.register(
+    name='render_custom',
+    toolset='render_ui',
+    schema=RENDER_CUSTOM_SCHEMA,
+    handler=_render_custom_handler,
+    emoji='🧩',
+)
