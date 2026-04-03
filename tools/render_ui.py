@@ -28,7 +28,11 @@ RENDER_UI_SCHEMA = {
         'The component appears visually in the conversation immediately.\n\n'
         'Always call render_ui when showing dashboards, approval requests, '
         'structured data tables, multi-step forms, or any content that would '
-        'benefit from a richer visual presentation than plain text.'
+        'benefit from a richer visual presentation than plain text.\n\n'
+        'Use the optional componentId to enable in-place updates for multi-step '
+        'components (wizards, multi-step forms). If componentId is provided and '
+        'a component with that ID is already rendered, the frontend updates it '
+        'in-place rather than creating a new component.'
     ),
     'parameters': {
         'type': 'object',
@@ -61,6 +65,16 @@ RENDER_UI_SCHEMA = {
             'title': {
                 'type': 'string',
                 'description': 'Optional title shown above the rendered component.',
+            },
+            'componentId': {
+                'type': 'string',
+                'description': (
+                    'Optional stable identifier for multi-step components. '
+                    'If provided and a component with this ID is already rendered, '
+                    'the frontend will update it in-place. If not provided or new, '
+                    'a fresh component is rendered. Use for wizards, multi-step forms, '
+                    'or any component that progresses through states.'
+                ),
             },
         },
         'required': ['composition', 'data'],
