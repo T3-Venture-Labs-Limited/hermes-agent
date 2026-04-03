@@ -33,7 +33,10 @@ AgentMail gives the agent its own identity and inbox.
 - Go to https://console.agentmail.to
 - Create an account and generate an API key (starts with `am_`)
 
-### 2. Configure MCP Server
+### 2. Configure via env_vars_form
+When prompted by the setup wizard, enter your AgentMail API key. It will be stored securely and injected into the MCP server environment.
+
+### 3. Configure MCP Server
 Add to `~/.hermes/config.yaml` (paste your actual key — MCP env vars are not expanded from .env):
 ```yaml
 mcp_servers:
@@ -44,7 +47,7 @@ mcp_servers:
       AGENTMAIL_API_KEY: "am_your_key_here"
 ```
 
-### 3. Restart Hermes
+### 4. Restart Hermes
 ```bash
 hermes
 ```
@@ -65,6 +68,69 @@ All 11 AgentMail tools are now available automatically.
 | `forward_message` | Forward an email |
 | `update_message` | Update message labels/status |
 | `get_attachment` | Download an email attachment |
+
+## Generative UI Compositions
+
+The agent can render email data using A2UI composition files. These compositions define how email data is displayed as interactive UI elements.
+
+### email_thread_list
+Renders a list of email threads with available actions.
+
+```yaml
+name: email_thread_list
+template:
+  blocks:
+    - type: entries
+      items: '$threads'
+    - type: actions
+      items: '$actions'
+```
+
+**Available actions per thread:**
+
+| Action | Description |
+|--------|-------------|
+| `mark_read` | Mark thread as read |
+| `mark_unread` | Mark thread as unread |
+| `archive` | Archive the thread |
+| `send_reply` | Open reply composition |
+| `Discard` | Dismiss / close thread |
+
+### email_reply_compose
+Renders a reply form for composing an email response.
+
+```yaml
+name: email_reply_compose
+template:
+  blocks:
+    - type: form
+      id: email_reply_form
+      fields:
+        - name: subject
+          label: Subject
+          type: text
+          readonly: true
+        - name: to
+          label: To
+          type: text
+          readonly: true
+        - name: body
+          label: Message
+          type: textarea
+          hint: Write your reply...
+      submitLabel: Send Reply
+      submitAction: send_reply
+```
+
+### Reply Flow
+
+1. Agent calls `list_threads` to retrieve inbox threads
+2. Agent renders `email_thread_list` composition with thread entries and available actions
+3. User selects an action (e.g., `send_reply`)
+4. Agent calls `get_thread` to fetch full thread context
+5. Agent renders `email_reply_compose` with pre-filled subject/to fields
+6. User composes reply in the `body` textarea field
+7. On submit, agent calls `reply_to_message` with the composed reply
 
 ## Procedure
 
