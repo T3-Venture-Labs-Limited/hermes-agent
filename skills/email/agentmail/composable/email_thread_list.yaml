@@ -1,0 +1,7 @@
+name: email_thread_list
+template:
+  blocks:
+    - type: entries
+      items: '$threads'
+    - type: actions
+      items: '$actions'

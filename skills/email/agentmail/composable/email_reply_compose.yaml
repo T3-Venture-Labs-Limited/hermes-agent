@@ -1,0 +1,20 @@
+name: email_reply_compose
+template:
+  blocks:
+    - type: form
+      id: email_reply_form
+      fields:
+        - name: subject
+          label: Subject
+          type: text
+          readonly: true
+        - name: to
+          label: To
+          type: text
+          readonly: true
+        - name: body
+          label: Message
+          type: textarea
+          hint: Write your reply...
+      submitLabel: Send Reply
+      submitAction: send_reply
