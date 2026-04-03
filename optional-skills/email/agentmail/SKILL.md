@@ -4,7 +4,7 @@ description: Give the agent its own dedicated email inbox via AgentMail. Send, r
 version: 1.0.0
 metadata:
   hermes:
-    tags: [email, communication, agentmail, mcp]
+    tags: [email, communication, agentmail, generative-ui]
     category: email
 ---
 
