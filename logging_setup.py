@@ -20,6 +20,30 @@ from loguru import logger
 
 
 _SERVICE = 'myah-agent'
+_LOG_RECORD_RESERVED_KEYS = {
+    'name',
+    'msg',
+    'args',
+    'levelname',
+    'levelno',
+    'pathname',
+    'filename',
+    'module',
+    'exc_info',
+    'exc_text',
+    'stack_info',
+    'lineno',
+    'funcName',
+    'created',
+    'msecs',
+    'relativeCreated',
+    'thread',
+    'threadName',
+    'processName',
+    'process',
+    'message',
+    'asctime',
+}
 
 
 def _json_sink(message) -> None:
@@ -40,6 +64,9 @@ def _json_sink(message) -> None:
         extras = {k: v for k, v in record['extra'].items() if not k.startswith('_')}
         if extras:
             log_entry['extra'] = extras
+            for key in ('otel_trace_id', 'trace_id', 'message_id', 'chat_id', 'langfuse_trace_id'):
+                if key in extras:
+                    log_entry[key] = extras[key]
 
     if record['exception'] is not None:
         exc = record['exception']
@@ -65,7 +92,12 @@ class _InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _LOG_RECORD_RESERVED_KEYS and not key.startswith('_')
+        }
+        logger.opt(depth=depth, exception=record.exc_info).bind(**extras).log(level, record.getMessage())
 
 
 def setup_logging(level: str = 'DEBUG') -> None:

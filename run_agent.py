@@ -24,6 +24,7 @@ import atexit
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import json
@@ -5601,10 +5602,11 @@ class AIAgent:
 
         try:
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
+            _ctx_snapshot = contextvars.copy_context()
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    f = executor.submit(_ctx_snapshot.copy().run, _run_tool, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete (exceptions are captured inside _run_tool)

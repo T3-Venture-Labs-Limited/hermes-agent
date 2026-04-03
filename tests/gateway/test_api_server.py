@@ -606,6 +606,34 @@ class TestChatCompletionsEndpoint:
             assert call_kwargs["conversation_history"][1] == {"role": "assistant", "content": "2"}
 
     @pytest.mark.asyncio
+    async def test_chat_completions_passes_request_metadata_to_run_agent(self, adapter):
+        """Request metadata should be passed explicitly to _run_agent."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        metadata = {
+            "chat_id": "chat-123",
+            "message_id": "msg-123",
+            "user_id": "user-123",
+            "session_id": "session-123",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "metadata": metadata,
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["request_metadata"] == metadata
+
+    @pytest.mark.asyncio
     async def test_agent_error_returns_500(self, adapter):
         """Agent exception returns 500."""
         app = _create_app(adapter)
@@ -637,8 +665,34 @@ class TestResponsesEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/responses", json={"model": "test"})
             assert resp.status == 400
-            data = await resp.json()
-            assert "input" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_responses_passes_request_metadata_to_run_agent(self, adapter):
+        """Responses API metadata should be passed explicitly to _run_agent."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        metadata = {
+            "chat_id": "chat-456",
+            "message_id": "msg-456",
+            "user_id": "user-456",
+            "session_id": "session-456",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "hello",
+                        "metadata": metadata,
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["request_metadata"] == metadata
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):

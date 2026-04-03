@@ -573,8 +573,7 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
-        # Stash metadata for Langfuse context propagation in _run_agent
-        self._last_request_metadata = body.get("metadata", {})
+        _request_metadata = body.get("metadata", {})
 
         # ── Myah: extract OTEL trace context from W3C traceparent header ──────────
         # The platform backend (with OTEL+HTTPX) injects this automatically.
@@ -592,9 +591,9 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug('Request trace context received', extra={'otel_trace_id': _otel_trace_id})
         # Bind correlation ID to all log lines for this request
         _corr = {
-            k: self._last_request_metadata.get(k, '')
+            k: _request_metadata.get(k, '')
             for k in ('message_id', 'chat_id', 'user_id')
-            if self._last_request_metadata.get(k)
+            if _request_metadata.get(k)
         }
         if _corr:
             # Use Loguru directly — stdlib logger.bind() does not exist
@@ -605,7 +604,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Honcho peer/session objects are reused across requests.  Without this
         # each message triggers 3 blocking Honcho API round-trips before the
         # agent starts thinking, adding ~60-70s of latency per message.
-        _chat_id = self._last_request_metadata.get("chat_id", "") or session_id
+        _chat_id = _request_metadata.get("chat_id", "") or session_id
         _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_chat_id)
 
         if stream:
@@ -701,6 +700,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status_callback=_on_status,
                 agent_ref=agent_ref,
                 otel_trace_id=_otel_trace_id,
+                request_metadata=_request_metadata,
             ))
 
             return await self._write_sse_chat_completion(
@@ -718,6 +718,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 honcho_manager=_honcho_manager,
                 honcho_config=_honcho_config,
                 otel_trace_id=_otel_trace_id,
+                request_metadata=_request_metadata,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1022,6 +1023,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 honcho_manager=_honcho_manager,
                 honcho_config=_honcho_config,
+                request_metadata=body.get("metadata", {}),
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1450,6 +1452,7 @@ class APIServerAdapter(BasePlatformAdapter):
         status_callback=None,
         agent_ref: Optional[list] = None,
         otel_trace_id: str = "",
+        request_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1469,7 +1472,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         loop = asyncio.get_event_loop()
 
-        _req_metadata = getattr(self, "_last_request_metadata", {}) or {}
+        _req_metadata = request_metadata or {}
 
         try:
             from langfuse import propagate_attributes as _lf_prop, get_client as _lf_get

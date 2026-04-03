@@ -6,6 +6,7 @@ are made.
 """
 
 import json
+import contextvars
 import logging
 import re
 import uuid
@@ -1210,6 +1211,26 @@ class TestConcurrentToolExecution:
         assert len(messages) == 2
         assert "cancelled" in messages[0]["content"].lower() or "skipped" in messages[0]["content"].lower()
         assert "cancelled" in messages[1]["content"].lower() or "skipped" in messages[1]["content"].lower()
+
+    def test_concurrent_propagates_contextvars_into_worker_threads(self, agent):
+        """Concurrent tool workers should inherit contextvars from caller context."""
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"two"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        request_id = contextvars.ContextVar("request_id", default="")
+        request_id.set("req-ctx-123")
+
+        def fake_handle(name, args, task_id, **kwargs):
+            return request_id.get("")
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert len(messages) == 2
+        assert messages[0]["content"] == "req-ctx-123"
+        assert messages[1]["content"] == "req-ctx-123"
 
     def test_concurrent_truncates_large_results(self, agent):
         """Concurrent path should truncate results over 100k chars."""
