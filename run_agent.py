@@ -4616,23 +4616,39 @@ class AIAgent:
         return False
 
     @staticmethod
+    def _detect_image_mime(raw_bytes: bytes) -> str:
+        """Detect the actual MIME type from image magic bytes, ignoring declared type."""
+        if raw_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+            return "image/png"
+        if raw_bytes[:3] == b'\xff\xd8\xff':
+            return "image/jpeg"
+        if raw_bytes[:6] in (b'GIF87a', b'GIF89a'):
+            return "image/gif"
+        if raw_bytes[:4] == b'RIFF' and raw_bytes[8:12] == b'WEBP':
+            return "image/webp"
+        return "image/png"  # Safe default — Anthropic accepts PNG
+
+    @staticmethod
     def _materialize_data_url_for_vision(image_url: str) -> tuple[str, Optional[Path]]:
         header, _, data = str(image_url or "").partition(",")
-        mime = "image/jpeg"
+        declared_mime = "image/jpeg"
         if header.startswith("data:"):
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
             if mime_part.startswith("image/"):
-                mime = mime_part
+                declared_mime = mime_part
+        raw_bytes = base64.b64decode(data)
+        # Detect the real MIME type from magic bytes so we never mismatch
+        # declared vs actual format (Anthropic rejects mismatches with 400).
+        mime = AIAgent._detect_image_mime(raw_bytes)
         suffix = {
             "image/png": ".png",
             "image/gif": ".gif",
             "image/webp": ".webp",
             "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-        }.get(mime, ".jpg")
+        }.get(mime, ".png")
         tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
         with tmp:
-            tmp.write(base64.b64decode(data))
+            tmp.write(raw_bytes)
         path = Path(tmp.name)
         return str(path), path
 

@@ -17,12 +17,40 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from types import SimpleNamespace
+import base64
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import anthropic as _anthropic_sdk
 except ImportError:
     _anthropic_sdk = None  # type: ignore[assignment]
+
+
+def _detect_image_mime_from_bytes(raw: bytes) -> str:
+    """Return the true MIME type of an image by inspecting magic bytes.
+
+    Anthropic rejects requests where the declared media_type doesn't match
+    the actual image format, so we always detect from bytes rather than
+    trusting the data URI header.
+    """
+    if raw[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if raw[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    if raw[:6] in (b'GIF87a', b'GIF89a'):
+        return "image/gif"
+    if len(raw) >= 12 and raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/png"  # Safe fallback — Anthropic accepts PNG
+
+
+def _verified_media_type(declared: str, data_b64: str) -> str:
+    """Return the actual MIME type, verifying against image magic bytes."""
+    try:
+        raw = base64.b64decode(data_b64 + "==")  # padding-safe
+        return _detect_image_mime_from_bytes(raw)
+    except Exception:
+        return declared or "image/png"
 
 logger = logging.getLogger(__name__)
 
@@ -836,7 +864,8 @@ def _convert_openai_image_part_to_anthropic(part: Dict[str, Any]) -> Optional[Di
     if url.startswith("data:"):
         header, sep, data = url.partition(",")
         if sep and ";base64" in header:
-            media_type = header[5:].split(";", 1)[0] or "image/png"
+            declared = header[5:].split(";", 1)[0] or "image/png"
+            media_type = _verified_media_type(declared, data)
             return {
                 "type": "image",
                 "source": {
@@ -871,13 +900,15 @@ def _convert_user_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any
         if ptype == "image" and part.get("source"):
             return dict(part)
         if ptype == "image" and part.get("data"):
-            media_type = part.get("mimeType") or part.get("media_type") or "image/png"
+            declared = part.get("mimeType") or part.get("media_type") or "image/png"
+            data_b64 = part.get("data", "")
+            media_type = _verified_media_type(declared, data_b64)
             return {
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": media_type,
-                    "data": part.get("data", ""),
+                    "data": data_b64,
                 },
             }
         if ptype == "tool_result":
@@ -910,11 +941,12 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
 
     if url.startswith("data:"):
         header, _, data = url.partition(",")
-        media_type = "image/jpeg"
+        declared = "image/png"
         if header.startswith("data:"):
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
             if mime_part.startswith("image/"):
-                media_type = mime_part
+                declared = mime_part
+        media_type = _verified_media_type(declared, data)
         return {
             "type": "base64",
             "media_type": media_type,
