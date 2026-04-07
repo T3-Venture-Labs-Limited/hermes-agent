@@ -18,6 +18,7 @@ Requires:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ except ImportError:
 # Must run before any Hermes module imports their own loggers.
 try:
     from logging_setup import (
+        get_tracer,
         setup_logging as _setup_logging,
         setup_sentry as _setup_sentry,
         setup_otel as _setup_otel,
@@ -48,6 +50,9 @@ try:
     _setup_otel()
 except Exception as _e:
     import logging as _logging
+
+    def get_tracer():
+        return None
 
     _logging.warning(f"logging_setup failed, using stdlib fallback: {_e}")
 # ────────────────────────────────────────────────────────────────────────────
@@ -65,6 +70,32 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+
+
+def _extract_traceparent_context(request: "web.Request") -> tuple[str, Any]:
+    traceparent = request.headers.get("traceparent", "")
+    if not traceparent:
+        return "", None
+
+    try:
+        from opentelemetry.propagate import extract as _otel_extract
+
+        return traceparent, _otel_extract({"traceparent": traceparent})
+    except Exception:
+        return traceparent, None
+
+
+def _get_current_trace_id() -> str:
+    try:
+        from opentelemetry import trace as _otel_trace
+
+        span = _otel_trace.get_current_span()
+        span_context = span.get_span_context()
+        if span_context and span_context.is_valid:
+            return f"{span_context.trace_id:032x}"
+    except Exception:
+        pass
+    return ""
 
 
 def check_api_server_requirements() -> bool:
@@ -597,279 +628,308 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = body.get("stream", False)
-
-        # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
-        system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
-
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                # Accumulate system messages
-                if system_prompt is None:
-                    system_prompt = content
-                else:
-                    system_prompt = system_prompt + "\n" + content
-            elif role in ("user", "assistant"):
-                conversation_messages.append({"role": role, "content": content})
-
-        # Extract the last user message as the primary input
-        user_message = ""
-        history = []
-        if conversation_messages:
-            user_message = conversation_messages[-1].get("content", "")
-            history = conversation_messages[:-1]
-
-        if not user_message:
-            return web.json_response(
-                {
-                    "error": {
-                        "message": "No user message found in messages",
-                        "type": "invalid_request_error",
-                    }
-                },
-                status=400,
-            )
-
-        session_id = str(uuid.uuid4())
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", "hermes-agent")
-        created = int(time.time())
-
-        # Stash metadata for Langfuse context propagation in _run_agent
-        self._last_request_metadata = body.get("metadata", {})
-
-        # ── Myah: extract OTEL trace context from W3C traceparent header ──────────
-        # The platform backend (with OTEL+HTTPX) injects this automatically.
-        # Format: 00-{trace_id}-{parent_span_id}-{flags}
-        # We extract trace_id for log correlation and Langfuse metadata.
-        _otel_trace_id = ""
-        _traceparent = request.headers.get("traceparent", "")
-        if _traceparent:
-            _tp_parts = _traceparent.split("-")
+        request_metadata = body.get("metadata", {}) or {}
+        traceparent, parent_context = _extract_traceparent_context(request)
+        parent_trace_id = ""
+        if traceparent:
+            _tp_parts = traceparent.split("-")
             if len(_tp_parts) >= 3:
-                _otel_trace_id = _tp_parts[1]
-        # ─────────────────────────────────────────────────────────────────────────
+                parent_trace_id = _tp_parts[1]
 
-        if _otel_trace_id:
-            logger.debug(
-                "Request trace context received",
-                extra={"otel_trace_id": _otel_trace_id},
-            )
-        # Bind correlation ID to all log lines for this request
-        _corr = {
-            k: self._last_request_metadata.get(k, "")
-            for k in ("message_id", "chat_id", "user_id")
-            if self._last_request_metadata.get(k)
-        }
-        if _corr:
-            # Use Loguru directly — stdlib logger.bind() does not exist
-            from loguru import logger as _llogger
+        async def _process_request(active_trace_id: str) -> "web.Response":
+            # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+            system_prompt = None
+            conversation_messages: List[Dict[str, str]] = []
 
-            _llogger.bind(**_corr).debug("Chat completion request received")
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    # Accumulate system messages
+                    if system_prompt is None:
+                        system_prompt = content
+                    else:
+                        system_prompt = system_prompt + "\n" + content
+                elif role in ("user", "assistant"):
+                    conversation_messages.append({"role": role, "content": content})
 
-        # Resolve a persistent Honcho manager for this chat session so the
-        # Honcho peer/session objects are reused across requests.  Without this
-        # each message triggers 3 blocking Honcho API round-trips before the
-        # agent starts thinking, adding ~60-70s of latency per message.
-        _chat_id = self._last_request_metadata.get("chat_id", "") or session_id
-        _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_chat_id)
+            # Extract the last user message as the primary input
+            user_message = ""
+            history = []
+            if conversation_messages:
+                user_message = conversation_messages[-1].get("content", "")
+                history = conversation_messages[:-1]
 
-        if stream:
-            import queue as _q
-
-            _stream_q: _q.Queue = _q.Queue()
-
-            def _on_delta(delta):
-                # Filter out None — the agent fires stream_delta_callback(None)
-                # to signal the CLI display to close its response box before
-                # tool execution, but the SSE writer uses None as end-of-stream
-                # sentinel.  Forwarding it would prematurely close the HTTP
-                # response, causing Open WebUI (and similar frontends) to miss
-                # the final answer after tool calls.  The SSE loop detects
-                # completion via agent_task.done() instead.
-                if delta is not None:
-                    _stream_q.put(delta)
-
-            def _on_tool_progress(name: str, preview: str, args: dict) -> None:
-                """Push a lightweight progress event into the SSE stream."""
-                if name.startswith("_"):
-                    return  # Skip internal events (_thinking)
-                _stream_q.put(
+            if not user_message:
+                return web.json_response(
                     {
-                        "_event_type": "tool.event",
-                        "object": "tool.event",
-                        "type": "progress",
-                        "name": name,
-                        "preview": (preview or "")[:200],
-                    }
+                        "error": {
+                            "message": "No user message found in messages",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                    status=400,
                 )
 
-            def _on_tool_start(call_id: str, name: str, args: dict) -> None:
-                """Push a structured tool-start event into the SSE stream."""
-                _stream_q.put(
-                    {
-                        "_event_type": "tool.event",
-                        "object": "tool.event",
-                        "type": "start",
-                        "call_id": call_id,
-                        "name": name,
-                        "args": args,
-                    }
-                )
+            session_id = str(uuid.uuid4())
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            model_name = body.get("model", "hermes-agent")
+            created = int(time.time())
 
-            def _on_tool_complete(
-                call_id: str, name: str, args: dict, result: Any
-            ) -> None:
-                """Push a structured tool-complete event into the SSE stream."""
-                _stream_q.put(
-                    {
-                        "_event_type": "tool.event",
-                        "object": "tool.event",
-                        "type": "complete",
-                        "call_id": call_id,
-                        "name": name,
-                        "args": args,
-                        "result": result,
-                    }
-                )
+            # Stash metadata for Langfuse context propagation in _run_agent
+            self._last_request_metadata = request_metadata
 
-            def _on_step(iteration: int, prev_tools: list) -> None:
-                """Log each agent loop iteration to Langfuse as a point-in-time event."""
-                logger.debug("agent:step iteration=%d tools=%s", iteration, prev_tools)
-                try:
-                    from langfuse import get_client as _lf_get
+            # ── Myah: extract OTEL trace context from W3C traceparent header ──────────
+            # The platform backend (with OTEL+HTTPX) injects this automatically.
+            # Format: 00-{trace_id}-{parent_span_id}-{flags}
+            # We extract trace_id for log correlation and Langfuse metadata.
+            _otel_trace_id = active_trace_id or parent_trace_id
+            # ─────────────────────────────────────────────────────────────────────────
 
-                    _lf_get().create_event(
-                        name="agent:step",
-                        input={"iteration": iteration, "tools_called": prev_tools},
-                    )
-                except Exception:
-                    pass
-
-            def _on_status(event_type: str, message: str) -> None:
-                """Log agent lifecycle and context-pressure events to Langfuse."""
+            if _otel_trace_id:
                 logger.debug(
-                    "agent:status type=%s message=%s",
-                    event_type,
-                    message[:120] if message else "",
+                    "Request trace context received",
+                    extra={"otel_trace_id": _otel_trace_id},
                 )
-                try:
-                    from langfuse import get_client as _lf_get
+            # Bind correlation ID to all log lines for this request
+            _corr = {
+                k: self._last_request_metadata.get(k, "")
+                for k in ("message_id", "chat_id", "user_id")
+                if self._last_request_metadata.get(k)
+            }
+            if _corr:
+                # Use Loguru directly — stdlib logger.bind() does not exist
+                from loguru import logger as _llogger
 
-                    _lf_get().create_event(
-                        name=f"agent:{event_type}",
-                        input={"message": message},
-                        level="DEFAULT" if event_type == "lifecycle" else "WARNING",
+                _llogger.bind(**_corr).debug("Chat completion request received")
+
+            # Resolve a persistent Honcho manager for this chat session so the
+            # Honcho peer/session objects are reused across requests.  Without this
+            # each message triggers 3 blocking Honcho API round-trips before the
+            # agent starts thinking, adding ~60-70s of latency per message.
+            _chat_id = self._last_request_metadata.get("chat_id", "") or session_id
+            _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(
+                _chat_id
+            )
+
+            if stream:
+                import queue as _q
+
+                _stream_q: _q.Queue = _q.Queue()
+
+                def _on_delta(delta):
+                    # Filter out None — the agent fires stream_delta_callback(None)
+                    # to signal the CLI display to close its response box before
+                    # tool execution, but the SSE writer uses None as end-of-stream
+                    # sentinel.  Forwarding it would prematurely close the HTTP
+                    # response, causing Open WebUI (and similar frontends) to miss
+                    # the final answer after tool calls.  The SSE loop detects
+                    # completion via agent_task.done() instead.
+                    if delta is not None:
+                        _stream_q.put(delta)
+
+                def _on_tool_progress(name: str, preview: str, args: dict) -> None:
+                    """Push a lightweight progress event into the SSE stream."""
+                    if name.startswith("_"):
+                        return  # Skip internal events (_thinking)
+                    _stream_q.put(
+                        {
+                            "_event_type": "tool.event",
+                            "object": "tool.event",
+                            "type": "progress",
+                            "name": name,
+                            "preview": (preview or "")[:200],
+                        }
                     )
-                except Exception:
-                    pass
 
-            # Start agent in background.  agent_ref is a mutable container
-            # so the SSE writer can interrupt the agent on client disconnect.
-            agent_ref = [None]
-            agent_task = asyncio.ensure_future(
-                self._run_agent(
+                def _on_tool_start(call_id: str, name: str, args: dict) -> None:
+                    """Push a structured tool-start event into the SSE stream."""
+                    _stream_q.put(
+                        {
+                            "_event_type": "tool.event",
+                            "object": "tool.event",
+                            "type": "start",
+                            "call_id": call_id,
+                            "name": name,
+                            "args": args,
+                        }
+                    )
+
+                def _on_tool_complete(
+                    call_id: str, name: str, args: dict, result: Any
+                ) -> None:
+                    """Push a structured tool-complete event into the SSE stream."""
+                    _stream_q.put(
+                        {
+                            "_event_type": "tool.event",
+                            "object": "tool.event",
+                            "type": "complete",
+                            "call_id": call_id,
+                            "name": name,
+                            "args": args,
+                            "result": result,
+                        }
+                    )
+
+                def _on_step(iteration: int, prev_tools: list) -> None:
+                    """Log each agent loop iteration to Langfuse as a point-in-time event."""
+                    logger.debug(
+                        "agent:step iteration=%d tools=%s", iteration, prev_tools
+                    )
+                    try:
+                        from langfuse import get_client as _lf_get
+
+                        _lf_get().create_event(
+                            name="agent:step",
+                            input={"iteration": iteration, "tools_called": prev_tools},
+                        )
+                    except Exception:
+                        pass
+
+                def _on_status(event_type: str, message: str) -> None:
+                    """Log agent lifecycle and context-pressure events to Langfuse."""
+                    logger.debug(
+                        "agent:status type=%s message=%s",
+                        event_type,
+                        message[:120] if message else "",
+                    )
+                    try:
+                        from langfuse import get_client as _lf_get
+
+                        _lf_get().create_event(
+                            name=f"agent:{event_type}",
+                            input={"message": message},
+                            level="DEFAULT" if event_type == "lifecycle" else "WARNING",
+                        )
+                    except Exception:
+                        pass
+
+                # Start agent in background.  agent_ref is a mutable container
+                # so the SSE writer can interrupt the agent on client disconnect.
+                agent_ref = [None]
+                agent_task = asyncio.ensure_future(
+                    self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        honcho_manager=_honcho_manager,
+                        honcho_config=_honcho_config,
+                        stream_delta_callback=_on_delta,
+                        tool_progress_callback=_on_tool_progress,
+                        tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete,
+                        step_callback=_on_step,
+                        status_callback=_on_status,
+                        agent_ref=agent_ref,
+                        otel_trace_id=_otel_trace_id,
+                    )
+                )
+
+                return await self._write_sse_chat_completion(
+                    request,
+                    completion_id,
+                    model_name,
+                    created,
+                    _stream_q,
+                    agent_task,
+                    agent_ref,
+                )
+
+            # Non-streaming: run the agent (with optional Idempotency-Key)
+            async def _compute_completion():
+                return await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
                     honcho_manager=_honcho_manager,
                     honcho_config=_honcho_config,
-                    stream_delta_callback=_on_delta,
-                    tool_progress_callback=_on_tool_progress,
-                    tool_start_callback=_on_tool_start,
-                    tool_complete_callback=_on_tool_complete,
-                    step_callback=_on_step,
-                    status_callback=_on_status,
-                    agent_ref=agent_ref,
                     otel_trace_id=_otel_trace_id,
                 )
+
+            idempotency_key = request.headers.get("Idempotency-Key")
+            if idempotency_key:
+                fp = _make_request_fingerprint(
+                    body, keys=["model", "messages", "tools", "tool_choice", "stream"]
+                )
+                try:
+                    result, usage = await _idem_cache.get_or_set(
+                        idempotency_key, fp, _compute_completion
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Error running agent for chat completions: %s", e, exc_info=True
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            f"Internal server error: {e}", err_type="server_error"
+                        ),
+                        status=500,
+                    )
+            else:
+                try:
+                    result, usage = await _compute_completion()
+                except Exception as e:
+                    logger.error(
+                        "Error running agent for chat completions: %s", e, exc_info=True
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            f"Internal server error: {e}", err_type="server_error"
+                        ),
+                        status=500,
+                    )
+
+            final_response = result.get("final_response", "")
+            if not final_response:
+                final_response = result.get("error", "(No response generated)")
+
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": final_response,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+
+            return web.json_response(response_data)
+
+        tracer = get_tracer()
+        span_context = (
+            tracer.start_as_current_span(
+                "handle_chat_completion", context=parent_context
             )
+            if tracer is not None
+            else contextlib.nullcontext()
+        )
 
-            return await self._write_sse_chat_completion(
-                request,
-                completion_id,
-                model_name,
-                created,
-                _stream_q,
-                agent_task,
-                agent_ref,
-            )
+        with span_context as span:
+            if span is not None:
+                span.set_attribute("http.method", request.method)
+                span.set_attribute("http.route", request.path)
+                if request_metadata.get("user_id"):
+                    span.set_attribute("user_id", str(request_metadata["user_id"]))
+                if request_metadata.get("message_id"):
+                    span.set_attribute(
+                        "message_id", str(request_metadata["message_id"])
+                    )
 
-        # Non-streaming: run the agent (with optional Idempotency-Key)
-        async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                honcho_manager=_honcho_manager,
-                honcho_config=_honcho_config,
-                otel_trace_id=_otel_trace_id,
-            )
-
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(
-                body, keys=["model", "messages", "tools", "tool_choice", "stream"]
-            )
-            try:
-                result, usage = await _idem_cache.get_or_set(
-                    idempotency_key, fp, _compute_completion
-                )
-            except Exception as e:
-                logger.error(
-                    "Error running agent for chat completions: %s", e, exc_info=True
-                )
-                return web.json_response(
-                    _openai_error(
-                        f"Internal server error: {e}", err_type="server_error"
-                    ),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage = await _compute_completion()
-            except Exception as e:
-                logger.error(
-                    "Error running agent for chat completions: %s", e, exc_info=True
-                )
-                return web.json_response(
-                    _openai_error(
-                        f"Internal server error: {e}", err_type="server_error"
-                    ),
-                    status=500,
-                )
-
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = result.get("error", "(No response generated)")
-
-        response_data = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
-
-        return web.json_response(response_data)
+            return await _process_request(_get_current_trace_id() or parent_trace_id)
 
     async def _write_sse_chat_completion(
         self,

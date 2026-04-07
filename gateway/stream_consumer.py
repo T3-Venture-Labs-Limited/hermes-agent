@@ -16,11 +16,14 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from logging_setup import get_tracer
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -31,6 +34,7 @@ _DONE = object()
 @dataclass
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
+
     edit_interval: float = 0.3
     buffer_threshold: int = 40
     cursor: str = " ▉"
@@ -68,7 +72,7 @@ class GatewayStreamConsumer:
         self._already_sent = False
         self._edit_supported = True  # Disabled on first edit failure (Signal/Email/HA)
         self._last_edit_time = 0.0
-        self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        self._last_sent_text = ""  # Track last-sent text to skip redundant edits
 
     @property
     def already_sent(self) -> bool:
@@ -90,71 +94,97 @@ class GatewayStreamConsumer:
         # Platform message length limit — leave room for cursor + formatting
         _raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
         _safe_limit = max(500, _raw_limit - len(self.cfg.cursor) - 100)
+        tracer = get_tracer()
+        span_context = (
+            tracer.start_as_current_span("stream.lifecycle")
+            if tracer is not None
+            else contextlib.nullcontext()
+        )
 
-        try:
-            while True:
-                # Drain all available items from the queue
-                got_done = False
+        with span_context as span:
+            if span is not None:
+                stream_type = None
+                if isinstance(self.metadata, dict):
+                    stream_type = self.metadata.get("stream_type")
+                if not stream_type:
+                    stream_type = getattr(
+                        self.adapter, "name", type(self.adapter).__name__
+                    )
+                span.set_attribute("stream.type", str(stream_type))
+
+            try:
                 while True:
-                    try:
-                        item = self._queue.get_nowait()
-                        if item is _DONE:
-                            got_done = True
+                    # Drain all available items from the queue
+                    got_done = False
+                    while True:
+                        try:
+                            item = self._queue.get_nowait()
+                            if item is _DONE:
+                                got_done = True
+                                break
+                            self._accumulated += item
+                        except queue.Empty:
                             break
-                        self._accumulated += item
-                    except queue.Empty:
-                        break
 
-                # Decide whether to flush an edit
-                now = time.monotonic()
-                elapsed = now - self._last_edit_time
-                should_edit = (
-                    got_done
-                    or (elapsed >= self.cfg.edit_interval
-                        and len(self._accumulated) > 0)
-                    or len(self._accumulated) >= self.cfg.buffer_threshold
-                )
+                    # Decide whether to flush an edit
+                    now = time.monotonic()
+                    elapsed = now - self._last_edit_time
+                    should_edit = (
+                        got_done
+                        or (
+                            elapsed >= self.cfg.edit_interval
+                            and len(self._accumulated) > 0
+                        )
+                        or len(self._accumulated) >= self.cfg.buffer_threshold
+                    )
 
-                if should_edit and self._accumulated:
-                    # Split overflow: if accumulated text exceeds the platform
-                    # limit, finalize the current message and start a new one.
-                    while (
-                        len(self._accumulated) > _safe_limit
-                        and self._message_id is not None
-                    ):
-                        split_at = self._accumulated.rfind("\n", 0, _safe_limit)
-                        if split_at < _safe_limit // 2:
-                            split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
-                        await self._send_or_edit(chunk)
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
-                        self._message_id = None
-                        self._last_sent_text = ""
+                    if should_edit and self._accumulated:
+                        # Split overflow: if accumulated text exceeds the platform
+                        # limit, finalize the current message and start a new one.
+                        while (
+                            len(self._accumulated) > _safe_limit
+                            and self._message_id is not None
+                        ):
+                            split_at = self._accumulated.rfind("\n", 0, _safe_limit)
+                            if split_at < _safe_limit // 2:
+                                split_at = _safe_limit
+                            chunk = self._accumulated[:split_at]
+                            await self._send_or_edit(chunk)
+                            self._accumulated = self._accumulated[split_at:].lstrip(
+                                "\n"
+                            )
+                            self._message_id = None
+                            self._last_sent_text = ""
 
-                    display_text = self._accumulated
-                    if not got_done:
-                        display_text += self.cfg.cursor
+                        display_text = self._accumulated
+                        if not got_done:
+                            display_text += self.cfg.cursor
 
-                    await self._send_or_edit(display_text)
-                    self._last_edit_time = time.monotonic()
+                        await self._send_or_edit(display_text)
+                        self._last_edit_time = time.monotonic()
 
-                if got_done:
-                    # Final edit without cursor
-                    if self._accumulated and self._message_id:
+                    if got_done:
+                        # Final edit without cursor
+                        if self._accumulated and self._message_id:
+                            await self._send_or_edit(self._accumulated)
+                        return
+
+                    await asyncio.sleep(0.05)  # Small yield to not busy-loop
+
+            except asyncio.CancelledError:
+                # Best-effort final edit on cancellation
+                if self._accumulated and self._message_id:
+                    try:
                         await self._send_or_edit(self._accumulated)
-                    return
-
-                await asyncio.sleep(0.05)  # Small yield to not busy-loop
-
-        except asyncio.CancelledError:
-            # Best-effort final edit on cancellation
-            if self._accumulated and self._message_id:
-                try:
-                    await self._send_or_edit(self._accumulated)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error("Stream consumer error: %s", e)
+                    except Exception:
+                        pass
+            except Exception as e:
+                if span is not None:
+                    try:
+                        span.record_exception(e)
+                    except Exception:
+                        pass
+                logger.error("Stream consumer error: %s", e)
 
     async def _send_or_edit(self, text: str) -> None:
         """Send or edit the streaming message."""
@@ -178,7 +208,9 @@ class GatewayStreamConsumer:
                         # let the normal send path handle the final response.
                         # Without this guard, adapters like Signal/Email would
                         # flood the chat with a new message every edit_interval.
-                        logger.debug("Edit failed, disabling streaming for this adapter")
+                        logger.debug(
+                            "Edit failed, disabling streaming for this adapter"
+                        )
                         self._edit_supported = False
                 else:
                     # Editing not supported — skip intermediate updates.
