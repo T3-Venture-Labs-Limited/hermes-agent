@@ -494,8 +494,33 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent"})
+        """GET /health — health check with credential validation.
+
+        Returns 503 if no LLM API key is configured, allowing the platform
+        to detect broken agent containers at startup.
+
+        Ref: T3-884
+        """
+        checks = {}
+
+        # Check LLM credentials — at least one must be present for the agent to function
+        llm_keys = ['OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']
+        checks['llm_credentials'] = any(
+            os.environ.get(k, '').strip() for k in llm_keys
+        )
+
+        # Check memory provider (Honcho) — only required if configured
+        honcho_key = os.environ.get('HONCHO_API_KEY', '').strip()
+        checks['memory_provider'] = bool(honcho_key) if honcho_key else True  # True if not configured
+
+        all_ok = all(checks.values())
+        status_code = 200 if all_ok else 503
+
+        return web.json_response({
+            "status": "ok" if all_ok else "degraded",
+            "platform": "hermes-agent",
+            "checks": checks,
+        }, status=status_code)
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
