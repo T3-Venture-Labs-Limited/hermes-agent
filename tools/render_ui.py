@@ -16,9 +16,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
-# ── Schema definitions ────────────────────────────────────────────────────────
-
 RENDER_UI_SCHEMA = {
     'name': 'render_ui',
     'description': (
@@ -52,14 +49,14 @@ RENDER_UI_SCHEMA = {
                     'Template data used to populate the composition. '
                     'The keys depend on the chosen composition. '
                     'Examples: '
-                    'kpi_dashboard → {metrics, chart, table}; '
-                    'approval_card → {title, action, rationale, risks, options}; '
-                    'triage_table → {items, actions}; '
-                    'form_wizard → {steps: [{label, fields: [{name, label, type, hint}]}], currentStep: 0} — currentStep is 0-indexed, always start with currentStep: 0; '
-                    'env_vars_form → {service, description, fields}; '
-                    'comparison_view → {options}; '
-                    'activity_feed → {entries, actions}; '
-                    'email_reply → {subject, from, from_email, original_message, draft_reply, reply_actions}.'
+                    'kpi_dashboard -> {metrics, chart, table}; '
+                    'approval_card -> {title, action, rationale, risks, options}; '
+                    'triage_table -> {items, actions}; '
+                    'form_wizard -> {steps: [{label, fields: [{name, label, type, hint}]}], currentStep: 0}; '
+                    'env_vars_form -> {service, description, fields}; '
+                    'comparison_view -> {options}; '
+                    'activity_feed -> {entries, actions}; '
+                    'email_reply -> {subject, from, from_email, original_message, draft_reply, reply_actions}.'
                 ),
             },
             'title': {
@@ -71,9 +68,7 @@ RENDER_UI_SCHEMA = {
                 'description': (
                     'Optional stable identifier for multi-step components. '
                     'If provided and a component with this ID is already rendered, '
-                    'the frontend will update it in-place. If not provided or new, '
-                    'a fresh component is rendered. Use for wizards, multi-step forms, '
-                    'or any component that progresses through states.'
+                    'the frontend will update it in-place.'
                 ),
             },
         },
@@ -111,29 +106,17 @@ RENDER_CUSTOM_SCHEMA = {
 }
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
 def _render_ui_handler(args: dict, **kw) -> str:
-    """Emit a [RENDER_UI]…[/RENDER_UI] sentinel that the platform middleware
-    intercepts and converts into a declarative UI state snapshot.
-
-    Returning the raw args as JSON inside the sentinel lets the middleware
-    call expand_composition() on the platform side where the full composition
-    registry lives.
-    """
     payload = json.dumps(args, ensure_ascii=False)
     return f'[RENDER_UI]{payload}[/RENDER_UI]'
 
 
 def _render_custom_handler(args: dict, **kw) -> str:
-    """Emit a [RENDER_UI] sentinel for a freeform block array."""
     payload = json.dumps(args, ensure_ascii=False)
     return f'[RENDER_UI]{payload}[/RENDER_UI]'
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-
-from tools.registry import registry  # noqa: E402 — must come after function defs
+from tools.registry import registry  # noqa: E402
 
 registry.register(
     name='render_ui',

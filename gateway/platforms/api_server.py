@@ -2,11 +2,13 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
+- POST /v1/runs                    — start a run, returns run_id immediately (202)
+- GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -18,6 +20,7 @@ Requires:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -33,22 +36,20 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
-# ── Myah: structured logging setup ─────────────────────────────────────────
-# Must run before any Hermes module imports their own loggers.
-try:
-    from logging_setup import setup_logging as _setup_logging, setup_sentry as _setup_sentry
-    _setup_logging()
-    _setup_sentry()
-except Exception as _e:
-    import logging as _logging
-    _logging.warning(f'logging_setup failed, using stdlib fallback: {_e}')
-# ────────────────────────────────────────────────────────────────────────────
-
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
 )
+
+# ── Myah: Sentry integration ──────────────────────────────────────────────
+try:
+    from logging_setup import setup_sentry as _setup_sentry
+    _setup_sentry()
+except Exception as _e:
+    import logging as _logging
+    _logging.warning('logging_setup failed: %s', _e)
+# ───────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,7 @@ else:
     security_headers_middleware = None  # type: ignore[assignment]
 
 
-# ── Sentry distributed trace continuation middleware ─────────────────────────
+# ── Sentry distributed trace continuation middleware ─────────────────────
 # Reads the sentry-trace and baggage headers injected by the platform backend
 # and continues the trace so agent spans appear in the same Sentry trace as
 # the originating browser request.
@@ -276,7 +277,7 @@ if AIOHTTP_AVAILABLE:
                 with sentry_sdk.start_transaction(transaction):
                     return await handler(request)
         except Exception:
-            pass  # Sentry not configured — fall through transparently
+            pass  # Sentry not configured — fall through
         return await handler(request)
 else:
     sentry_trace_middleware = None  # type: ignore[assignment]
@@ -341,12 +342,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Persistent Honcho session managers, keyed by chat_id.
-        # Reusing the same manager across requests avoids 2-3 blocking Honcho
-        # API round-trips (peer lookup + session.context()) on every message,
-        # which was causing 60-70s latency on simple exchanges.
-        self._honcho_managers: Dict[str, Any] = {}
-        self._honcho_configs: Dict[str, Any] = {}
+        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
+        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Creation timestamps for orphaned-run TTL sweep
+        self._run_streams_created: Dict[str, float] = {}
+        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -410,7 +410,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if token == self._api_key:
+            if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
         return web.json_response(
@@ -419,42 +419,22 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Honcho manager pool
+    # Session DB helper
     # ------------------------------------------------------------------
 
-    def _get_or_create_honcho_manager(self, chat_id: str):
-        """Return a persistent (manager, config) pair for this chat session.
+    def _ensure_session_db(self):
+        """Lazily initialise and return the shared SessionDB instance.
 
-        Mirrors gateway.run._get_or_create_gateway_honcho so Honcho peer and
-        session objects are created once per chat and reused across requests.
-        Without this, every message triggers 2-3 blocking Honcho API calls
-        (peer lookup + session.context) before the agent starts thinking.
+        Sessions are persisted to ``state.db`` so that ``hermes sessions list``
+        shows API-server conversations alongside CLI and gateway ones.
         """
-        if chat_id in self._honcho_managers:
-            return self._honcho_managers[chat_id], self._honcho_configs.get(chat_id)
-
-        try:
-            from honcho_integration.client import HonchoClientConfig, get_honcho_client
-            from honcho_integration.session import HonchoSessionManager
-
-            hcfg = HonchoClientConfig.from_global_config()
-            if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
-                logger.debug("Honcho disabled or not configured — skipping manager pool for %s", chat_id)
-                return None, hcfg
-
-            client = get_honcho_client(hcfg)
-            manager = HonchoSessionManager(
-                honcho=client,
-                config=hcfg,
-                context_tokens=hcfg.context_tokens,
-            )
-            self._honcho_managers[chat_id] = manager
-            self._honcho_configs[chat_id] = hcfg
-            logger.debug("Honcho manager created for chat_id=%s", chat_id)
-            return manager, hcfg
-        except Exception as e:
-            logger.debug("Honcho manager init failed for chat_id=%s: %s", chat_id, e)
-            return None, None
+        if self._session_db is None:
+            try:
+                from hermes_state import SessionDB
+                self._session_db = SessionDB()
+            except Exception as e:
+                logger.debug("SessionDB unavailable for API server: %s", e)
+        return self._session_db
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -464,14 +444,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
-        honcho_manager: Any = None,
-        honcho_config: Any = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
-        tool_start_callback=None,
-        tool_complete_callback=None,
-        step_callback=None,
-        status_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -480,10 +454,6 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
-
-        honcho_manager/honcho_config should come from _get_or_create_honcho_manager
-        so that Honcho peer and session objects are reused across requests rather
-        than re-initialised (and their caches discarded) on every message.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
@@ -497,25 +467,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
-        # Full observability — quiet_mode off so all tool activity is logged
+        # Load fallback provider chain so the API server platform has the
+        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
+        from gateway.run import GatewayRunner
+        fallback_model = GatewayRunner._load_fallback_model()
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
-            quiet_mode=False,
-            verbose_logging=True,
+            quiet_mode=True,
+            verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
-            honcho_manager=honcho_manager,
-            honcho_config=honcho_config,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            step_callback=step_callback,
-            status_callback=status_callback,
+            session_db=self._ensure_session_db(),
+            fallback_model=fallback_model,
         )
         return agent
 
@@ -524,8 +494,33 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent"})
+        """GET /health — health check with credential validation.
+
+        Returns 503 if no LLM API key is configured, allowing the platform
+        to detect broken agent containers at startup.
+
+        Ref: T3-884
+        """
+        checks = {}
+
+        # Check LLM credentials — at least one must be present for the agent to function
+        llm_keys = ['OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']
+        checks['llm_credentials'] = any(
+            os.environ.get(k, '').strip() for k in llm_keys
+        )
+
+        # Check memory provider (Honcho) — only required if configured
+        honcho_key = os.environ.get('HONCHO_API_KEY', '').strip()
+        checks['memory_provider'] = bool(honcho_key) if honcho_key else True  # True if not configured
+
+        all_ok = all(checks.values())
+        status_code = 200 if all_ok else 503
+
+        return web.json_response({
+            "status": "ok" if all_ok else "degraded",
+            "platform": "hermes-agent",
+            "checks": checks,
+        }, status=status_code)
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -598,45 +593,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        session_id = str(uuid.uuid4())
+        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
+        # When provided, history is loaded from state.db instead of from the request body.
+        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if provided_session_id:
+            session_id = provided_session_id
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    history = db.get_messages_as_conversation(session_id)
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
+        else:
+            session_id = str(uuid.uuid4())
+            # history already set from request body above
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
-        # Stash metadata for Langfuse context propagation in _run_agent
-        self._last_request_metadata = body.get("metadata", {})
-
-        # ── Myah: extract OTEL trace context from W3C traceparent header ──────────
-        # The platform backend (with OTEL+HTTPX) injects this automatically.
-        # Format: 00-{trace_id}-{parent_span_id}-{flags}
-        # We extract trace_id for log correlation and Langfuse metadata.
-        _otel_trace_id = ''
-        _traceparent = request.headers.get('traceparent', '')
-        if _traceparent:
-            _tp_parts = _traceparent.split('-')
-            if len(_tp_parts) >= 3:
-                _otel_trace_id = _tp_parts[1]
-        # ─────────────────────────────────────────────────────────────────────────
-
-        if _otel_trace_id:
-            logger.debug('Request trace context received', extra={'otel_trace_id': _otel_trace_id})
-        # Bind correlation ID to all log lines for this request
+        # Stash request metadata for Langfuse context propagation
+        self._last_request_metadata = body.get("metadata", {}) or {}
         _corr = {
             k: self._last_request_metadata.get(k, '')
             for k in ('message_id', 'chat_id', 'user_id')
             if self._last_request_metadata.get(k)
         }
         if _corr:
-            # Use Loguru directly — stdlib logger.bind() does not exist
-            from loguru import logger as _llogger
-            _llogger.bind(**_corr).debug('Chat completion request received')
-
-        # Resolve a persistent Honcho manager for this chat session so the
-        # Honcho peer/session objects are reused across requests.  Without this
-        # each message triggers 3 blocking Honcho API round-trips before the
-        # agent starts thinking, adding ~60-70s of latency per message.
-        _chat_id = self._last_request_metadata.get("chat_id", "") or session_id
-        _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_chat_id)
+            logger.debug('Chat completion request received: %s', _corr)
 
         if stream:
             import queue as _q
@@ -653,65 +638,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(name: str, preview: str, args: dict) -> None:
-                """Push a lightweight progress event into the SSE stream."""
-                if name.startswith("_"):
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                """Inject tool progress into the SSE stream for Open WebUI.
+
+                Also emits structured tool.event SSE events so the platform
+                frontend can render live tool call status without parsing
+                markdown.
+                """
+                if name and name.startswith("_"):
                     return  # Skip internal events (_thinking)
-                _stream_q.put({
-                    "_event_type": "tool.event",
-                    "object": "tool.event",
-                    "type": "progress",
-                    "name": name,
-                    "preview": (preview or "")[:200],
-                })
-
-            def _on_tool_start(call_id: str, name: str, args: dict) -> None:
-                """Push a structured tool-start event into the SSE stream."""
-                _stream_q.put({
-                    "_event_type": "tool.event",
-                    "object": "tool.event",
-                    "type": "start",
-                    "call_id": call_id,
-                    "name": name,
-                    "args": args,
-                })
-
-            def _on_tool_complete(call_id: str, name: str, args: dict, result: Any) -> None:
-                """Push a structured tool-complete event into the SSE stream."""
-                _stream_q.put({
-                    "_event_type": "tool.event",
-                    "object": "tool.event",
-                    "type": "complete",
-                    "call_id": call_id,
-                    "name": name,
-                    "args": args,
-                    "result": result,
-                })
-
-            def _on_step(iteration: int, prev_tools: list) -> None:
-                """Log each agent loop iteration to Langfuse as a point-in-time event."""
-                logger.debug("agent:step iteration=%d tools=%s", iteration, prev_tools)
-                try:
-                    from langfuse import get_client as _lf_get
-                    _lf_get().create_event(
-                        name="agent:step",
-                        input={"iteration": iteration, "tools_called": prev_tools},
-                    )
-                except Exception:
-                    pass
-
-            def _on_status(event_type: str, message: str) -> None:
-                """Log agent lifecycle and context-pressure events to Langfuse."""
-                logger.debug("agent:status type=%s message=%s", event_type, message[:120] if message else "")
-                try:
-                    from langfuse import get_client as _lf_get
-                    _lf_get().create_event(
-                        name=f"agent:{event_type}",
-                        input={"message": message},
-                        level="DEFAULT" if event_type == "lifecycle" else "WARNING",
-                    )
-                except Exception:
-                    pass
+                if event_type == "tool.started":
+                    # Human-readable progress text
+                    from agent.display import get_tool_emoji
+                    emoji = get_tool_emoji(name)
+                    label = preview or name
+                    _stream_q.put(f"\n`{emoji} {label}`\n")
+                    # Structured tool.event for the platform frontend
+                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
+                    _stream_q.put({
+                        "_event_type": "tool.event",
+                        "object": "tool.event",
+                        "type": "start",
+                        "call_id": call_id,
+                        "name": name,
+                        "args": args or {},
+                    })
+                elif event_type == "tool.completed":
+                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
+                    _stream_q.put({
+                        "_event_type": "tool.event",
+                        "object": "tool.event",
+                        "type": "complete",
+                        "call_id": call_id,
+                        "name": name,
+                        "args": args or {},
+                        "result": kwargs.get("result"),
+                    })
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -721,21 +683,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
-                honcho_manager=_honcho_manager,
-                honcho_config=_honcho_config,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                step_callback=_on_step,
-                status_callback=_on_status,
                 agent_ref=agent_ref,
-                otel_trace_id=_otel_trace_id,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref,
+                agent_task, agent_ref, session_id=session_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -745,9 +700,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
-                honcho_manager=_honcho_manager,
-                honcho_config=_honcho_config,
-                otel_trace_id=_otel_trace_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -797,11 +749,11 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data)
+        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
-        created: int, stream_q, agent_task, agent_ref=None,
+        created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -818,6 +770,8 @@ class APIServerAdapter(BasePlatformAdapter):
         cors = self._cors_headers_for_origin(origin) if origin else None
         if cors:
             sse_headers.update(cors)
+        if session_id:
+            sse_headers["X-Hermes-Session-Id"] = session_id
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -843,10 +797,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                if isinstance(delta, dict) and delta.get("_event_type") == "tool.event":
-                                    event_data = {k: v for k, v in delta.items() if k != "_event_type"}
-                                    await response.write(f"data: {json.dumps(event_data, default=str)}\n\n".encode())
-                                    continue
                                 content_chunk = {
                                     "id": completion_id, "object": "chat.completion.chunk",
                                     "created": created, "model": model,
@@ -861,13 +811,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is None:  # End of stream sentinel
                     break
 
-                # ── Myah: structured tool.event — emit as a separate SSE line ──
-                if isinstance(delta, dict) and delta.get("_event_type") == "tool.event":
-                    event_data = {k: v for k, v in delta.items() if k != "_event_type"}
-                    await response.write(f"data: {json.dumps(event_data, default=str)}\n\n".encode())
-                    continue
-                # ─────────────────────────────────────────────────────────────────
-
                 content_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
@@ -877,43 +820,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-            result = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception:
                 pass
-
-            # ── Myah: emit render_* tool_calls_log in final chunk ─────────────
-            if isinstance(result, dict):
-                _all_msgs = result.get("messages", [])
-                _render_tools = [
-                    m for m in _all_msgs
-                    if (m.get("role") == "assistant" and any(
-                        tc.get("function", {}).get("name", "").startswith("render_")
-                        for tc in (m.get("tool_calls") or [])
-                    )) or (
-                        m.get("role") == "tool"
-                        and any(
-                            prev.get("role") == "assistant"
-                            and any(
-                                tc.get("id") == m.get("tool_call_id")
-                                and tc.get("function", {}).get("name", "").startswith("render_")
-                                for tc in (prev.get("tool_calls") or [])
-                            )
-                            for prev in _all_msgs
-                        )
-                    )
-                ]
-                if _render_tools:
-                    _tc_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-                        "tool_calls_log": _render_tools,
-                    }
-                    await response.write(f"data: {json.dumps(_tc_chunk, default=str)}\n\n".encode())
-            # ─────────────────────────────────────────────────────────────────
 
             # Finish chunk
             finish_chunk = {
@@ -1007,9 +918,29 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
-        # Reconstruct conversation history from previous_response_id
+        # Accept explicit conversation_history from the request body.
+        # This lets stateless clients supply their own history instead of
+        # relying on server-side response chaining via previous_response_id.
+        # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
-        if previous_response_id:
+        raw_history = body.get("conversation_history")
+        if raw_history:
+            if not isinstance(raw_history, list):
+                return web.json_response(
+                    _openai_error("'conversation_history' must be an array of message objects"),
+                    status=400,
+                )
+            for i, entry in enumerate(raw_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        status=400,
+                    )
+                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+            if previous_response_id:
+                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+
+        if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
@@ -1034,24 +965,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Run the agent (with Idempotency-Key support)
         session_id = str(uuid.uuid4())
 
-        # Resolve persistent Honcho manager — use conversation/previous_response_id
-        # as the stable key so the same session gets the same manager across turns.
-        _resp_chat_id = (
-            body.get("metadata", {}).get("chat_id")
-            or conversation
-            or previous_response_id
-            or session_id
-        )
-        _honcho_manager, _honcho_config = self._get_or_create_honcho_manager(_resp_chat_id)
-
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
-                honcho_manager=_honcho_manager,
-                honcho_config=_honcho_config,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1169,28 +1088,28 @@ class APIServerAdapter(BasePlatformAdapter):
     _CRON_AVAILABLE = False
     try:
         from cron.jobs import (
-            list_jobs as _cron_list_fn,
-            get_job as _cron_get_fn,
-            create_job as _cron_create_fn,
-            update_job as _cron_update_fn,
-            remove_job as _cron_remove_fn,
-            pause_job as _cron_pause_fn,
-            resume_job as _cron_resume_fn,
-            trigger_job as _cron_trigger_fn,
+            list_jobs as _cron_list,
+            get_job as _cron_get,
+            create_job as _cron_create,
+            update_job as _cron_update,
+            remove_job as _cron_remove,
+            pause_job as _cron_pause,
+            resume_job as _cron_resume,
+            trigger_job as _cron_trigger,
         )
+        # Wrap as staticmethod to prevent descriptor binding — these are plain
+        # module functions, not instance methods.  Without this, self._cron_*()
+        # injects ``self`` as the first positional argument and every call
+        # raises TypeError.
+        _cron_list = staticmethod(_cron_list)
+        _cron_get = staticmethod(_cron_get)
+        _cron_create = staticmethod(_cron_create)
+        _cron_update = staticmethod(_cron_update)
+        _cron_remove = staticmethod(_cron_remove)
+        _cron_pause = staticmethod(_cron_pause)
+        _cron_resume = staticmethod(_cron_resume)
+        _cron_trigger = staticmethod(_cron_trigger)
         _CRON_AVAILABLE = True
-        # Wrap in staticmethod so Python's descriptor protocol does not inject
-        # `self` as a positional arg when called via instance (e.g. self._cron_list(...)).
-        # Without this, every call raises:
-        #   "list_jobs() got multiple values for argument 'include_disabled'"
-        _cron_list = staticmethod(_cron_list_fn)
-        _cron_get = staticmethod(_cron_get_fn)
-        _cron_create = staticmethod(_cron_create_fn)
-        _cron_update = staticmethod(_cron_update_fn)
-        _cron_remove = staticmethod(_cron_remove_fn)
-        _cron_pause = staticmethod(_cron_pause_fn)
-        _cron_resume = staticmethod(_cron_resume_fn)
-        _cron_trigger = staticmethod(_cron_trigger_fn)
     except ImportError:
         pass
 
@@ -1470,16 +1389,9 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
-        honcho_manager: Any = None,
-        honcho_config: Any = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
-        tool_start_callback=None,
-        tool_complete_callback=None,
-        step_callback=None,
-        status_callback=None,
         agent_ref: Optional[list] = None,
-        otel_trace_id: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1491,9 +1403,6 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
-
-        Langfuse context is propagated from the calling async context into the
-        thread executor so all LLM + tool spans are nested under the request trace.
         """
         import contextvars as _cv
 
@@ -1504,15 +1413,12 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from langfuse import propagate_attributes as _lf_prop, get_client as _lf_get
             _lf_ctx = _lf_prop(
-                session_id=_req_metadata.get("session_id") or None,
+                session_id=_req_metadata.get("session_id") or session_id or None,
                 user_id=_req_metadata.get("user_id") or None,
                 tags=["hermes", "myah"],
                 metadata={
                     "chat_id": _req_metadata.get("chat_id", ""),
                     "message_id": _req_metadata.get("message_id", ""),
-                    # Link from Langfuse → Grafana Tempo: copy the OTEL trace_id into
-                    # Langfuse metadata so you can search Tempo from a Langfuse trace.
-                    "otel_trace_id": otel_trace_id,
                 },
             )
         except Exception:
@@ -1524,14 +1430,8 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
-                honcho_manager=honcho_manager,
-                honcho_config=honcho_config,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                step_callback=step_callback,
-                status_callback=status_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -1546,30 +1446,288 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 conversation_history=conversation_history,
             )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
+
             if _lf_get is not None:
                 try:
                     _lf_get().flush()
                 except Exception:
                     pass
+
+            usage = {
+                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+            }
             return result, usage
 
         with _lf_ctx:
-            # Log the OTEL trace ID for Grafana→Langfuse navigation.
-            # The Langfuse trace ID is NOT available here — it's created inside _run()
-            # when the @observe decorator activates, which runs in the thread executor.
-            # The reverse link (Langfuse→Grafana) works via otel_trace_id in Langfuse
-            # metadata above — from a Langfuse trace, look up otel_trace_id to find
-            # the corresponding Grafana Tempo trace.
-            if otel_trace_id:
-                logger.debug('Agent conversation starting', extra={'otel_trace_id': otel_trace_id})
-
             _ctx_snapshot = _cv.copy_context()
             return await loop.run_in_executor(None, lambda: _ctx_snapshot.run(_run))
+
+    # ------------------------------------------------------------------
+    # /v1/runs — structured event streaming
+    # ------------------------------------------------------------------
+
+    _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
+    _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
+
+    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        def _push(event: Dict[str, Any]) -> None:
+            q = self._run_streams.get(run_id)
+            if q is None:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except Exception:
+                pass
+
+        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+            ts = time.time()
+            if event_type == "tool.started":
+                _push({
+                    "event": "tool.started",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "tool": tool_name,
+                    "preview": preview,
+                })
+            elif event_type == "tool.completed":
+                _push({
+                    "event": "tool.completed",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "tool": tool_name,
+                    "duration": round(kwargs.get("duration", 0), 3),
+                    "error": kwargs.get("is_error", False),
+                })
+            elif event_type == "reasoning.available":
+                _push({
+                    "event": "reasoning.available",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "text": preview or "",
+                })
+            # _thinking and subagent_progress are intentionally not forwarded
+
+        return _callback
+
+    async def _handle_runs(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs — start an agent run, return run_id immediately."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Enforce concurrency limit
+        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
+            return web.json_response(
+                _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
+                status=429,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        raw_input = body.get("input")
+        if not raw_input:
+            return web.json_response(_openai_error("Missing 'input' field"), status=400)
+
+        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
+        if not user_message:
+            return web.json_response(_openai_error("No user message found in input"), status=400)
+
+        run_id = f"run_{uuid.uuid4().hex}"
+        loop = asyncio.get_running_loop()
+        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        self._run_streams[run_id] = q
+        self._run_streams_created[run_id] = time.time()
+
+        event_cb = self._make_run_event_callback(run_id, loop)
+
+        # Also wire stream_delta_callback so message.delta events flow through
+        def _text_cb(delta: Optional[str]) -> None:
+            if delta is None:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": delta,
+                })
+            except Exception:
+                pass
+
+        instructions = body.get("instructions")
+        previous_response_id = body.get("previous_response_id")
+
+        # Accept explicit conversation_history from the request body.
+        # Precedence: explicit conversation_history > previous_response_id.
+        conversation_history: List[Dict[str, str]] = []
+        raw_history = body.get("conversation_history")
+        if raw_history:
+            if not isinstance(raw_history, list):
+                return web.json_response(
+                    _openai_error("'conversation_history' must be an array of message objects"),
+                    status=400,
+                )
+            for i, entry in enumerate(raw_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        status=400,
+                    )
+                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+            if previous_response_id:
+                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+
+        if not conversation_history and previous_response_id:
+            stored = self._response_store.get(previous_response_id)
+            if stored:
+                conversation_history = list(stored.get("conversation_history", []))
+                if instructions is None:
+                    instructions = stored.get("instructions")
+
+        # When input is a multi-message array, extract all but the last
+        # message as conversation history (the last becomes user_message).
+        # Only fires when no explicit history was provided.
+        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+            for msg in raw_input[:-1]:
+                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        # Flatten multi-part content blocks to text
+                        content = " ".join(
+                            part.get("text", "") for part in content
+                            if isinstance(part, dict) and part.get("type") == "text"
+                        )
+                    conversation_history.append({"role": msg["role"], "content": str(content)})
+
+        session_id = body.get("session_id") or run_id
+        ephemeral_system_prompt = instructions
+
+        async def _run_and_close():
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=_text_cb,
+                    tool_progress_callback=event_cb,
+                )
+                def _run_sync():
+                    r = agent.run_conversation(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                    )
+                    u = {
+                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    }
+                    return r, u
+
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                q.put_nowait({
+                    "event": "run.completed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "output": final_response,
+                    "usage": usage,
+                })
+            except Exception as exc:
+                logger.exception("[api_server] run %s failed", run_id)
+                try:
+                    q.put_nowait({
+                        "event": "run.failed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "error": str(exc),
+                    })
+                except Exception:
+                    pass
+            finally:
+                # Sentinel: signal SSE stream to close
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+
+        task = asyncio.create_task(_run_and_close())
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            pass
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+
+    async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+
+        # Allow subscribing slightly before the run is registered (race condition window)
+        for _ in range(20):
+            if run_id in self._run_streams:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        q = self._run_streams[run_id]
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                if event is None:
+                    # Run finished — send final SSE comment and close
+                    await response.write(b": stream closed\n\n")
+                    break
+                payload = f"data: {json.dumps(event)}\n\n"
+                await response.write(payload.encode())
+        except Exception as exc:
+            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
+        finally:
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+
+        return response
+
+    async def _sweep_orphaned_runs(self) -> None:
+        """Periodically clean up run streams that were never consumed."""
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            stale = [
+                run_id
+                for run_id, created_at in list(self._run_streams_created.items())
+                if now - created_at > self._RUN_STREAM_TTL
+            ]
+            for run_id in stale:
+                logger.debug("[api_server] sweeping orphaned run %s", run_id)
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -1582,7 +1740,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (sentry_trace_middleware, cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, sentry_trace_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
@@ -1601,6 +1759,17 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # Structured event streaming
+            self._app.router.add_post("/v1/runs", self._handle_runs)
+            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            # Start background sweep to clean up orphaned (unconsumed) run streams
+            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
+            try:
+                self._background_tasks.add(sweep_task)
+            except TypeError:
+                pass
+            if hasattr(sweep_task, "add_done_callback"):
+                sweep_task.add_done_callback(self._background_tasks.discard)
 
             # Port conflict detection — fail fast if port is already in use
             import socket as _socket

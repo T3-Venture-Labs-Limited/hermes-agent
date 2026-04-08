@@ -10,6 +10,7 @@ Auth supports:
   - Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json) → Bearer auth
 """
 
+import copy
 import json
 import logging
 import os
@@ -17,40 +18,12 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from types import SimpleNamespace
-import base64
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import anthropic as _anthropic_sdk
 except ImportError:
     _anthropic_sdk = None  # type: ignore[assignment]
-
-
-def _detect_image_mime_from_bytes(raw: bytes) -> str:
-    """Return the true MIME type of an image by inspecting magic bytes.
-
-    Anthropic rejects requests where the declared media_type doesn't match
-    the actual image format, so we always detect from bytes rather than
-    trusting the data URI header.
-    """
-    if raw[:8] == b'\x89PNG\r\n\x1a\n':
-        return "image/png"
-    if raw[:3] == b'\xff\xd8\xff':
-        return "image/jpeg"
-    if raw[:6] in (b'GIF87a', b'GIF89a'):
-        return "image/gif"
-    if len(raw) >= 12 and raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
-        return "image/webp"
-    return "image/png"  # Safe fallback — Anthropic accepts PNG
-
-
-def _verified_media_type(declared: str, data_b64: str) -> str:
-    """Return the actual MIME type, verifying against image magic bytes."""
-    try:
-        raw = base64.b64decode(data_b64 + "==")  # padding-safe
-        return _detect_image_mime_from_bytes(raw)
-    except Exception:
-        return declared or "image/png"
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +188,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     if not base_url:
         return False
     normalized = base_url.rstrip("/").lower()
-    return normalized.startswith("https://api.minimax.io/anthropic") or normalized.startswith(
-        "https://api.minimaxi.com/anthropic"
-    )
+    return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
 
 
 def build_anthropic_client(api_key: str, base_url: str = None):
@@ -735,29 +706,6 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
     }
 
 
-def run_hermes_oauth_login() -> Optional[str]:
-    """Run Hermes-native OAuth PKCE flow for Claude Pro/Max subscription.
-
-    Opens a browser to claude.ai for authorization, prompts for the code,
-    exchanges it for tokens, and stores them in ~/.hermes/.anthropic_oauth.json.
-
-    Returns the access token on success, None on failure.
-    """
-    result = run_hermes_oauth_login_pure()
-    if not result:
-        return None
-
-    access_token = result["access_token"]
-    refresh_token = result["refresh_token"]
-    expires_at_ms = result["expires_at_ms"]
-
-    _save_hermes_oauth_credentials(access_token, refresh_token, expires_at_ms)
-    _write_claude_code_credentials(access_token, refresh_token, expires_at_ms)
-
-    print("Authentication successful!")
-    return access_token
-
-
 def _save_hermes_oauth_credentials(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
     """Save OAuth credentials to ~/.hermes/.anthropic_oauth.json."""
     data = {
@@ -782,38 +730,6 @@ def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
                 return data
         except (json.JSONDecodeError, OSError, IOError) as e:
             logger.debug("Failed to read Hermes OAuth credentials: %s", e)
-    return None
-
-
-def refresh_hermes_oauth_token() -> Optional[str]:
-    """Refresh the Hermes-managed OAuth token using the stored refresh token.
-
-    Returns the new access token, or None if refresh fails.
-    """
-    creds = read_hermes_oauth_credentials()
-    if not creds or not creds.get("refreshToken"):
-        return None
-
-    try:
-        refreshed = refresh_anthropic_oauth_pure(
-            creds["refreshToken"],
-            use_json=True,
-        )
-        _save_hermes_oauth_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        logger.debug("Successfully refreshed Hermes OAuth token")
-        return refreshed["access_token"]
-    except Exception as e:
-        logger.debug("Failed to refresh Hermes OAuth token: %s", e)
-
     return None
 
 
@@ -864,8 +780,7 @@ def _convert_openai_image_part_to_anthropic(part: Dict[str, Any]) -> Optional[Di
     if url.startswith("data:"):
         header, sep, data = url.partition(",")
         if sep and ";base64" in header:
-            declared = header[5:].split(";", 1)[0] or "image/png"
-            media_type = _verified_media_type(declared, data)
+            media_type = header[5:].split(";", 1)[0] or "image/png"
             return {
                 "type": "image",
                 "source": {
@@ -875,7 +790,7 @@ def _convert_openai_image_part_to_anthropic(part: Dict[str, Any]) -> Optional[Di
                 },
             }
 
-    if url.startswith("http://") or url.startswith("https://"):
+    if url.startswith(("http://", "https://")):
         return {
             "type": "image",
             "source": {
@@ -884,37 +799,6 @@ def _convert_openai_image_part_to_anthropic(part: Dict[str, Any]) -> Optional[Di
             },
         }
 
-    return None
-
-
-def _convert_user_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(part, dict):
-        ptype = part.get("type")
-        if ptype == "text":
-            block = {"type": "text", "text": part.get("text", "")}
-            if isinstance(part.get("cache_control"), dict):
-                block["cache_control"] = dict(part["cache_control"])
-            return block
-        if ptype == "image_url":
-            return _convert_openai_image_part_to_anthropic(part)
-        if ptype == "image" and part.get("source"):
-            return dict(part)
-        if ptype == "image" and part.get("data"):
-            declared = part.get("mimeType") or part.get("media_type") or "image/png"
-            data_b64 = part.get("data", "")
-            media_type = _verified_media_type(declared, data_b64)
-            return {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": data_b64,
-                },
-            }
-        if ptype == "tool_result":
-            return dict(part)
-    elif part is not None:
-        return {"type": "text", "text": str(part)}
     return None
 
 
@@ -941,12 +825,11 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
 
     if url.startswith("data:"):
         header, _, data = url.partition(",")
-        declared = "image/png"
+        media_type = "image/jpeg"
         if header.startswith("data:"):
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
             if mime_part.startswith("image/"):
-                declared = mime_part
-        media_type = _verified_media_type(declared, data)
+                media_type = mime_part
         return {
             "type": "base64",
             "media_type": media_type,
@@ -979,6 +862,69 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     if isinstance(part.get("cache_control"), dict) and "cache_control" not in block:
         block["cache_control"] = dict(part["cache_control"])
     return block
+
+
+def _to_plain_data(value: Any, *, _depth: int = 0, _path: Optional[set] = None) -> Any:
+    """Recursively convert SDK objects to plain Python data structures.
+
+    Guards against circular references (``_path`` tracks ``id()`` of objects
+    on the *current* recursion path) and runaway depth (capped at 20 levels).
+    Uses path-based tracking so shared (but non-cyclic) objects referenced by
+    multiple siblings are converted correctly rather than being stringified.
+    """
+    _MAX_DEPTH = 20
+    if _depth > _MAX_DEPTH:
+        return str(value)
+
+    if _path is None:
+        _path = set()
+
+    obj_id = id(value)
+    if obj_id in _path:
+        return str(value)
+
+    if hasattr(value, "model_dump"):
+        _path.add(obj_id)
+        result = _to_plain_data(value.model_dump(), _depth=_depth + 1, _path=_path)
+        _path.discard(obj_id)
+        return result
+    if isinstance(value, dict):
+        _path.add(obj_id)
+        result = {k: _to_plain_data(v, _depth=_depth + 1, _path=_path) for k, v in value.items()}
+        _path.discard(obj_id)
+        return result
+    if isinstance(value, (list, tuple)):
+        _path.add(obj_id)
+        result = [_to_plain_data(v, _depth=_depth + 1, _path=_path) for v in value]
+        _path.discard(obj_id)
+        return result
+    if hasattr(value, "__dict__"):
+        _path.add(obj_id)
+        result = {
+            k: _to_plain_data(v, _depth=_depth + 1, _path=_path)
+            for k, v in vars(value).items()
+            if not k.startswith("_")
+        }
+        _path.discard(obj_id)
+        return result
+    return value
+
+
+def _extract_preserved_thinking_blocks(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return Anthropic thinking blocks previously preserved on the message."""
+    raw_details = message.get("reasoning_details")
+    if not isinstance(raw_details, list):
+        return []
+
+    preserved: List[Dict[str, Any]] = []
+    for detail in raw_details:
+        if not isinstance(detail, dict):
+            continue
+        block_type = str(detail.get("type", "") or "").strip().lower()
+        if block_type not in {"thinking", "redacted_thinking"}:
+            continue
+        preserved.append(copy.deepcopy(detail))
+    return preserved
 
 
 def _convert_content_to_anthropic(content: Any) -> Any:
@@ -1027,7 +973,7 @@ def convert_messages_to_anthropic(
             continue
 
         if role == "assistant":
-            blocks = []
+            blocks = _extract_preserved_thinking_blocks(m)
             if content:
                 if isinstance(content, list):
                     converted_content = _convert_content_to_anthropic(content)
@@ -1278,9 +1224,9 @@ def build_anthropic_kwargs(
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6 models use adaptive thinking + output_config.effort.
     # Older models use manual thinking with budget_tokens.
-    # Haiku models do NOT support extended thinking at all — skip entirely.
+    # Haiku and MiniMax models do NOT support extended thinking — skip entirely.
     if reasoning_config and isinstance(reasoning_config, dict):
-        if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
+        if reasoning_config.get("enabled") is not False and "haiku" not in model.lower() and "minimax" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
             if _supports_adaptive_thinking(model):
@@ -1311,6 +1257,7 @@ def normalize_anthropic_response(
     """
     text_parts = []
     reasoning_parts = []
+    reasoning_details = []
     tool_calls = []
 
     for block in response.content:
@@ -1318,6 +1265,9 @@ def normalize_anthropic_response(
             text_parts.append(block.text)
         elif block.type == "thinking":
             reasoning_parts.append(block.thinking)
+            block_dict = _to_plain_data(block)
+            if isinstance(block_dict, dict):
+                reasoning_details.append(block_dict)
         elif block.type == "tool_use":
             name = block.name
             if strip_tool_prefix and name.startswith(_MCP_TOOL_PREFIX):
@@ -1348,7 +1298,7 @@ def normalize_anthropic_response(
             tool_calls=tool_calls or None,
             reasoning="\n\n".join(reasoning_parts) if reasoning_parts else None,
             reasoning_content=None,
-            reasoning_details=None,
+            reasoning_details=reasoning_details or None,
         ),
         finish_reason,
     )
