@@ -42,6 +42,15 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+# ── Myah: Sentry integration ──────────────────────────────────────────────
+try:
+    from logging_setup import setup_sentry as _setup_sentry
+    _setup_sentry()
+except Exception as _e:
+    import logging as _logging
+    _logging.warning('logging_setup failed: %s', _e)
+# ───────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 
 # Default settings
@@ -169,7 +178,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, sentry-trace, baggage",
 }
 
 
@@ -242,6 +251,36 @@ if AIOHTTP_AVAILABLE:
         return response
 else:
     security_headers_middleware = None  # type: ignore[assignment]
+
+
+# ── Sentry distributed trace continuation middleware ─────────────────────
+# Reads the sentry-trace and baggage headers injected by the platform backend
+# and continues the trace so agent spans appear in the same Sentry trace as
+# the originating browser request.
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def sentry_trace_middleware(request, handler):
+        """Continue a Sentry distributed trace from the platform backend."""
+        try:
+            import sentry_sdk
+            from sentry_sdk.tracing import Transaction
+
+            sentry_trace = request.headers.get('sentry-trace')
+            baggage = request.headers.get('baggage')
+            if sentry_trace:
+                transaction = Transaction.continue_from_headers(
+                    {'sentry-trace': sentry_trace, 'baggage': baggage or ''},
+                    op='http.server',
+                    name=f'{request.method} {request.path}',
+                )
+                with sentry_sdk.start_transaction(transaction):
+                    return await handler(request)
+        except Exception:
+            pass  # Sentry not configured — fall through
+        return await handler(request)
+else:
+    sentry_trace_middleware = None  # type: ignore[assignment]
 
 
 class _IdempotencyCache:
@@ -1604,7 +1643,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, sentry_trace_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
