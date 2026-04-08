@@ -60,12 +60,21 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Generative UI — render interactive components inline in chat
+    "render_ui", "render_custom",
 ]
 
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
+    # Generative UI — render interactive components inline in chat
+    "render_ui": {
+        "description": "Generative UI — render interactive components inline in chat (dashboards, forms, approvals, tables)",
+        "tools": ["render_ui", "render_custom"],
+        "includes": []
+    },
+
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
@@ -270,11 +279,13 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            # Generative UI — render interactive components inline in chat
+            "render_ui", "render_custom",
 
         ],
         "includes": []
     },
-    
+
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
