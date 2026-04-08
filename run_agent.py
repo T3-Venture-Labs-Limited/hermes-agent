@@ -38,10 +38,7 @@ import threading
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
-try:
-    from langfuse.openai import OpenAI
-except ImportError:
-    from openai import OpenAI
+from openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path

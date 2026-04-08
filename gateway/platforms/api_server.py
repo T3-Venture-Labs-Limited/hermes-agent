@@ -639,41 +639,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Inject tool progress into the SSE stream for Open WebUI.
-
-                Also emits structured tool.event SSE events so the platform
-                frontend can render live tool call status without parsing
-                markdown.
-                """
+                """Inject tool progress into the SSE stream for Open WebUI."""
                 if name and name.startswith("_"):
-                    return  # Skip internal events (_thinking)
-                if event_type == "tool.started":
-                    # Human-readable progress text
-                    from agent.display import get_tool_emoji
-                    emoji = get_tool_emoji(name)
-                    label = preview or name
-                    _stream_q.put(f"\n`{emoji} {label}`\n")
-                    # Structured tool.event for the platform frontend
-                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
-                    _stream_q.put({
-                        "_event_type": "tool.event",
-                        "object": "tool.event",
-                        "type": "start",
-                        "call_id": call_id,
-                        "name": name,
-                        "args": args or {},
-                    })
-                elif event_type == "tool.completed":
-                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
-                    _stream_q.put({
-                        "_event_type": "tool.event",
-                        "object": "tool.event",
-                        "type": "complete",
-                        "call_id": call_id,
-                        "name": name,
-                        "args": args or {},
-                        "result": kwargs.get("result"),
-                    })
+                    return
+                if event_type != "tool.started":
+                    return
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+                label = preview or name
+                _stream_q.put(f"\n`{emoji} {label}`\n")
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1404,27 +1378,7 @@ class APIServerAdapter(BasePlatformAdapter):
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
         """
-        import contextvars as _cv
-
         loop = asyncio.get_event_loop()
-
-        _req_metadata = getattr(self, "_last_request_metadata", {}) or {}
-
-        try:
-            from langfuse import propagate_attributes as _lf_prop, get_client as _lf_get
-            _lf_ctx = _lf_prop(
-                session_id=_req_metadata.get("session_id") or session_id or None,
-                user_id=_req_metadata.get("user_id") or None,
-                tags=["hermes", "myah"],
-                metadata={
-                    "chat_id": _req_metadata.get("chat_id", ""),
-                    "message_id": _req_metadata.get("message_id", ""),
-                },
-            )
-        except Exception:
-            import contextlib
-            _lf_ctx = contextlib.nullcontext()
-            _lf_get = None
 
         def _run():
             agent = self._create_agent(
@@ -1435,24 +1389,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
-
-            try:
-                from langfuse import observe as _lf_obs
-                _conv_fn = _lf_obs(as_type="agent", name="hermes-conversation")(agent.run_conversation)
-            except Exception:
-                _conv_fn = agent.run_conversation
-
-            result = _conv_fn(
+            result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
             )
-
-            if _lf_get is not None:
-                try:
-                    _lf_get().flush()
-                except Exception:
-                    pass
-
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -1460,9 +1400,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return result, usage
 
-        with _lf_ctx:
-            _ctx_snapshot = _cv.copy_context()
-            return await loop.run_in_executor(None, lambda: _ctx_snapshot.run(_run))
+        return await loop.run_in_executor(None, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -1482,17 +1420,26 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        _call_ids: dict = {}  # tool_name -> last call_id (for start/complete correlation)
+
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
+            call_id = kwargs.get('call_id') or kwargs.get('tool_call_id', '')
             if event_type == "tool.started":
+                if call_id:
+                    _call_ids[tool_name] = call_id
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "call_id": call_id,
+                    "args": args if isinstance(args, dict) else {},
                 })
             elif event_type == "tool.completed":
+                if not call_id:
+                    call_id = _call_ids.pop(tool_name, '')
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -1500,6 +1447,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "call_id": call_id,
+                    "args": args if isinstance(args, dict) else {},
+                    "result": kwargs.get("result", ""),
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -1616,6 +1566,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
+
+                def _tool_start_cb(call_id, name, args):
+                    event_cb("tool.started", name, None, args, call_id=call_id)
+
+                def _tool_complete_cb(call_id, name, args, result):
+                    event_cb("tool.completed", name, None, args, call_id=call_id, result=result)
+
+                agent.tool_start_callback = _tool_start_cb
+                agent.tool_complete_callback = _tool_complete_cb
+
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,

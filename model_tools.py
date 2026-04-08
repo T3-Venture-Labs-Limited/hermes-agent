@@ -31,12 +31,6 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
-try:
-    import langfuse
-    _langfuse_observe = langfuse.observe(as_type='tool')
-except ImportError:
-    _langfuse_observe = lambda fn: fn  # no-op decorator
-
 
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
@@ -463,7 +457,6 @@ def _coerce_boolean(value: str):
     return value
 
 
-@_langfuse_observe
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
