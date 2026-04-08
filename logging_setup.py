@@ -89,6 +89,8 @@ def setup_sentry() -> None:
     """Initialize Sentry if SENTRY_DSN_AGENT is set.
 
     Call after setup_logging() at container startup.
+    Enables error capture, distributed tracing (so traces from the platform
+    backend flow through into the agent), profiling, and structured logging.
     """
     dsn = os.environ.get('SENTRY_DSN_AGENT', '')
     if not dsn:
@@ -96,14 +98,31 @@ def setup_sentry() -> None:
 
     try:
         import sentry_sdk
+        from sentry_sdk.integrations.logging import LoggingIntegration
+        import logging as _logging
 
         sentry_sdk.init(
             dsn=dsn,
-            traces_sample_rate=0,
             environment=os.environ.get('ENV', 'production'),
+            # Trace every agent request — the agent handles low traffic so 100%
+            # gives full visibility into which LLM calls and tool calls are slow.
+            traces_sample_rate=1.0,
+            # Continuous profiling tied to active spans
+            profile_session_sample_rate=1.0,
+            profile_lifecycle='trace',
+            send_default_pii=True,
+            # Forward structured logs to Sentry
+            enable_logs=True,
+            integrations=[
+                # Bridge Python stdlib logging → Sentry breadcrumbs and issues
+                LoggingIntegration(
+                    level=_logging.WARNING,
+                    event_level=_logging.ERROR,
+                ),
+            ],
         )
         sentry_sdk.set_tag('user_id', os.environ.get('MYAH_USER_ID', 'unknown'))
         sentry_sdk.set_tag('service', _SERVICE)
-        logger.info('Sentry error tracking enabled for agent container')
+        logger.info('Sentry error tracking, tracing and logging enabled for agent container')
     except Exception as e:
         logger.warning(f'Sentry init failed: {e}')

@@ -165,6 +165,11 @@ def _discover_tools():
         try:
             importlib.import_module(mod_name)
         except Exception as e:
+            # Print directly to stderr so this is always visible in container
+            # logs regardless of log level — a silently-dropped tool module
+            # causes tools to disappear from the final selection with no trace.
+            import sys
+            print(f"⚠️  Tool module import failed: {mod_name}: {e}", file=sys.stderr)
             logger.warning("Could not import tool module %s: %s", mod_name, e)
 
 
