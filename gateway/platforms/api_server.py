@@ -588,6 +588,16 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
+        # Stash request metadata for Langfuse context propagation
+        self._last_request_metadata = body.get("metadata", {}) or {}
+        _corr = {
+            k: self._last_request_metadata.get(k, '')
+            for k in ('message_id', 'chat_id', 'user_id')
+            if self._last_request_metadata.get(k)
+        }
+        if _corr:
+            logger.debug('Chat completion request received: %s', _corr)
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -604,15 +614,41 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Inject tool progress into the SSE stream for Open WebUI."""
-                if event_type != "tool.started":
-                    return  # Only show tool start events in chat stream
-                if name.startswith("_"):
+                """Inject tool progress into the SSE stream for Open WebUI.
+
+                Also emits structured tool.event SSE events so the platform
+                frontend can render live tool call status without parsing
+                markdown.
+                """
+                if name and name.startswith("_"):
                     return  # Skip internal events (_thinking)
-                from agent.display import get_tool_emoji
-                emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                if event_type == "tool.started":
+                    # Human-readable progress text
+                    from agent.display import get_tool_emoji
+                    emoji = get_tool_emoji(name)
+                    label = preview or name
+                    _stream_q.put(f"\n`{emoji} {label}`\n")
+                    # Structured tool.event for the platform frontend
+                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
+                    _stream_q.put({
+                        "_event_type": "tool.event",
+                        "object": "tool.event",
+                        "type": "start",
+                        "call_id": call_id,
+                        "name": name,
+                        "args": args or {},
+                    })
+                elif event_type == "tool.completed":
+                    call_id = kwargs.get('call_id') or kwargs.get('tool_call_id') or str(uuid.uuid4())
+                    _stream_q.put({
+                        "_event_type": "tool.event",
+                        "object": "tool.event",
+                        "type": "complete",
+                        "call_id": call_id,
+                        "name": name,
+                        "args": args or {},
+                        "result": kwargs.get("result"),
+                    })
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1343,7 +1379,27 @@ class APIServerAdapter(BasePlatformAdapter):
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
         """
+        import contextvars as _cv
+
         loop = asyncio.get_event_loop()
+
+        _req_metadata = getattr(self, "_last_request_metadata", {}) or {}
+
+        try:
+            from langfuse import propagate_attributes as _lf_prop, get_client as _lf_get
+            _lf_ctx = _lf_prop(
+                session_id=_req_metadata.get("session_id") or session_id or None,
+                user_id=_req_metadata.get("user_id") or None,
+                tags=["hermes", "myah"],
+                metadata={
+                    "chat_id": _req_metadata.get("chat_id", ""),
+                    "message_id": _req_metadata.get("message_id", ""),
+                },
+            )
+        except Exception:
+            import contextlib
+            _lf_ctx = contextlib.nullcontext()
+            _lf_get = None
 
         def _run():
             agent = self._create_agent(
@@ -1354,10 +1410,24 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
-            result = agent.run_conversation(
+
+            try:
+                from langfuse import observe as _lf_obs
+                _conv_fn = _lf_obs(as_type="agent", name="hermes-conversation")(agent.run_conversation)
+            except Exception:
+                _conv_fn = agent.run_conversation
+
+            result = _conv_fn(
                 user_message=user_message,
                 conversation_history=conversation_history,
             )
+
+            if _lf_get is not None:
+                try:
+                    _lf_get().flush()
+                except Exception:
+                    pass
+
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -1365,7 +1435,9 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        with _lf_ctx:
+            _ctx_snapshot = _cv.copy_context()
+            return await loop.run_in_executor(None, lambda: _ctx_snapshot.run(_run))
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
