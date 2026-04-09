@@ -47,7 +47,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, CRON_DIR
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -762,11 +762,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        try:
-            from langfuse import get_client as _lf_get
-            _lf_get().flush()
-        except Exception:
-            pass
         return True, output, final_response, None, result.get("messages", [])
         
     except Exception as e:

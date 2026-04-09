@@ -613,7 +613,7 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
 
-        # Stash request metadata for Langfuse context propagation
+        # Stash request metadata for correlation logging
         self._last_request_metadata = body.get("metadata", {}) or {}
         _corr = {
             k: self._last_request_metadata.get(k, '')
