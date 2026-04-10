@@ -821,7 +821,19 @@ class AIAgent:
                             "X-OpenRouter-Categories": "productivity,cli-agent",
                         },
                     }
-            
+
+            # Fail fast if no usable API key was resolved — sending an empty
+            # key produces a confusing "Missing Authentication header" 401 from
+            # the upstream provider rather than a clear credential error.
+            _resolved_key = str(client_kwargs.get("api_key") or "").strip()
+            _resolved_base = str(client_kwargs.get("base_url") or "").strip()
+            _is_local = any(h in _resolved_base for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+            if not _resolved_key and not _is_local:
+                raise RuntimeError(
+                    "No API key configured. Set OPENROUTER_API_KEY or OPENAI_API_KEY "
+                    "in ~/.hermes/.env, or run 'hermes model' to choose a provider."
+                )
+
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
             # Enable fine-grained tool streaming for Claude on OpenRouter.
@@ -5621,6 +5633,7 @@ class AIAgent:
             "openai/",
             "x-ai/",
             "google/gemini-2",
+            "google/gemma-4",
             "qwen/qwen3",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
@@ -8678,14 +8691,19 @@ class AIAgent:
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
                     # For subagents: relay first line to parent display (existing behaviour).
-                    # For all agents with a structured callback: emit reasoning.available event.
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                     if first_line and getattr(self, '_delegate_depth', 0) > 0:
                         try:
                             self.tool_progress_callback("_thinking", first_line)
                         except Exception:
                             pass
-                    elif _think_text:
+                    elif _think_text and not self._reasoning_deltas_fired:
+                        # Only emit reasoning.available when the model did NOT provide
+                        # structured reasoning deltas (e.g. XML-scratchpad models that
+                        # embed thinking inside the assistant content).  When
+                        # _reasoning_deltas_fired is True, the real tokens already
+                        # streamed via reasoning_callback — emitting content here would
+                        # duplicate the final answer text as reasoning.
                         try:
                             self.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                         except Exception:
