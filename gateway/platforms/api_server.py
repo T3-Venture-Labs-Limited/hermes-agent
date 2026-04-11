@@ -1585,14 +1585,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # so it takes effect immediately without a container restart.
         request_model = body.get("model") or None
 
-        # Set session key so approval.py's get_current_session_key() resolves
-        # correctly from the agent thread (agent thread reads HERMES_SESSION_KEY).
-        os.environ["HERMES_SESSION_KEY"] = session_id
-
         async def _run_and_close():
             from tools.approval import (
                 register_gateway_notify,
                 unregister_gateway_notify,
+                set_current_session_key,
+                reset_current_session_key,
             )
             import uuid as _uuid_mod
 
@@ -1640,16 +1638,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent.tool_complete_callback = _tool_complete_cb
 
                 def _run_sync():
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                    )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+                    # Set the session key as a thread-local context var so approval.py
+                    # can find it without process-global os.environ (which is racy under
+                    # concurrent runs).
+                    _sk_token = set_current_session_key(session_id)
+                    try:
+                        r = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                        )
+                        u = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        return r, u
+                    finally:
+                        reset_current_session_key(_sk_token)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -1674,7 +1679,6 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 unregister_gateway_notify(session_id)
                 self._run_sessions.pop(run_id, None)
-                os.environ.pop("HERMES_SESSION_KEY", None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
