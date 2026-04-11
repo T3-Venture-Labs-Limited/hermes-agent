@@ -917,10 +917,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     try:
                         import urllib.request as _ur
                         import json as _json
+                        # Resolve the chat_id for delivery — prefer explicit
+                        # chat_id on the job, then origin.chat_id.
+                        _job_chat_id = job.get("chat_id") or ""
+                        if not _job_chat_id:
+                            _origin = job.get("origin") or {}
+                            _job_chat_id = _origin.get("chat_id", "")
                         _payload = _json.dumps({
                             "user_id": _user_id,
                             "job_id": job["id"],
                             "job_name": job.get("name", job["id"]),
+                            "chat_id": _job_chat_id,
                             "response": deliver_content if success else f"⚠ Job failed: {error}",
                             "status": "ok" if success else "error",
                             "ran_at": _hermes_now().isoformat(),

@@ -1098,7 +1098,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "chat_id"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -1584,6 +1584,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-request model override — platform passes the user's chosen model
         # so it takes effect immediately without a container restart.
         request_model = body.get("model") or None
+
+        # ── Set session context env vars ─────────────────────────────────
+        # These allow _origin_from_env() in cronjob_tools.py to capture the
+        # chat context when creating cron jobs, so deliver="origin" routes
+        # output back to the correct chat.
+        _body_meta = body.get("metadata", {})
+        _chat_id_from_body = _body_meta.get("chat_id", "")
+        if _chat_id_from_body:
+            os.environ["HERMES_SESSION_PLATFORM"] = "api_server"
+            os.environ["HERMES_SESSION_CHAT_ID"] = str(_chat_id_from_body)
+            os.environ["HERMES_SESSION_CHAT_NAME"] = ""
 
         async def _run_and_close():
             from tools.approval import (
