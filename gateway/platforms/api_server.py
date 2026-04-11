@@ -346,6 +346,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
+        # Session keys for active runs: run_id → session_key (for approval resolution)
+        self._run_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -1583,8 +1585,42 @@ class APIServerAdapter(BasePlatformAdapter):
         # so it takes effect immediately without a container restart.
         request_model = body.get("model") or None
 
+        # Set session key so approval.py's get_current_session_key() resolves
+        # correctly from the agent thread (agent thread reads HERMES_SESSION_KEY).
+        os.environ["HERMES_SESSION_KEY"] = session_id
+
         async def _run_and_close():
+            from tools.approval import (
+                register_gateway_notify,
+                unregister_gateway_notify,
+            )
+            import uuid as _uuid_mod
+
             try:
+                # Register a gateway notify callback for this run's session.
+                # Enables request_action_confirmation() in cronjob_tools.py to
+                # emit tool.confirmation_required SSE events to the frontend.
+                def _confirmation_notify(data: dict) -> None:
+                    """Called from the agent thread when the agent needs user confirmation."""
+                    confirmation_id = _uuid_mod.uuid4().hex
+                    data["confirmation_id"] = confirmation_id
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "event": "tool.confirmation_required",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "confirmation_id": confirmation_id,
+                            "action_type": data.get("action_type", "confirmation"),
+                            "description": data.get("description", ""),
+                            "options": data.get("options", ["approve", "deny"]),
+                            "metadata": data.get("metadata", {}),
+                        })
+                    except Exception:
+                        pass
+
+                register_gateway_notify(session_id, _confirmation_notify)
+                self._run_sessions[run_id] = session_id
+
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
@@ -1636,6 +1672,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                unregister_gateway_notify(session_id)
+                self._run_sessions.pop(run_id, None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1701,6 +1740,47 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _handle_run_confirm(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/confirm — resolve a pending tool confirmation.
+
+        Called by the platform when the user clicks Approve/Deny on a
+        ConfirmationCard.  Unblocks the agent thread that is waiting in
+        request_action_confirmation().
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        session_key = self._run_sessions.get(run_id)
+        if not session_key:
+            return web.json_response(
+                _openai_error(f"No active run or confirmation for run_id={run_id}", code="not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        choice = body.get("choice", "deny")
+        if choice not in ("approve", "approve_session", "deny"):
+            return web.json_response(
+                _openai_error("choice must be 'approve', 'approve_session', or 'deny'"),
+                status=400,
+            )
+
+        from tools.approval import resolve_gateway_approval
+
+        resolved = resolve_gateway_approval(session_key, choice)
+        if resolved == 0:
+            return web.json_response(
+                _openai_error("No pending confirmation to resolve for this run"), status=404
+            )
+
+        return web.json_response({"ok": True, "resolved": resolved})
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -1749,6 +1829,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/confirm", self._handle_run_confirm)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
