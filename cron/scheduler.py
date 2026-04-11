@@ -874,8 +874,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         method="POST",
                     )
                     _urs.urlopen(_rqs, timeout=3)
-                except Exception:
-                    pass
+                except Exception as _wse:
+                    logger.warning("run-started webhook failed: %s", _wse)
             # ────────────────────────────────────────────────────────────
             try:
                 # For recurring jobs (cron/interval), advance next_run_at to the
@@ -944,7 +944,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         )
                         _ur.urlopen(_req, timeout=5)
                     except Exception as _we:
-                        logger.debug("Webhook delivery failed: %s", _we)
+                        logger.warning("run-complete webhook failed: %s", _we)
                 # ────────────────────────────────────────────────────────────
                 executed += 1
 

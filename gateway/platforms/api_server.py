@@ -257,6 +257,14 @@ else:
 # Reads the sentry-trace and baggage headers injected by the platform backend
 # and continues the trace so agent spans appear in the same Sentry trace as
 # the originating browser request.
+#
+# sentry-sdk 2.x API:
+#   continue_trace() sets propagation context on the isolation scope and
+#   returns an unstarted Transaction.  It must be passed to start_transaction()
+#   to actually register it with the hub and make it the active span, which
+#   child spans (gen_ai.*, http.client, etc.) can then attach to.
+#   Using `with continue_trace(...)` alone silently no-ops — the Transaction
+#   .__enter__ logs a warning and does nothing if it was never started.
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
@@ -264,12 +272,11 @@ if AIOHTTP_AVAILABLE:
         """Continue a Sentry distributed trace from the platform backend."""
         try:
             import sentry_sdk
-            from sentry_sdk.tracing import Transaction
 
             sentry_trace = request.headers.get('sentry-trace')
             baggage = request.headers.get('baggage')
             if sentry_trace:
-                transaction = Transaction.continue_from_headers(
+                transaction = sentry_sdk.continue_trace(
                     {'sentry-trace': sentry_trace, 'baggage': baggage or ''},
                     op='http.server',
                     name=f'{request.method} {request.path}',
@@ -1595,6 +1602,15 @@ class APIServerAdapter(BasePlatformAdapter):
             os.environ["HERMES_SESSION_PLATFORM"] = "api_server"
             os.environ["HERMES_SESSION_CHAT_ID"] = str(_chat_id_from_body)
             os.environ["HERMES_SESSION_CHAT_NAME"] = ""
+
+        # Link all AI spans for this run to the originating chat session so
+        # multi-turn conversations appear grouped in Sentry's AI monitoring
+        # dashboard. Uses the chat_id when available, falling back to run_id.
+        try:
+            import sentry_sdk as _sentry
+            _sentry.ai.set_conversation_id(_chat_id_from_body or run_id)
+        except Exception:
+            pass
 
         async def _run_and_close():
             from tools.approval import (

@@ -30,6 +30,7 @@ def setup_sentry() -> None:
         sentry_sdk.init(
             dsn=dsn,
             environment=os.environ.get('ENV', 'production'),
+            release=os.environ.get('SENTRY_RELEASE'),
             traces_sample_rate=1.0,
             profile_session_sample_rate=1.0,
             profile_lifecycle='trace',
