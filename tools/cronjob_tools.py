@@ -26,6 +26,7 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
+from tools.approval import request_action_confirmation
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,33 @@ def cronjob(
                 script_error = _validate_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
+
+            # ── User confirmation ──────────────────────────────────────────────
+            # Block the agent thread until the user approves or denies.
+            # request_action_confirmation() auto-approves silently when no
+            # gateway callback is registered (e.g. CLI, cron sub-agent).
+            _parsed = parse_schedule(schedule)
+            _schedule_display = _parsed.get("display", schedule)
+            _prompt_preview = (prompt or "")[:120] + ("..." if len(prompt or "") > 120 else "")
+            _conf_choice = request_action_confirmation(
+                action_type="cron_create",
+                description=f"Create recurring task: {(name or _prompt_preview[:50])!r} — {_schedule_display}",
+                options=["approve", "approve_session", "deny"],
+                metadata={
+                    "name": name or _prompt_preview[:50],
+                    "schedule": schedule,
+                    "schedule_display": _schedule_display,
+                    "prompt_preview": _prompt_preview,
+                    "deliver": deliver or "origin",
+                },
+            )
+            if _conf_choice == "deny":
+                return tool_error(
+                    "User denied cron creation. If the user changes their mind, "
+                    "ask them to confirm and try again.",
+                    success=False,
+                )
+            # ── End confirmation ───────────────────────────────────────────────
 
             job = create_job(
                 prompt=prompt or "",
