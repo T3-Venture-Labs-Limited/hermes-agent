@@ -413,6 +413,44 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
+    # ── Deduplication guard ────────────────────────────────────────────────
+    # If a job with the same name+schedule or prompt+schedule was created in
+    # the last 60 seconds, return it instead of creating a duplicate.
+    # This prevents the agent from creating dozens of identical jobs when it
+    # loops (e.g. missing skill, looping on confirmation).
+    _existing = load_jobs()
+    _now_dt = _hermes_now()
+    _norm_name = (name or "").strip().lower()
+    _norm_prompt = (prompt or "").strip()
+    _norm_schedule = (schedule or "").strip().lower()
+    for _j in _existing:
+        try:
+            _created_str = _j.get("created_at", "")
+            if not _created_str:
+                continue
+            _dt = datetime.fromisoformat(_created_str.replace("Z", "+00:00"))
+            # Ensure both are comparable (both aware or both naive)
+            if _dt.tzinfo is None and _now_dt.tzinfo is not None:
+                _dt = _dt.replace(tzinfo=_now_dt.tzinfo)
+            elif _dt.tzinfo is not None and _now_dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=None)
+            _age = (_now_dt - _dt).total_seconds()
+        except Exception:
+            continue
+        if _age < 0 or _age > 60:
+            continue
+        _j_name = (_j.get("name") or "").strip().lower()
+        _j_prompt = (_j.get("prompt") or "").strip()
+        _j_sched = (_j.get("schedule_display") or "").strip().lower()
+        # Match by name (if provided) OR by prompt+schedule combination
+        name_match = bool(_norm_name and _j_name == _norm_name)
+        content_match = bool(
+            _norm_prompt and _norm_schedule and _j_prompt == _norm_prompt and _j_sched == _norm_schedule
+        )
+        if name_match or content_match:
+            return _j
+    # ── End dedup guard ────────────────────────────────────────────────────
+
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
