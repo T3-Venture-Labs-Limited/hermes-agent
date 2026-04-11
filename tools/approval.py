@@ -263,6 +263,100 @@ def pending_approval_count(session_key: str) -> int:
         return len(_gateway_queues.get(session_key, []))
 
 
+def request_action_confirmation(
+    action_type: str,
+    description: str,
+    options: list,
+    metadata: Optional[dict] = None,
+    session_key: Optional[str] = None,
+    timeout: int = 300,
+) -> str:
+    """Request user confirmation for an action (non-terminal-command use case).
+
+    Blocks the calling (agent) thread until the user selects one of the provided
+    *options* or the *timeout* elapses.  Uses the same _ApprovalEntry / gateway
+    queue infrastructure as dangerous-command approvals.
+
+    Args:
+        action_type: Short identifier, e.g. ``"cron_create"``.
+        description: Human-readable summary shown to the user.
+        options: List of choice strings the user can pick, e.g.
+                 ``["approve", "approve_session", "deny"]``.
+        metadata: Optional structured data forwarded to the notification
+                  callback (e.g. job name, schedule, prompt preview).
+        session_key: Override the session key.  Defaults to the current
+                     context-var / HERMES_SESSION_KEY env var.
+        timeout: Seconds to wait before auto-denying.  Default 300 (5 min).
+
+    Returns:
+        The option string chosen by the user, or ``"deny"`` on timeout / error.
+        Returns ``options[0]`` immediately if no gateway callback is registered
+        (CLI, cron sub-agent, etc.) so the action is not silently blocked.
+    """
+    _key = session_key or get_current_session_key()
+
+    notify_cb = None
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(_key)
+
+    if notify_cb is None:
+        # No gateway callback registered (e.g. cron, CLI without approval
+        # support). Auto-approve so the action is not silently blocked.
+        logger.debug(
+            'request_action_confirmation: no notify callback for session %s, '
+            'auto-approving %s',
+            _key,
+            action_type,
+        )
+        return options[0] if options else 'approve'
+
+    confirmation_data = {
+        'action_type': action_type,
+        'description': description,
+        'options': list(options),
+        'metadata': metadata or {},
+        # Distinguish from dangerous-command entries so both can coexist
+        '_confirmation': True,
+    }
+    entry = _ApprovalEntry(confirmation_data)
+
+    with _lock:
+        _gateway_queues.setdefault(_key, []).append(entry)
+
+    try:
+        notify_cb(confirmation_data)
+    except Exception as exc:
+        logger.warning('request_action_confirmation: notify callback failed: %s', exc)
+        with _lock:
+            queue = _gateway_queues.get(_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(_key, None)
+        return 'deny'
+
+    resolved = entry.event.wait(timeout=timeout)
+
+    with _lock:
+        queue = _gateway_queues.get(_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(_key, None)
+
+    choice = entry.result
+    if not resolved or choice is None:
+        logger.warning(
+            'request_action_confirmation: timed out waiting for user '
+            '(session=%s action=%s)',
+            _key,
+            action_type,
+        )
+        return 'deny'
+
+    return choice
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
