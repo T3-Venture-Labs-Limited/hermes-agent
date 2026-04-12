@@ -156,6 +156,7 @@ def _handle_send(args):
         "wecom": Platform.WECOM,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "myah": Platform.MYAH,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -396,6 +397,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.MYAH:
+            result = await _send_myah(pconfig, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -925,6 +928,46 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         }
     except Exception as e:
         return _error(f"Feishu send failed: {e}")
+
+
+async def _send_myah(pconfig, chat_id: str, message: str):
+    """Send a message to a Myah chat via the live adapter's send() method.
+
+    The Myah adapter uses SSE streams — messages can only be delivered when
+    the adapter is running inside the gateway process with an active stream
+    for the target chat_id.  There is no standalone HTTP API for pushing
+    messages to Myah chats.
+    """
+    try:
+        from gateway.platforms.api_server import get_shared_app
+        app = get_shared_app()
+        if app is None:
+            return {"error": "Myah adapter not available (gateway API server not running)"}
+
+        # The Myah adapter registers itself on the shared aiohttp app.
+        # Access the running adapter instance via the app's frozen state
+        # if available, otherwise scan registered adapters.
+        from gateway.platforms.myah import MyahAdapter
+        myah_adapter = app.get("myah_adapter")
+
+        if myah_adapter is None:
+            # Fallback: the adapter isn't stored on the app — Myah messages
+            # can only be sent when there's an active SSE stream, which
+            # requires the adapter instance.
+            return {
+                "error": (
+                    "Myah adapter instance not accessible. Myah messages are "
+                    "delivered via SSE streams — cross-platform send_message "
+                    "to Myah is not yet supported."
+                )
+            }
+
+        result = await myah_adapter.send(chat_id, message)
+        if result.success:
+            return {"success": True, "platform": "myah", "chat_id": chat_id, "message_id": result.message_id}
+        return _error(f"Myah send failed: {result.error}")
+    except Exception as e:
+        return _error(f"Myah send failed: {e}")
 
 
 def _check_send_message():

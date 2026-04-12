@@ -349,6 +349,12 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "myah": (
+        "User is interacting via the Myah web platform. "
+        "Full markdown rendering is supported including code blocks, tables, "
+        "images (via URL), and links. The user can see tool call progress "
+        "and reasoning in real time."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000

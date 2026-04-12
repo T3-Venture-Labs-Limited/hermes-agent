@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    MYAH = "myah"
 
 
 @dataclass
@@ -882,6 +883,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+
+    # Myah Web Platform
+    myah_enabled = os.getenv("MYAH_ADAPTER_ENABLED", "").lower() in ("true", "1", "yes")
+    myah_auth_key = os.getenv("MYAH_ADAPTER_AUTH_KEY", "")
+    if myah_enabled or myah_auth_key:
+        if Platform.MYAH not in config.platforms:
+            config.platforms[Platform.MYAH] = PlatformConfig()
+        config.platforms[Platform.MYAH].enabled = True
+        if myah_auth_key:
+            config.platforms[Platform.MYAH].extra["auth_key"] = myah_auth_key
+        myah_port = os.getenv("MYAH_ADAPTER_PORT")
+        if myah_port:
+            try:
+                config.platforms[Platform.MYAH].extra["port"] = int(myah_port)
+            except ValueError:
+                pass
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")

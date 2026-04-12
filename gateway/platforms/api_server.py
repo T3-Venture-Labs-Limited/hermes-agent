@@ -37,6 +37,17 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+
+# Module-level reference to the shared aiohttp app for cross-adapter route registration.
+# Set by APIServerAdapter.connect(), cleared by disconnect().
+_shared_app: Optional["web.Application"] = None
+
+
+def get_shared_app() -> Optional["web.Application"]:
+    """Return the shared aiohttp web.Application, if the API server is connected."""
+    return _shared_app
+
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -1912,6 +1923,8 @@ class APIServerAdapter(BasePlatformAdapter):
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, sentry_trace_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
+            global _shared_app
+            _shared_app = self._app
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
@@ -1978,6 +1991,8 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._app = None
+        global _shared_app
+        _shared_app = None
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

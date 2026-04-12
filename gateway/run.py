@@ -1656,6 +1656,15 @@ class GatewayRunner:
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
+        elif platform == Platform.MYAH:
+            from gateway.platforms.myah import MyahAdapter, check_myah_requirements
+            if not check_myah_requirements():
+                logger.warning("Myah: requirements not met")
+                return None
+            adapter = MyahAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -1674,7 +1683,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.MYAH):
             return True
 
         user_id = source.user_id
@@ -1694,6 +1703,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.MYAH: "MYAH_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -1708,6 +1718,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.MYAH: "MYAH_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -1758,6 +1769,10 @@ class GatewayRunner:
                 check_ids.add(normalized_user_id)
 
         return bool(check_ids & allowed_ids)
+
+    def _get_adapter_for_platform(self, platform: 'Platform') -> Optional['BasePlatformAdapter']:
+        """Get the active adapter instance for a platform."""
+        return self.adapters.get(platform)
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
         """Return how unauthorized DMs should be handled for a platform."""
@@ -6712,10 +6727,27 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+
+            # Check if the platform adapter wants structured event callbacks
+            # (e.g., Myah web adapter needs SSE events, not text editing)
+            _structured_cbs = None
+            if source and source.platform:
+                _platform_adapter = self._get_adapter_for_platform(source.platform)
+                if _platform_adapter and hasattr(_platform_adapter, 'get_structured_callbacks'):
+                    _structured_cbs = _platform_adapter.get_structured_callbacks(session_key)
+
+            if _structured_cbs:
+                agent.stream_delta_callback = _structured_cbs.get('stream_delta')
+                agent.tool_progress_callback = _structured_cbs.get('tool_progress')
+                if hasattr(agent, 'reasoning_callback'):
+                    agent.reasoning_callback = _structured_cbs.get('reasoning')
+                agent.status_callback = _structured_cbs.get('status')
+            else:
+                agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+                agent.stream_delta_callback = _stream_delta_cb
+                agent.status_callback = _status_callback_sync
+
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
-            agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
 
             # Background review delivery — send "💾 Memory updated" etc. to user
