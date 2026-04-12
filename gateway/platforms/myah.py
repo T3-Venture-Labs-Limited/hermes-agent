@@ -660,6 +660,12 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_post("/myah/v1/message", self._handle_message_endpoint)
         app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
+
+        # Register management API routes (config, skills, plugins, MCP,
+        # toolsets, sessions) with the same bearer token auth.
+        from gateway.platforms.myah_management import register_management_routes
+        register_management_routes(app, auth_key=self._auth_key)
+
         self._routes_registered = True
         logger.info("[%s] Routes registered on shared aiohttp app (pre-setup hook)", self.name)
 
