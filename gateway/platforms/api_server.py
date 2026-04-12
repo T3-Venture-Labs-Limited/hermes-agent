@@ -1708,51 +1708,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     finally:
                         reset_current_session_key(_sk_token)
 
-                # ── Sentry: agent run span ────────────────────────────────────
-                # The HTTP handler (POST /v1/runs) returns 202 immediately and the
-                # agent runs in a background asyncio task. By the time run_in_executor
-                # fires, the sentry_trace_middleware transaction is already closed.
-                # Solution: start the gen_ai.invoke_agent span HERE in the async
-                # context (while the transaction is still open), pass it into the
-                # thread explicitly, and finish it after run_in_executor returns.
-                _sentry_agent_span = None
-                try:
-                    import sentry_sdk as _sentry
-                    _agent_model = getattr(agent, 'model', '') or ''
-                    _sentry_agent_span = _sentry.start_span(
-                        op="gen_ai.invoke_agent",
-                        name="invoke_agent Hermes",
-                    )
-                    _sentry_agent_span.set_data("gen_ai.agent.name", "Hermes")
-                    _sentry_agent_span.set_data("gen_ai.request.model", _agent_model)
-                    _sentry_agent_span.set_data("gen_ai.agent.run_id", run_id)
-                    _sentry_agent_span.set_data("gen_ai.agent.session_id", session_id)
-                except Exception:
-                    pass
-
-                # Capture the current contextvars scope so the thread inherits it
-                import contextvars as _cv
-                _sentry_ctx = _cv.copy_context()
+                # ── Sentry: agent run transaction ─────────────────────────────
+                # POST /v1/runs returns 202 immediately — the agent runs in a
+                # background asyncio task on a thread executor. The HTTP transaction
+                # is long closed by then. We create a standalone gen_ai.invoke_agent
+                # transaction INSIDE the thread so it properly measures the full
+                # agent execution duration and acts as root for child LLM/tool spans.
+                _agent_model = getattr(agent, 'model', '') or ''
 
                 def _run_sync_with_span():
-                    # Run inside the captured async context so Sentry SDK sees
-                    # the parent span even though we're in a thread executor.
-                    return _sentry_ctx.run(_run_sync)
-
-                try:
-                    result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
-                finally:
-                    # Close the agent span after the thread finishes, whether it
-                    # succeeded or raised. finish() is idempotent.
                     try:
-                        if _sentry_agent_span is not None:
-                            u_in = usage.get("input_tokens", 0) if isinstance(usage, dict) else 0
-                            u_out = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
-                            _sentry_agent_span.set_data("gen_ai.usage.input_tokens", u_in)
-                            _sentry_agent_span.set_data("gen_ai.usage.output_tokens", u_out)
-                            _sentry_agent_span.finish()
+                        import sentry_sdk as _sentry
+                        _tx = _sentry.start_transaction(
+                            op="gen_ai.invoke_agent",
+                            name="invoke_agent Hermes",
+                            sampled=True,
+                        )
+                        _tx.set_data("gen_ai.agent.name", "Hermes")
+                        _tx.set_data("gen_ai.request.model", _agent_model)
+                        _tx.set_data("gen_ai.agent.run_id", run_id)
+                        _tx.set_data("gen_ai.agent.session_id", session_id)
                     except Exception:
-                        pass
+                        _tx = None
+
+                    try:
+                        result, usage = _run_sync()
+                        try:
+                            if _tx is not None:
+                                u_in = usage.get("input_tokens", 0)
+                                u_out = usage.get("output_tokens", 0)
+                                _tx.set_data("gen_ai.usage.input_tokens", u_in)
+                                _tx.set_data("gen_ai.usage.output_tokens", u_out)
+                        except Exception:
+                            pass
+                        return result, usage
+                    finally:
+                        try:
+                            if _tx is not None:
+                                _tx.finish()
+                        except Exception:
+                            pass
+
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 q.put_nowait({
                     "event": "run.completed",
