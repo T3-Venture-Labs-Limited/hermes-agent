@@ -44,6 +44,9 @@ from gateway.platforms.base import (
 
 # ── Myah: Sentry integration ──────────────────────────────────────────────
 try:
+    import sys as _sys
+    if '/opt/hermes-source' not in _sys.path:
+        _sys.path.insert(0, '/opt/hermes-source')
     from logging_setup import setup_sentry as _setup_sentry
     _setup_sentry()
 except Exception as _e:
