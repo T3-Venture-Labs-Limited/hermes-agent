@@ -262,6 +262,7 @@ class MyahAdapter(BasePlatformAdapter):
                 self._push_event_sync(stream_id, {
                     "event": "run.failed",
                     "stream_id": stream_id,
+                    "run_id": stream_id,
                     "timestamp": time.time(),
                     "error": "No message handler registered (gateway not ready)",
                 })
@@ -302,6 +303,7 @@ class MyahAdapter(BasePlatformAdapter):
             self._push_event_sync(stream_id, {
                 "event": "run.failed",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "error": str(exc),
             })
@@ -315,6 +317,7 @@ class MyahAdapter(BasePlatformAdapter):
                 self._push_event_sync(stream_id, {
                     "event": "run.completed",
                     "stream_id": stream_id,
+                    "run_id": stream_id,
                     "timestamp": time.time(),
                 })
                 # Sentinel to close the SSE stream
@@ -453,6 +456,7 @@ class MyahAdapter(BasePlatformAdapter):
             event_data = {
                 "event": "tool.confirmation_required",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "confirmation_id": confirmation_id,
                 "action_type": approval_data.get("action_type", "confirmation"),
@@ -504,6 +508,7 @@ class MyahAdapter(BasePlatformAdapter):
             _put({
                 "event": "message.delta",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "delta": text,
             })
@@ -517,6 +522,7 @@ class MyahAdapter(BasePlatformAdapter):
             _put({
                 "event": "reasoning.delta",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "text": text,
             })
@@ -525,6 +531,7 @@ class MyahAdapter(BasePlatformAdapter):
             _put({
                 "event": "status",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "text": text,
             })
@@ -546,6 +553,7 @@ class MyahAdapter(BasePlatformAdapter):
             return {
                 "event": "status",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "text": "working",
             }
@@ -556,6 +564,7 @@ class MyahAdapter(BasePlatformAdapter):
             return {
                 "event": "tool.started",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "tool": args[1],
                 "call_id": args[1],
@@ -566,6 +575,7 @@ class MyahAdapter(BasePlatformAdapter):
             return {
                 "event": "tool.completed",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "tool": args[1],
                 "call_id": args[1],
@@ -578,6 +588,7 @@ class MyahAdapter(BasePlatformAdapter):
             return {
                 "event": "reasoning.delta",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "text": args[1],
             }
@@ -585,6 +596,7 @@ class MyahAdapter(BasePlatformAdapter):
             return {
                 "event": "reasoning.available",
                 "stream_id": stream_id,
+                "run_id": stream_id,
                 "timestamp": time.time(),
                 "text": args[2] or "",
             }
@@ -592,6 +604,7 @@ class MyahAdapter(BasePlatformAdapter):
         return {
             "event": "status",
             "stream_id": stream_id,
+            "run_id": stream_id,
             "timestamp": time.time(),
             "text": str(args[0]) if args else "unknown",
         }
@@ -759,6 +772,7 @@ class MyahAdapter(BasePlatformAdapter):
         self._push_event_sync(stream_id, {
             "event": "message.delta",
             "stream_id": stream_id,
+            "run_id": stream_id,
             "timestamp": time.time(),
             "delta": content,
             "message_id": msg_id,
@@ -775,6 +789,7 @@ class MyahAdapter(BasePlatformAdapter):
         self._push_event_sync(stream_id, {
             "event": "status",
             "stream_id": stream_id,
+            "run_id": stream_id,
             "timestamp": time.time(),
             "status": "typing",
         })
