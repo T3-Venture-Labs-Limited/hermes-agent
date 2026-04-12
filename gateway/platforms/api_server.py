@@ -1668,8 +1668,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             op="gen_ai.execute_tool",
                             name=name,
                         )
-                        _span.set_attribute("gen_ai.tool.name", name)
-                        _span.set_attribute("gen_ai.tool.call_id", call_id)
+                        _span.set_data("gen_ai.tool.name", name)
+                        _span.set_data("gen_ai.tool.call_id", call_id)
                         _sentry_tool_spans[call_id] = _span
                     except Exception:
                         pass
@@ -1717,12 +1717,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         _agent_model = getattr(agent, 'model', '') or ''
                         with _sentry.start_span(
                             op="gen_ai.invoke_agent",
-                            name="Hermes agent run",
+                            name="invoke_agent Hermes",
                         ) as _agent_span:
-                            _agent_span.set_attribute("gen_ai.agent.name", "hermes")
-                            _agent_span.set_attribute("gen_ai.request.model", _agent_model)
-                            _agent_span.set_attribute("gen_ai.agent.run_id", run_id)
-                            _agent_span.set_attribute("gen_ai.agent.session_id", session_id)
+                            _agent_span.set_data("gen_ai.agent.name", "Hermes")
+                            _agent_span.set_data("gen_ai.request.model", _agent_model)
+                            _agent_span.set_data("gen_ai.agent.run_id", run_id)
+                            _agent_span.set_data("gen_ai.agent.session_id", session_id)
                             return _run_sync()
                     except Exception:
                         # Sentry unavailable — run without instrumentation
