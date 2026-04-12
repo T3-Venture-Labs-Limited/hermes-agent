@@ -1655,11 +1655,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     model_override=request_model,
                 )
 
+                # ── Sentry: per-tool span tracking ───────────────────────────
+                # Maps call_id -> sentry Span so we can close it on completion.
+                # All Sentry code is guarded — a failure here never affects the agent.
+                _sentry_tool_spans: dict = {}
+
                 def _tool_start_cb(call_id, name, args):
                     event_cb("tool.started", name, None, args, call_id=call_id)
+                    try:
+                        import sentry_sdk as _sentry
+                        _span = _sentry.start_span(
+                            op="gen_ai.execute_tool",
+                            name=name,
+                        )
+                        _span.set_attribute("gen_ai.tool.name", name)
+                        _span.set_attribute("gen_ai.tool.call_id", call_id)
+                        _sentry_tool_spans[call_id] = _span
+                    except Exception:
+                        pass
 
                 def _tool_complete_cb(call_id, name, args, result):
                     event_cb("tool.completed", name, None, args, call_id=call_id, result=result)
+                    try:
+                        _span = _sentry_tool_spans.pop(call_id, None)
+                        if _span is not None:
+                            _span.finish()
+                    except Exception:
+                        pass
 
                 agent.tool_start_callback = _tool_start_cb
                 agent.tool_complete_callback = _tool_complete_cb
@@ -1683,7 +1705,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     finally:
                         reset_current_session_key(_sk_token)
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # ── Sentry: agent run span ────────────────────────────────────
+                # Wraps the entire synchronous agent execution in a gen_ai.invoke_agent
+                # span. This is the parent that groups all LLM calls and tool executions
+                # for one agent run in the Sentry AI Agents dashboard.
+                # run_in_executor moves work to a thread; sentry_sdk 2.x propagates
+                # the current span context via contextvars automatically.
+                def _run_sync_with_span():
+                    try:
+                        import sentry_sdk as _sentry
+                        _agent_model = getattr(agent, 'model', '') or ''
+                        with _sentry.start_span(
+                            op="gen_ai.invoke_agent",
+                            name="Hermes agent run",
+                        ) as _agent_span:
+                            _agent_span.set_attribute("gen_ai.agent.name", "hermes")
+                            _agent_span.set_attribute("gen_ai.request.model", _agent_model)
+                            _agent_span.set_attribute("gen_ai.agent.run_id", run_id)
+                            _agent_span.set_attribute("gen_ai.agent.session_id", session_id)
+                            return _run_sync()
+                    except Exception:
+                        # Sentry unavailable — run without instrumentation
+                        return _run_sync()
+
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 q.put_nowait({
                     "event": "run.completed",

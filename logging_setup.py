@@ -26,6 +26,8 @@ def setup_sentry() -> None:
     try:
         import sentry_sdk
         from sentry_sdk.integrations.logging import LoggingIntegration
+        from sentry_sdk.integrations.openai import OpenAIIntegration
+        from sentry_sdk.integrations.anthropic import AnthropicIntegration
 
         sentry_sdk.init(
             dsn=dsn,
@@ -41,6 +43,10 @@ def setup_sentry() -> None:
                     level=logging.WARNING,
                     event_level=logging.ERROR,
                 ),
+                # Capture prompts and responses so Sentry traces show full
+                # conversation content alongside token counts and latency.
+                OpenAIIntegration(include_prompts=True),
+                AnthropicIntegration(include_prompts=True),
             ],
         )
         sentry_sdk.set_tag('user_id', os.environ.get('MYAH_USER_ID', 'unknown'))
