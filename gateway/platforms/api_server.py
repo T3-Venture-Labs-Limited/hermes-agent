@@ -1669,10 +1669,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         import sentry_sdk as _sentry
                         _span = _sentry.start_span(
                             op="gen_ai.execute_tool",
-                            name=name,
+                            name=f"execute_tool {name}",
                         )
                         _span.set_data("gen_ai.tool.name", name)
                         _span.set_data("gen_ai.tool.call_id", call_id)
+                        _span.set_data("gen_ai.request.model", _agent_model)
                         _sentry_tool_spans[call_id] = _span
                     except Exception:
                         pass
@@ -1725,6 +1726,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             sampled=True,
                         )
                         _tx.set_data("gen_ai.agent.name", "Hermes")
+                        _tx.set_data("gen_ai.operation.name", "invoke_agent")
                         _tx.set_data("gen_ai.request.model", _agent_model)
                         _tx.set_data("gen_ai.agent.run_id", run_id)
                         _tx.set_data("gen_ai.agent.session_id", session_id)
