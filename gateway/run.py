@@ -1111,23 +1111,27 @@ class GatewayRunner:
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         
-        # Initialize and connect each configured platform
+        # Phase 1: Create all adapters (allows cross-adapter pre-setup hooks
+        # to be registered before any adapter connects and freezes state).
+        _pending_adapters = []
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
-            
+
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 logger.warning("No adapter available for %s", platform.value)
                 continue
-            
-            # Set up message + fatal error handlers
+
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
-            
-            # Try to connect
+            _pending_adapters.append((platform, adapter))
+
+        # Phase 2: Connect all adapters (hooks registered during Phase 1 are
+        # invoked by the first adapter that starts a shared resource).
+        for platform, adapter in _pending_adapters:
             logger.info("Connecting to %s...", platform.value)
             try:
                 success = await adapter.connect()

@@ -92,6 +92,14 @@ class MyahAdapter(BasePlatformAdapter):
         # can safely push events to asyncio.Queue via call_soon_threadsafe.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # ── Route registration state ──────────────────────────────────
+        self._routes_registered = False
+        # Register a pre-setup hook so our routes are added to the shared
+        # aiohttp app BEFORE the API server calls runner.setup() (which
+        # freezes the router and rejects new route additions).
+        from gateway.platforms.api_server import register_pre_setup_hook
+        register_pre_setup_hook(self._register_routes_on_app)
+
     # ── Auth ────────────────────────────────────────────────────────────
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
@@ -628,11 +636,30 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── BasePlatformAdapter interface ───────────────────────────────────
 
-    async def connect(self) -> bool:
-        """Register HTTP routes on the shared aiohttp app.
+    def _register_routes_on_app(self, app: "web.Application") -> None:
+        """Pre-setup hook: add Myah routes to the shared aiohttp app.
 
-        Returns False if the API server hasn't connected yet (no shared
-        app available).  The gateway runner retries after 30 seconds.
+        Called by the API server's connect() BEFORE runner.setup() freezes
+        the router.  This is registered in __init__ via register_pre_setup_hook.
+        """
+        app["myah_adapter"] = self
+        app.router.add_get("/myah/health", self._handle_health)
+        app.router.add_post("/myah/v1/message", self._handle_message_endpoint)
+        app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
+        app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
+        self._routes_registered = True
+        logger.info("[%s] Routes registered on shared aiohttp app (pre-setup hook)", self.name)
+
+    async def connect(self) -> bool:
+        """Finalize adapter connection after routes are registered.
+
+        Routes are registered via the pre-setup hook (called during API server
+        connect, before the router is frozen).  This method waits for the API
+        server to be ready, then starts background tasks.
+
+        If routes were already registered via the hook, we just need to verify
+        and start.  If the API server hasn't connected yet, we return False
+        and the gateway retries.
         """
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
@@ -640,25 +667,31 @@ class MyahAdapter(BasePlatformAdapter):
 
         from gateway.platforms.api_server import get_shared_app
         app = get_shared_app()
-        if app is None:
-            logger.info(
-                "[%s] Shared aiohttp app not available yet (API server not connected). "
-                "Will retry.",
-                self.name,
-            )
-            return False
+
+        if not self._routes_registered:
+            if app is None:
+                logger.info(
+                    "[%s] Shared aiohttp app not available yet. Will retry.",
+                    self.name,
+                )
+                return False
+            # API server is up but our pre-setup hook didn't fire (adapter
+            # was created after API server connect).  Try registering routes
+            # directly — this will only work if the router isn't frozen yet.
+            try:
+                self._register_routes_on_app(app)
+            except RuntimeError as e:
+                if "frozen" in str(e).lower():
+                    logger.error(
+                        "[%s] Cannot register routes: aiohttp router is frozen. "
+                        "Ensure MYAH adapter is created BEFORE API_SERVER connect().",
+                        self.name,
+                    )
+                    return False
+                raise
 
         # Capture the event loop for thread-safe queue access (Fix 2)
         self._loop = asyncio.get_running_loop()
-
-        # Store adapter reference on app for cross-platform send_message access
-        app["myah_adapter"] = self
-
-        # Register Myah routes on the shared app
-        app.router.add_get("/myah/health", self._handle_health)
-        app.router.add_post("/myah/v1/message", self._handle_message_endpoint)
-        app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
-        app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
 
         # Start background sweep for orphaned streams
         sweep_task = asyncio.create_task(self._sweep_orphaned_streams())
@@ -670,7 +703,7 @@ class MyahAdapter(BasePlatformAdapter):
             sweep_task.add_done_callback(self._background_tasks.discard)
 
         self._mark_connected()
-        logger.info("[%s] Myah adapter connected (routes registered on shared app)", self.name)
+        logger.info("[%s] Myah adapter connected", self.name)
         return True
 
     async def disconnect(self) -> None:

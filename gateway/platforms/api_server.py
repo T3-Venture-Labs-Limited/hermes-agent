@@ -42,10 +42,27 @@ from gateway.config import Platform, PlatformConfig
 # Set by APIServerAdapter.connect(), cleared by disconnect().
 _shared_app: Optional["web.Application"] = None
 
+# Pre-setup hooks: callbacks registered by other adapters (e.g. Myah) that need
+# to add routes to the shared app BEFORE the aiohttp router is frozen.
+# Each callback receives the web.Application and should add routes to it.
+_pre_setup_hooks: list = []
+
 
 def get_shared_app() -> Optional["web.Application"]:
     """Return the shared aiohttp web.Application, if the API server is connected."""
     return _shared_app
+
+
+def register_pre_setup_hook(hook) -> None:
+    """Register a callback to be invoked after the app is created but before runner.setup().
+
+    Use this when another adapter needs to add routes to the shared aiohttp app.
+    The hook signature is: hook(app: web.Application) -> None
+
+    Must be called BEFORE the API server's connect() — typically in the other
+    adapter's __init__() or from the gateway runner's adapter creation phase.
+    """
+    _pre_setup_hooks.append(hook)
 
 
 from gateway.platforms.base import (
@@ -1964,6 +1981,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
             except (ConnectionRefusedError, OSError):
                 pass  # port is free
+
+            # Invoke pre-setup hooks so other adapters (e.g. Myah) can register
+            # routes before the aiohttp router is frozen by runner.setup().
+            for _hook in _pre_setup_hooks:
+                try:
+                    _hook(self._app)
+                except Exception as _he:
+                    logger.warning("[%s] pre-setup hook failed: %s", self.name, _he)
+            _pre_setup_hooks.clear()
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
