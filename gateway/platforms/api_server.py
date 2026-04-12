@@ -1733,23 +1733,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         _tx = None
 
-                    try:
-                        result, usage = _run_sync()
-                        try:
-                            if _tx is not None:
-                                u_in = usage.get("input_tokens", 0)
-                                u_out = usage.get("output_tokens", 0)
-                                _tx.set_data("gen_ai.usage.input_tokens", u_in)
-                                _tx.set_data("gen_ai.usage.output_tokens", u_out)
-                        except Exception:
-                            pass
-                        return result, usage
-                    finally:
-                        try:
-                            if _tx is not None:
-                                _tx.finish()
-                        except Exception:
-                            pass
+                    if _tx is not None:
+                        # Use 'with' to set the transaction as the current span
+                        # on the scope so auto-instrumented child spans (OpenAI,
+                        # Anthropic, httpx) and our execute_tool spans attach to
+                        # this transaction instead of being orphaned.
+                        with _sentry.start_transaction(_tx):
+                            try:
+                                result, usage = _run_sync()
+                                try:
+                                    u_in = usage.get("input_tokens", 0)
+                                    u_out = usage.get("output_tokens", 0)
+                                    _tx.set_data("gen_ai.usage.input_tokens", u_in)
+                                    _tx.set_data("gen_ai.usage.output_tokens", u_out)
+                                except Exception:
+                                    pass
+                                return result, usage
+                            except Exception:
+                                raise
+                    else:
+                        return _run_sync()
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
