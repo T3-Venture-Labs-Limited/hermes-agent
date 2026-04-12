@@ -1706,29 +1706,50 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_current_session_key(_sk_token)
 
                 # ── Sentry: agent run span ────────────────────────────────────
-                # Wraps the entire synchronous agent execution in a gen_ai.invoke_agent
-                # span. This is the parent that groups all LLM calls and tool executions
-                # for one agent run in the Sentry AI Agents dashboard.
-                # run_in_executor moves work to a thread; sentry_sdk 2.x propagates
-                # the current span context via contextvars automatically.
-                def _run_sync_with_span():
-                    try:
-                        import sentry_sdk as _sentry
-                        _agent_model = getattr(agent, 'model', '') or ''
-                        with _sentry.start_span(
-                            op="gen_ai.invoke_agent",
-                            name="invoke_agent Hermes",
-                        ) as _agent_span:
-                            _agent_span.set_data("gen_ai.agent.name", "Hermes")
-                            _agent_span.set_data("gen_ai.request.model", _agent_model)
-                            _agent_span.set_data("gen_ai.agent.run_id", run_id)
-                            _agent_span.set_data("gen_ai.agent.session_id", session_id)
-                            return _run_sync()
-                    except Exception:
-                        # Sentry unavailable — run without instrumentation
-                        return _run_sync()
+                # The HTTP handler (POST /v1/runs) returns 202 immediately and the
+                # agent runs in a background asyncio task. By the time run_in_executor
+                # fires, the sentry_trace_middleware transaction is already closed.
+                # Solution: start the gen_ai.invoke_agent span HERE in the async
+                # context (while the transaction is still open), pass it into the
+                # thread explicitly, and finish it after run_in_executor returns.
+                _sentry_agent_span = None
+                try:
+                    import sentry_sdk as _sentry
+                    _agent_model = getattr(agent, 'model', '') or ''
+                    _sentry_agent_span = _sentry.start_span(
+                        op="gen_ai.invoke_agent",
+                        name="invoke_agent Hermes",
+                    )
+                    _sentry_agent_span.set_data("gen_ai.agent.name", "Hermes")
+                    _sentry_agent_span.set_data("gen_ai.request.model", _agent_model)
+                    _sentry_agent_span.set_data("gen_ai.agent.run_id", run_id)
+                    _sentry_agent_span.set_data("gen_ai.agent.session_id", session_id)
+                except Exception:
+                    pass
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
+                # Capture the current contextvars scope so the thread inherits it
+                import contextvars as _cv
+                _sentry_ctx = _cv.copy_context()
+
+                def _run_sync_with_span():
+                    # Run inside the captured async context so Sentry SDK sees
+                    # the parent span even though we're in a thread executor.
+                    return _sentry_ctx.run(_run_sync)
+
+                try:
+                    result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
+                finally:
+                    # Close the agent span after the thread finishes, whether it
+                    # succeeded or raised. finish() is idempotent.
+                    try:
+                        if _sentry_agent_span is not None:
+                            u_in = usage.get("input_tokens", 0) if isinstance(usage, dict) else 0
+                            u_out = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
+                            _sentry_agent_span.set_data("gen_ai.usage.input_tokens", u_in)
+                            _sentry_agent_span.set_data("gen_ai.usage.output_tokens", u_out)
+                            _sentry_agent_span.finish()
+                    except Exception:
+                        pass
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 q.put_nowait({
                     "event": "run.completed",
