@@ -87,6 +87,9 @@ class MyahAdapter(BasePlatformAdapter):
         # stream_id → session_key (reverse lookup for confirm endpoint)
         self._stream_sessions: Dict[str, str] = {}
 
+        # Pending secret captures: stream_id → { event: threading.Event, result: dict }
+        self._pending_secrets: Dict[str, Dict] = {}
+
         # ── Thread safety (Fix 2) ──────────────────────────────────────
         # Captured in connect() so callbacks from the agent worker thread
         # can safely push events to asyncio.Queue via call_soon_threadsafe.
@@ -215,9 +218,6 @@ class MyahAdapter(BasePlatformAdapter):
         self._session_streams[session_key] = stream_id
         self._stream_sessions[stream_id] = session_key
 
-        # Register approval notification callback for this session
-        self._register_approval_notify(session_key, stream_id)
-
         # Build the message event
         msg_type = MessageType.COMMAND if message.startswith("/") else MessageType.TEXT
         event = MessageEvent(
@@ -326,17 +326,15 @@ class MyahAdapter(BasePlatformAdapter):
                 except asyncio.QueueFull:
                     pass
 
+            # Unblock any pending secret capture (let callback thread handle cleanup)
+            pending_secret = self._pending_secrets.get(stream_id)
+            if pending_secret:
+                pending_secret['event'].set()
+
             # Clean up dual mappings (Fix 1)
             self._chat_id_streams.pop(chat_id, None)
             self._session_streams.pop(session_key, None)
             self._stream_sessions.pop(stream_id, None)
-
-            # Unregister approval callback
-            try:
-                from tools.approval import unregister_gateway_notify
-                unregister_gateway_notify(session_key)
-            except Exception:
-                pass
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
@@ -431,45 +429,162 @@ class MyahAdapter(BasePlatformAdapter):
 
         return web.json_response({"ok": True, "resolved": resolved})
 
-    # ── Approval notification ───────────────────────────────────────────
+    def _secret_capture_callback(
+        self, var_name: str, prompt: str, metadata=None, stream_id: str = '',
+    ) -> dict:
+        """Prompt the user for a secret via inline SSE card.
 
-    def _register_approval_notify(self, session_key: str, stream_id: str) -> None:
-        """Register a gateway approval notification callback for this session.
-
-        The callback fires from the agent thread when
-        request_action_confirmation() needs user input.  It bridges
-        sync→async using call_soon_threadsafe (Fix 2).
+        Called from the agent worker thread.  Blocks until the user submits
+        the value via POST /myah/v1/secret/{stream_id}, or until timeout.
         """
-        from tools.approval import register_gateway_notify
-
-        def _notify(approval_data: dict) -> None:
-            """Called from agent thread — must be thread-safe."""
-            confirmation_id = uuid.uuid4().hex
-            approval_data["confirmation_id"] = confirmation_id
-
-            # Build the event dict eagerly (we're in the agent thread).
-            # Then use call_soon_threadsafe to push it — passing the
-            # queue's put_nowait directly avoids lambda closure issues.
-            q = self._streams.get(stream_id)
-            if q is None:
-                return
-            event_data = {
-                "event": "tool.confirmation_required",
-                "stream_id": stream_id,
-                "run_id": stream_id,
-                "timestamp": time.time(),
-                "confirmation_id": confirmation_id,
-                "action_type": approval_data.get("action_type", "confirmation"),
-                "description": approval_data.get("description", ""),
-                "options": approval_data.get("options", ["approve", "deny"]),
-                "metadata": approval_data.get("metadata", {}),
+        import threading
+        if not stream_id:
+            return {
+                'success': True,
+                'skipped': True,
+                'stored_as': var_name,
+                'validated': False,
+                'message': 'No stream for secret capture',
             }
-            try:
-                self._loop.call_soon_threadsafe(q.put_nowait, event_data)
-            except RuntimeError:
-                pass  # Loop closed
 
-        register_gateway_notify(session_key, _notify)
+        event = threading.Event()
+        self._pending_secrets[stream_id] = {
+            'event': event,
+            'var_name': var_name,
+            'result': None,
+        }
+
+        # Emit SSE event to frontend (thread-safe — we're in agent thread)
+        meta = metadata or {}
+        self._push_event(stream_id, {
+            'event': 'secret.required',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'var_name': var_name,
+            'prompt': prompt,
+            'help': meta.get('help', ''),
+            'skill_name': meta.get('skill_name', ''),
+        })
+
+        # Block agent thread (same pattern as approval system)
+        resolved = event.wait(timeout=120)
+
+        pending = self._pending_secrets.pop(stream_id, None)
+        if not resolved or not pending or not pending.get('result'):
+            # Timeout or cancelled
+            self._push_event(stream_id, {
+                'event': 'secret.resolved',
+                'stream_id': stream_id,
+                'run_id': stream_id,
+                'timestamp': time.time(),
+                'var_name': var_name,
+                'status': 'timeout',
+            })
+            return {
+                'success': True,
+                'skipped': True,
+                'stored_as': var_name,
+                'validated': False,
+                'message': 'Secret setup timed out.',
+            }
+
+        result = pending['result']
+
+        # Emit resolved event
+        self._push_event(stream_id, {
+            'event': 'secret.resolved',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'var_name': var_name,
+            'status': 'stored',
+        })
+
+        return result
+
+    async def _handle_secret_endpoint(self, request: 'web.Request') -> 'web.Response':
+        """POST /myah/v1/secret/{stream_id} — receive a secret value from the frontend."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        stream_id = request.match_info['stream_id']
+        pending = self._pending_secrets.get(stream_id)
+        if not pending:
+            return web.json_response(
+                {'error': 'No pending secret capture for this stream'}, status=404
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({'error': 'Invalid JSON'}, status=400)
+
+        var_name = body.get('var_name', '')
+        value = body.get('value', '')
+
+        if not value:
+            return web.json_response({'error': 'value is required'}, status=400)
+        if len(value) > 4096:
+            return web.json_response({'error': 'value too long'}, status=400)
+        if var_name != pending['var_name']:
+            return web.json_response(
+                {'error': f"var_name mismatch: expected {pending['var_name']}"}, status=400
+            )
+
+        # Write to .env using the same function the CLI uses
+        try:
+            from hermes_cli.config import save_env_value_secure
+            result = save_env_value_secure(var_name, value)
+            result['skipped'] = False
+            result['message'] = 'Secret stored securely. The value was not exposed to the model.'
+        except Exception as e:
+            logger.error('[myah] Failed to save env value %s: %s', var_name, e)
+            # Unblock the agent thread (leave result=None → callback treats as skip)
+            pending['event'].set()
+            return web.json_response({'error': f'Failed to store: {e}'}, status=500)
+
+        # Unblock the agent thread
+        pending['result'] = result
+        pending['event'].set()
+
+        return web.json_response({'ok': True, 'stored_as': var_name})
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = 'dangerous command',
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Emit a structured approval SSE event instead of plain text.
+
+        Called by the gateway runner when a dangerous command requires
+        approval.  Emits a tool.confirmation_required event so the
+        frontend can render the structured ConfirmationCard UI.
+        """
+        stream_id = self._session_streams.get(session_key)
+        if not stream_id or stream_id not in self._streams:
+            return SendResult(success=False, error='No active stream')
+
+        confirmation_id = uuid.uuid4().hex
+        cmd_preview = command[:500] + '...' if len(command) > 500 else command
+
+        self._push_event_sync(stream_id, {
+            'event': 'tool.confirmation_required',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'confirmation_id': confirmation_id,
+            'action_type': 'exec_approval',
+            'description': f'Command requires approval:\n{cmd_preview}\n\nReason: {description}',
+            'options': ['approve', 'approve_session', 'deny'],
+            'metadata': metadata or {},
+        })
+
+        return SendResult(success=True)
 
     # ── Structured callbacks for gateway runner ───────────────────────────
 
@@ -660,6 +775,7 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_post("/myah/v1/message", self._handle_message_endpoint)
         app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
+        app.router.add_post("/myah/v1/secret/{stream_id}", self._handle_secret_endpoint)
 
         # Register management API routes (config, skills, plugins, MCP,
         # toolsets, sessions) with the same bearer token auth.

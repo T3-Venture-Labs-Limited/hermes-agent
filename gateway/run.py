@@ -7940,7 +7940,6 @@ class GatewayRunner:
                 agent.status_callback = _status_callback_sync
             # ────────────────────────────────────────────────────────
 
-            # These always apply regardless of structured callbacks
             _existing_step_cb = getattr(agent, 'step_callback', None)
             agent.step_callback = _existing_step_cb or (
                 _step_callback_sync if _hooks_ref.loaded_hooks else None
@@ -7952,19 +7951,63 @@ class GatewayRunner:
 
             # ── Myah: Sentry AI monitoring ───────────────────────────
             _sentry_tx = None
+            _sentry_tool_spans: dict = {}
             if _structured_cbs:
                 try:
-                    import sentry_sdk
-                    sentry_sdk.ai.set_conversation_id(session_key)
-                    _sentry_tx = sentry_sdk.start_transaction(
-                        op="gen_ai.invoke_agent",
-                        name=f"hermes.gateway.run ({source.platform.value})",
-                    )
-                    _sentry_tx.__enter__()
-                except (ImportError, AttributeError):
-                    pass
-            # ────────────────────────────────────────────────────────
+                    import sentry_sdk as _sentry
+                    _agent_model = getattr(agent, 'model', '') or ''
 
+                    # Group all AI spans for this conversation under a shared ID
+                    # so multi-turn interactions appear together in Sentry's AI
+                    # monitoring dashboard.  session_id == the Myah chat_id.
+                    _sentry.ai.set_conversation_id(session_id)
+
+                    # Create a standalone gen_ai.invoke_agent transaction.
+                    # run_sync() runs in a thread executor — this is the correct
+                    # thread to create the transaction so that auto-instrumented
+                    # child spans (OpenAI, Anthropic, httpx) and tool spans all
+                    # attach to it rather than being orphaned.
+                    _sentry_tx = _sentry.start_transaction(
+                        op='gen_ai.invoke_agent',
+                        name='invoke_agent Hermes',
+                        sampled=True,
+                    )
+                    _sentry_tx.set_data('gen_ai.agent.name', 'Hermes')
+                    _sentry_tx.set_data('gen_ai.request.model', _agent_model)
+                    _sentry_tx.set_data('gen_ai.agent.session_id', session_id)
+
+                    # Wrap the existing tool_progress callback to also open/close
+                    # gen_ai.execute_tool Sentry spans.  Uses tool name as the key
+                    # since the gateway's callback signature is
+                    # (event_type, tool_name, preview, args, **kwargs).
+                    _orig_tool_cb = agent.tool_progress_callback
+                    if _orig_tool_cb is not None:
+                        def _sentry_tool_progress(*args, **kwargs):
+                            # Always forward to the original SSE-pushing callback
+                            try:
+                                _orig_tool_cb(*args, **kwargs)
+                            except Exception:
+                                pass
+                            # Additionally create/close Sentry tool spans
+                            try:
+                                _ev = args[0] if args else ''
+                                _tname = args[1] if len(args) > 1 else 'unknown'
+                                if _ev == 'tool.started':
+                                    _tspan = _sentry.start_span(
+                                        op='gen_ai.execute_tool',
+                                        name=f'execute_tool {_tname}',
+                                    )
+                                    _tspan.set_data('gen_ai.tool.name', _tname)
+                                    _sentry_tool_spans[_tname] = _tspan
+                                elif _ev == 'tool.completed':
+                                    _tspan = _sentry_tool_spans.pop(_tname, None)
+                                    if _tspan is not None:
+                                        _tspan.finish()
+                            except Exception:
+                                pass
+                        agent.tool_progress_callback = _sentry_tool_progress
+                except Exception:
+                    _sentry_tx = None
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
                 if not _status_adapter:
@@ -8064,6 +8107,11 @@ class GatewayRunner:
                 set_current_session_key,
                 unregister_gateway_notify,
             )
+            from tools.skills_tool import (
+                set_secret_capture_callback,
+                set_secret_session_key,
+                reset_secret_session_key,
+            )
 
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
@@ -8136,18 +8184,76 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
-            try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
-            finally:
-                unregister_gateway_notify(_approval_session_key)
-                reset_current_session_key(_approval_session_token)
-                # ── Myah: close Sentry transaction ───────────────────────
-                if _sentry_tx:
+
+            _secret_cb_registered = False
+            _secret_session_token = None
+            if _platform_adapter and hasattr(_platform_adapter, '_secret_capture_callback'):
+                _sid = _platform_adapter._session_streams.get(session_key) if hasattr(_platform_adapter, '_session_streams') else None
+                if _sid:
+                    def _secret_cb(var_name, prompt, metadata=None, _adapter=_platform_adapter, _stream_id=_sid):
+                        return _adapter._secret_capture_callback(
+                            var_name, prompt, metadata, stream_id=_stream_id,
+                        )
+                    _secret_session_token = set_secret_session_key(_approval_session_key)
+                    set_secret_capture_callback(_approval_session_key, _secret_cb)
+                    _secret_cb_registered = True
+
+            if _sentry_tx is not None:
+                try:
+                    import sentry_sdk as _sentry
+                    _sentry_sdk = _sentry
+                    _sentry_sdk.ai.set_conversation_id(session_key)
+                    _sentry_tx = _sentry_sdk.start_transaction(
+                        op="gen_ai.invoke_agent",
+                        name=f"hermes.gateway.run ({source.platform.value})",
+                    )
+                    _sentry_tx.__enter__()
                     try:
-                        _sentry_tx.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                # ────────────────────────────────────────────────────────
+                        result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                    finally:
+                        unregister_gateway_notify(_approval_session_key)
+                        reset_current_session_key(_approval_session_token)
+                        if _secret_cb_registered:
+                            set_secret_capture_callback(_approval_session_key, None)
+                            if _secret_session_token is not None:
+                                reset_secret_session_key(_secret_session_token)
+                        if _sentry_tx:
+                            try:
+                                _a = agent_holder[0]
+                                _sentry_tx.set_data(
+                                    'gen_ai.usage.input_tokens',
+                                    getattr(_a, 'session_prompt_tokens', 0) or 0,
+                                )
+                                _sentry_tx.set_data(
+                                    'gen_ai.usage.output_tokens',
+                                    getattr(_a, 'session_completion_tokens', 0) or 0,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                _sentry_tx.__exit__(None, None, None)
+                            except Exception:
+                                pass
+                except Exception:
+                    try:
+                        result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                    finally:
+                        unregister_gateway_notify(_approval_session_key)
+                        reset_current_session_key(_approval_session_token)
+                        if _secret_cb_registered:
+                            set_secret_capture_callback(_approval_session_key, None)
+                            if _secret_session_token is not None:
+                                reset_secret_session_key(_secret_session_token)
+            else:
+                try:
+                    result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                finally:
+                    unregister_gateway_notify(_approval_session_key)
+                    reset_current_session_key(_approval_session_token)
+                    if _secret_cb_registered:
+                        set_secret_capture_callback(_approval_session_key, None)
+                        if _secret_session_token is not None:
+                            reset_secret_session_key(_secret_session_token)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
