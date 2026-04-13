@@ -6751,8 +6751,8 @@ class GatewayRunner:
                 agent.stream_delta_callback = _stream_delta_cb
                 agent.status_callback = _status_callback_sync
 
-        agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-        agent.reasoning_config = reasoning_config
+            agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.reasoning_config = reasoning_config
 
         # ── Sentry AI monitoring (Myah structured callback sessions only) ──
         # When the Myah adapter provides structured callbacks, also wire up
