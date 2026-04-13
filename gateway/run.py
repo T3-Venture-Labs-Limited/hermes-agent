@@ -7913,15 +7913,16 @@ class GatewayRunner:
 
             # ── Myah: structured callbacks for typed SSE events ──────
             _structured_cbs = None
-            if hasattr(self.adapters.get(source.platform), 'get_structured_callbacks'):
-                _structured_cbs = self.adapters.get(source.platform).get_structured_callbacks(session_key)
+            _plat_adapter = self.adapters.get(source.platform)
+            if _plat_adapter is not None and hasattr(_plat_adapter, 'get_structured_callbacks'):
+                _structured_cbs = _plat_adapter.get_structured_callbacks(session_key)
 
             if _structured_cbs:
                 agent.tool_progress_callback = _structured_cbs.get("tool_progress")
-                agent.step_callback = _structured_cbs.get("step")
                 agent.stream_delta_callback = _structured_cbs.get("stream_delta")
                 agent.status_callback = _structured_cbs.get("status")
-                agent.reasoning_callback = _structured_cbs.get("reasoning")
+                if hasattr(agent, 'reasoning_callback'):
+                    agent.reasoning_callback = _structured_cbs.get("reasoning")
             else:
                 agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
                 agent.stream_delta_callback = _stream_delta_cb
@@ -7929,7 +7930,8 @@ class GatewayRunner:
             # ────────────────────────────────────────────────────────
 
             # These always apply regardless of structured callbacks
-            agent.step_callback = agent.step_callback or (
+            _existing_step_cb = getattr(agent, 'step_callback', None)
+            agent.step_callback = _existing_step_cb or (
                 _step_callback_sync if _hooks_ref.loaded_hooks else None
             )
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
