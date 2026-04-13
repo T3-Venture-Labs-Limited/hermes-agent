@@ -627,18 +627,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if os.getenv("MYAH_ADAPTER_ENABLED", "").lower() in ("true", "1", "yes"):
             warnings = []
             try:
-                from gateway.config import load_gateway_config
-                config = load_gateway_config()
-                model = config.model or os.getenv("HERMES_MODEL", "")
+                from gateway.run import _resolve_gateway_model
+                model = _resolve_gateway_model() or os.getenv("HERMES_MODEL", "")
                 if not model:
                     warnings.append("No model configured")
             except Exception as e:
-                warnings.append(f"Config load failed: {e}")
+                warnings.append(f"Model check failed: {e}")
 
             try:
                 from hermes_state import SessionDB
                 db = SessionDB()
-                db.list_sessions(limit=1)
+                db.list_sessions_rich(limit=1)
             except Exception as e:
                 warnings.append(f"SessionDB: {e}")
 

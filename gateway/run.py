@@ -1562,24 +1562,35 @@ class GatewayRunner:
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         
-        # Initialize and connect each configured platform
+        # ── Myah: two-pass adapter startup ───────────────────────────
+        # Pass 1 — instantiate ALL adapters and set up handlers.
+        # This ensures MyahAdapter.__init__() registers its pre-setup
+        # hook before APIServerAdapter.connect() freezes the router.
+        # Pass 2 — connect adapters (API_SERVER first so the hook fires
+        # and MYAH routes get registered before the router freezes).
+        _pending: list[tuple] = []  # [(Platform, PlatformConfig, adapter)]
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
-            
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 logger.warning("No adapter available for %s", platform.value)
                 continue
-            
-            # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            
-            # Try to connect
+            _pending.append((platform, platform_config, adapter))
+
+        # Sort: API_SERVER first (fires pre-setup hooks on connect),
+        # MYAH last (expects routes already registered by the hook).
+        _pending.sort(key=lambda t: (
+            0 if t[0] == Platform.API_SERVER else
+            2 if t[0] == Platform.MYAH else 1
+        ))
+
+        for platform, platform_config, adapter in _pending:
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
                 platform.value,
