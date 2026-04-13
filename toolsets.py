@@ -66,13 +66,6 @@ _HERMES_CORE_TOOLS = [
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
-    # Generative UI — render interactive components inline in chat
-    "render_ui": {
-        "description": "Generative UI — render interactive components inline in chat (dashboards, forms, approvals, tables)",
-        "tools": ["render_ui", "render_custom"],
-        "includes": []
-    },
-
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
