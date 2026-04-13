@@ -284,14 +284,19 @@ def _capture_required_environment_variables(
         }
 
     missing_names = [entry["name"] for entry in missing_entries]
-    if _is_gateway_surface():
+
+    # If a secret capture callback is registered, use it regardless of
+    # platform surface.  The Myah web adapter (and potentially future
+    # gateway adapters) can handle interactive secret capture natively.
+    if _secret_capture_callback is not None:
+        pass  # Fall through to the callback loop below (lines 301+)
+    elif _is_gateway_surface():
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
             "gateway_setup_hint": _gateway_setup_hint(),
         }
-
-    if _secret_capture_callback is None:
+    else:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,

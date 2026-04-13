@@ -6918,6 +6918,7 @@ class GatewayRunner:
                 set_current_session_key,
                 unregister_gateway_notify,
             )
+            from tools.skills_tool import set_secret_capture_callback
 
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
@@ -6990,6 +6991,22 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+
+            # Register secret capture callback if the adapter supports it.
+            # Mirrors the approval callback pattern so the Myah web adapter
+            # (and future adapters) can handle interactive secret capture
+            # natively instead of falling back to the gateway_setup_hint.
+            _secret_cb_registered = False
+            if _platform_adapter and hasattr(_platform_adapter, '_secret_capture_callback'):
+                _sid = _platform_adapter._session_streams.get(session_key) if hasattr(_platform_adapter, '_session_streams') else None
+                if _sid:
+                    def _secret_cb(var_name, prompt, metadata=None, _adapter=_platform_adapter, _stream_id=_sid):
+                        return _adapter._secret_capture_callback(
+                            var_name, prompt, metadata, stream_id=_stream_id,
+                        )
+                    set_secret_capture_callback(_secret_cb)
+                    _secret_cb_registered = True
+
             if _sentry_tx is not None:
                 try:
                     import sentry_sdk as _sentry
@@ -6999,6 +7016,8 @@ class GatewayRunner:
                         finally:
                             unregister_gateway_notify(_approval_session_key)
                             reset_current_session_key(_approval_session_token)
+                            if _secret_cb_registered:
+                                set_secret_capture_callback(None)
                         # Record token usage on the transaction now that
                         # run_conversation() has completed.
                         try:
@@ -7020,12 +7039,16 @@ class GatewayRunner:
                     finally:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
+                        if _secret_cb_registered:
+                            set_secret_capture_callback(None)
             else:
                 try:
                     result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
                 finally:
                     unregister_gateway_notify(_approval_session_key)
                     reset_current_session_key(_approval_session_token)
+                    if _secret_cb_registered:
+                        set_secret_capture_callback(None)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

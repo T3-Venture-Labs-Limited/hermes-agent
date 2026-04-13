@@ -503,11 +503,59 @@ class TestSkillViewSecureSetupOnLoad:
         tmp_path,
         monkeypatch,
     ):
+        """Gateway surface hint is returned only when no callback is registered.
+
+        When _secret_capture_callback is None (the default), a gateway surface
+        (e.g. Telegram) should still get the gateway_setup_hint directing the
+        user to the local CLI.  This verifies the elif branch added in the
+        reordered check.
+        """
+        monkeypatch.delenv("TENOR_API_KEY", raising=False)
+
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            None,
+            raising=False,
+        )
+
+        with patch.dict(
+            os.environ, {"HERMES_SESSION_PLATFORM": "telegram"}, clear=False
+        ):
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                _make_skill(
+                    tmp_path,
+                    "gif-search",
+                    frontmatter_extra=(
+                        "required_environment_variables:\n"
+                        "  - name: TENOR_API_KEY\n"
+                        "    prompt: Tenor API key\n"
+                    ),
+                )
+                raw = skill_view("gif-search")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "local cli" in result["gateway_setup_hint"].lower()
+        assert result["content"].startswith("---")
+
+    def test_gateway_load_uses_callback_over_gateway_hint(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Callback takes priority over gateway surface check.
+
+        When _secret_capture_callback is registered, it should fire even on a
+        gateway surface (e.g. Telegram).  No gateway_setup_hint should be
+        returned; the callback handles capture natively.
+        """
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
         called = {"value": False}
 
         def fake_secret_callback(var_name, prompt, metadata=None):
             called["value"] = True
+            os.environ[var_name] = "stored-by-callback"
             return {
                 "success": True,
                 "stored_as": var_name,
@@ -539,8 +587,8 @@ class TestSkillViewSecureSetupOnLoad:
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert called["value"] is False
-        assert "local cli" in result["gateway_setup_hint"].lower()
+        assert called["value"] is True
+        assert result.get("gateway_setup_hint") is None
         assert result["content"].startswith("---")
 
 
