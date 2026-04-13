@@ -6918,7 +6918,11 @@ class GatewayRunner:
                 set_current_session_key,
                 unregister_gateway_notify,
             )
-            from tools.skills_tool import set_secret_capture_callback
+            from tools.skills_tool import (
+                set_secret_capture_callback,
+                set_secret_session_key,
+                reset_secret_session_key,
+            )
 
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
@@ -6997,6 +7001,7 @@ class GatewayRunner:
             # (and future adapters) can handle interactive secret capture
             # natively instead of falling back to the gateway_setup_hint.
             _secret_cb_registered = False
+            _secret_session_token = None
             if _platform_adapter and hasattr(_platform_adapter, '_secret_capture_callback'):
                 _sid = _platform_adapter._session_streams.get(session_key) if hasattr(_platform_adapter, '_session_streams') else None
                 if _sid:
@@ -7004,7 +7009,8 @@ class GatewayRunner:
                         return _adapter._secret_capture_callback(
                             var_name, prompt, metadata, stream_id=_stream_id,
                         )
-                    set_secret_capture_callback(_secret_cb)
+                    _secret_session_token = set_secret_session_key(_approval_session_key)
+                    set_secret_capture_callback(_approval_session_key, _secret_cb)
                     _secret_cb_registered = True
 
             if _sentry_tx is not None:
@@ -7017,7 +7023,9 @@ class GatewayRunner:
                             unregister_gateway_notify(_approval_session_key)
                             reset_current_session_key(_approval_session_token)
                             if _secret_cb_registered:
-                                set_secret_capture_callback(None)
+                                set_secret_capture_callback(_approval_session_key, None)
+                                if _secret_session_token is not None:
+                                    reset_secret_session_key(_secret_session_token)
                         # Record token usage on the transaction now that
                         # run_conversation() has completed.
                         try:
@@ -7040,7 +7048,9 @@ class GatewayRunner:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
                         if _secret_cb_registered:
-                            set_secret_capture_callback(None)
+                            set_secret_capture_callback(_approval_session_key, None)
+                            if _secret_session_token is not None:
+                                reset_secret_session_key(_secret_session_token)
             else:
                 try:
                     result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
@@ -7048,7 +7058,9 @@ class GatewayRunner:
                     unregister_gateway_notify(_approval_session_key)
                     reset_current_session_key(_approval_session_token)
                     if _secret_cb_registered:
-                        set_secret_capture_callback(None)
+                        set_secret_capture_callback(_approval_session_key, None)
+                        if _secret_session_token is not None:
+                            reset_secret_session_key(_secret_session_token)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

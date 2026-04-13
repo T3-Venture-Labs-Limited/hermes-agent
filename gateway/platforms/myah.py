@@ -541,6 +541,8 @@ class MyahAdapter(BasePlatformAdapter):
             result['message'] = 'Secret stored securely. The value was not exposed to the model.'
         except Exception as e:
             logger.error('[myah] Failed to save env value %s: %s', var_name, e)
+            # Unblock the agent thread (leave result=None → callback treats as skip)
+            pending['event'].set()
             return web.json_response({'error': f'Failed to store: {e}'}, status=500)
 
         # Unblock the agent thread

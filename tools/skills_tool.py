@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import contextvars
 import json
 import logging
 
@@ -101,7 +102,13 @@ _PLATFORM_MAP = {
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
 _REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona"})
-_secret_capture_callback = None
+
+# Session-keyed secret capture callbacks (mirrors approval.py pattern).
+# Safe for concurrent sessions — each session has its own callback entry.
+_secret_callbacks: Dict[str, object] = {}  # session_key → callable
+_secret_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'secret_session_key', default=''
+)
 
 
 def load_env() -> Dict[str, str]:
@@ -126,9 +133,26 @@ class SkillReadinessStatus(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
-def set_secret_capture_callback(callback) -> None:
-    global _secret_capture_callback
-    _secret_capture_callback = callback
+def set_secret_capture_callback(session_key: str, callback) -> None:
+    """Register or unregister a secret capture callback for a session.
+
+    Pass callback=None to unregister.  Mirrors the approval.py pattern so
+    concurrent sessions each get their own callback without interference.
+    """
+    if callback is None:
+        _secret_callbacks.pop(session_key, None)
+    else:
+        _secret_callbacks[session_key] = callback
+
+
+def set_secret_session_key(session_key: str) -> contextvars.Token:
+    """Set the session key for secret capture lookups (call from gateway run_sync)."""
+    return _secret_session_key.set(session_key or '')
+
+
+def reset_secret_session_key(token: contextvars.Token) -> None:
+    """Reset the session key after run_conversation completes."""
+    _secret_session_key.reset(token)
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -285,11 +309,15 @@ def _capture_required_environment_variables(
 
     missing_names = [entry["name"] for entry in missing_entries]
 
-    # If a secret capture callback is registered, use it regardless of
-    # platform surface.  The Myah web adapter (and potentially future
-    # gateway adapters) can handle interactive secret capture natively.
-    if _secret_capture_callback is not None:
-        pass  # Fall through to the callback loop below (lines 301+)
+    # Resolve the per-session callback via ContextVar (set by gateway run_sync).
+    # If a callback is registered for the current session, use it regardless of
+    # platform surface.  The Myah web adapter (and potentially future gateway
+    # adapters) can handle interactive secret capture natively.
+    _cur_session_key = _secret_session_key.get()
+    _callback = _secret_callbacks.get(_cur_session_key) if _cur_session_key else None
+
+    if _callback is not None:
+        pass  # Fall through to the callback loop below
     elif _is_gateway_surface():
         return {
             "missing_names": missing_names,
@@ -314,7 +342,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = _callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
