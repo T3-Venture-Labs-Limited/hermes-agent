@@ -40,11 +40,18 @@ def reset_current_session_key(token: contextvars.Token[str]) -> None:
 
 
 def get_current_session_key(default: str = "default") -> str:
-    """Return the active session key, preferring context-local state."""
+    """Return the active session key, preferring context-local state.
+
+    Resolution order:
+    1. approval-specific contextvars (set by gateway before agent.run)
+    2. session_context contextvars (set by _set_session_env)
+    3. os.environ fallback (CLI, cron, tests)
+    """
     session_key = _approval_session_key.get()
     if session_key:
         return session_key
-    return os.getenv("HERMES_SESSION_KEY", default)
+    from gateway.session_context import get_session_env
+    return get_session_env("HERMES_SESSION_KEY", default)
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME.
@@ -99,10 +106,30 @@ DANGEROUS_PATTERNS = [
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
+    # Self-termination via kill + command substitution (pgrep/pidof).
+    # The name-based pattern above catches `pkill hermes` but not
+    # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
+    # to regex at detection time. Catch the structural pattern instead.
+    (r'\bkill\b.*\$\(\s*pgrep\b', "kill process via pgrep expansion (self-termination)"),
+    (r'\bkill\b.*`\s*pgrep\b', "kill process via backtick pgrep expansion (self-termination)"),
     # File copy/move/edit into sensitive system paths
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
     (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    # Script execution via heredoc — bypasses the -e/-c flag patterns above.
+    # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
+    (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
+    # Git destructive operations that can lose uncommitted work or rewrite
+    # shared history. Not captured by rm/chmod/etc patterns.
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
+    (r'\bgit\s+push\b.*--force\b', "git force push (rewrites remote history)"),
+    (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
+    (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
+    # Script execution after chmod +x — catches the two-step pattern where
+    # a script is first made executable then immediately run. The script
+    # content may contain dangerous commands that individual patterns miss.
+    (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
 ]
 
 
@@ -172,6 +199,7 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
+_session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
 # =========================================================================
@@ -257,104 +285,126 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
-def pending_approval_count(session_key: str) -> int:
-    """Return the number of pending blocking approvals for a session."""
-    with _lock:
-        return len(_gateway_queues.get(session_key, []))
+# =========================================================================
+# Generic action confirmation (non-command, Myah platform)
+# =========================================================================
+
+_action_queues: dict[str, dict] = {}  # confirmation_id → {event, result, ...}
 
 
 def request_action_confirmation(
     action_type: str,
     description: str,
-    options: list,
-    metadata: Optional[dict] = None,
-    session_key: Optional[str] = None,
-    timeout: int = 300,
+    options: list[str] | None = None,
+    timeout: float = 300.0,
 ) -> str:
-    """Request user confirmation for an action (non-terminal-command use case).
+    """Block until the user confirms or denies a proposed action.
 
-    Blocks the calling (agent) thread until the user selects one of the provided
-    *options* or the *timeout* elapses.  Uses the same _ApprovalEntry / gateway
-    queue infrastructure as dangerous-command approvals.
+    This is a *generic* blocking confirmation mechanism for non-terminal-command
+    actions (e.g. cron job creation, plugin installation) that mirrors the
+    existing terminal-command approval flow but is triggered by arbitrary tool
+    logic instead of dangerous-command detection.
 
-    Args:
-        action_type: Short identifier, e.g. ``"cron_create"``.
-        description: Human-readable summary shown to the user.
-        options: List of choice strings the user can pick, e.g.
-                 ``["approve", "approve_session", "deny"]``.
-        metadata: Optional structured data forwarded to the notification
-                  callback (e.g. job name, schedule, prompt preview).
-        session_key: Override the session key.  Defaults to the current
-                     context-var / HERMES_SESSION_KEY env var.
-        timeout: Seconds to wait before auto-denying.  Default 300 (5 min).
+    Parameters
+    ----------
+    action_type : str
+        Short machine-readable label, e.g. ``"create_cron_job"``.
+    description : str
+        Human-readable explanation shown to the user.
+    options : list[str] | None
+        Custom response options.  Defaults to ``["approve", "deny"]``.
+    timeout : float
+        Seconds to wait before auto-denying.
 
-    Returns:
-        The option string chosen by the user, or ``"deny"`` on timeout / error.
-        Returns ``options[0]`` immediately if no gateway callback is registered
-        (CLI, cron sub-agent, etc.) so the action is not silently blocked.
+    Returns
+    -------
+    str
+        The chosen option (e.g. ``"approve"``, ``"deny"``,
+        ``"approve_session"``).  If no gateway callback is registered
+        the function returns ``"approve"`` immediately (non-interactive
+        environments like tests or batch runs).
     """
-    _key = session_key or get_current_session_key()
+    import uuid
 
-    notify_cb = None
+    if options is None:
+        options = ["approve", "deny"]
+
+    session_key = get_current_session_key()
+
+    # If no gateway callback is registered, auto-approve (non-interactive).
     with _lock:
-        notify_cb = _gateway_notify_cbs.get(_key)
-
-    if notify_cb is None:
-        # No gateway callback registered (e.g. cron, CLI without approval
-        # support). Auto-approve so the action is not silently blocked.
+        callback = _gateway_notify_cbs.get(session_key)
+    if callback is None:
         logger.debug(
-            'request_action_confirmation: no notify callback for session %s, '
-            'auto-approving %s',
-            _key,
-            action_type,
+            "request_action_confirmation: no gateway callback for %s, auto-approve",
+            session_key,
         )
-        return options[0] if options else 'approve'
+        return "approve"
 
-    confirmation_data = {
-        'action_type': action_type,
-        'description': description,
-        'options': list(options),
-        'metadata': metadata or {},
-        # Distinguish from dangerous-command entries so both can coexist
-        '_confirmation': True,
-    }
-    entry = _ApprovalEntry(confirmation_data)
+    confirmation_id = str(uuid.uuid4())
+    event = threading.Event()
+    result_holder: list[str] = []
 
     with _lock:
-        _gateway_queues.setdefault(_key, []).append(entry)
+        _action_queues[confirmation_id] = {
+            "session_key": session_key,
+            "action_type": action_type,
+            "description": description,
+            "options": options,
+            "event": event,
+            "result": result_holder,
+        }
 
+    # Notify the gateway adapter so it can emit an SSE event to the frontend.
     try:
-        notify_cb(confirmation_data)
-    except Exception as exc:
-        logger.warning('request_action_confirmation: notify callback failed: %s', exc)
-        with _lock:
-            queue = _gateway_queues.get(_key, [])
-            if entry in queue:
-                queue.remove(entry)
-            if not queue:
-                _gateway_queues.pop(_key, None)
-        return 'deny'
+        callback(
+            session_key,
+            {
+                "type": "tool.confirmation_required",
+                "confirmation_id": confirmation_id,
+                "action_type": action_type,
+                "description": description,
+                "options": options,
+            },
+        )
+    except Exception:
+        logger.exception("request_action_confirmation: notify callback failed")
 
-    resolved = entry.event.wait(timeout=timeout)
-
+    # Block until the gateway resolves the confirmation or we time out.
+    resolved = event.wait(timeout=timeout)
     with _lock:
-        queue = _gateway_queues.get(_key, [])
-        if entry in queue:
-            queue.remove(entry)
-        if not queue:
-            _gateway_queues.pop(_key, None)
+        _action_queues.pop(confirmation_id, None)
 
-    choice = entry.result
-    if not resolved or choice is None:
+    if not resolved:
         logger.warning(
-            'request_action_confirmation: timed out waiting for user '
-            '(session=%s action=%s)',
-            _key,
+            "request_action_confirmation timed out after %.0fs for %s",
+            timeout,
             action_type,
         )
-        return 'deny'
+        return "deny"
 
+    choice = result_holder[0] if result_holder else "deny"
+    logger.info(
+        "request_action_confirmation resolved: action=%s choice=%s",
+        action_type,
+        choice,
+    )
     return choice
+
+
+def resolve_action_confirmation(confirmation_id: str, choice: str) -> bool:
+    """Resolve a pending action confirmation by id.
+
+    Called by the gateway's confirm endpoint.  Returns True if resolved,
+    False if the confirmation_id is unknown or already resolved.
+    """
+    with _lock:
+        entry = _action_queues.get(confirmation_id)
+    if entry is None:
+        return False
+    entry["result"].append(choice)
+    entry["event"].set()
+    return True
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -363,22 +413,39 @@ def submit_pending(session_key: str, approval: dict):
         _pending[session_key] = approval
 
 
-def pop_pending(session_key: str) -> Optional[dict]:
-    """Retrieve and remove a pending approval for a session."""
-    with _lock:
-        return _pending.pop(session_key, None)
-
-
-def has_pending(session_key: str) -> bool:
-    """Check if a session has a pending approval request."""
-    with _lock:
-        return session_key in _pending
-
-
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
     with _lock:
         _session_approved.setdefault(session_key, set()).add(pattern_key)
+
+
+def enable_session_yolo(session_key: str) -> None:
+    """Enable YOLO bypass for a single session key."""
+    if not session_key:
+        return
+    with _lock:
+        _session_yolo.add(session_key)
+
+
+def disable_session_yolo(session_key: str) -> None:
+    """Disable YOLO bypass for a single session key."""
+    if not session_key:
+        return
+    with _lock:
+        _session_yolo.discard(session_key)
+
+
+def is_session_yolo_enabled(session_key: str) -> bool:
+    """Return True when YOLO bypass is enabled for a specific session."""
+    if not session_key:
+        return False
+    with _lock:
+        return session_key in _session_yolo
+
+
+def is_current_session_yolo_enabled() -> bool:
+    """Return True when the active approval session has YOLO bypass enabled."""
+    return is_session_yolo_enabled(get_current_session_key(default=""))
 
 
 def is_approved(session_key: str, pattern_key: str) -> bool:
@@ -411,12 +478,14 @@ def clear_session(session_key: str):
     """Clear all approvals and pending requests for a session."""
     with _lock:
         _session_approved.pop(session_key, None)
+        _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         _gateway_notify_cbs.pop(session_key, None)
         # Signal ALL blocked threads so they don't hang forever
         entries = _gateway_queues.pop(session_key, [])
         for entry in entries:
             entry.event.set()
+
 
 
 # =========================================================================
@@ -436,7 +505,8 @@ def load_permanent_allowlist() -> set:
         if patterns:
             load_permanent(patterns)
         return patterns
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to load permanent allowlist: %s", e)
         return set()
 
 
@@ -478,7 +548,8 @@ def prompt_dangerous_approval(command: str, description: str,
         try:
             return approval_callback(command, description,
                                      allow_permanent=allow_permanent)
-        except Exception:
+        except Exception as e:
+            logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"
 
     os.environ["HERMES_SPINNER_PAUSE"] = "1"
@@ -560,7 +631,8 @@ def _get_approval_config() -> dict:
         from hermes_cli.config import load_config
         config = load_config()
         return config.get("approvals", {}) or {}
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to load approval config: %s", e)
         return {}
 
 
@@ -648,8 +720,9 @@ def check_dangerous_command(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
-    # --yolo: bypass all approval prompts
-    if os.getenv("HERMES_YOLO_MODE"):
+    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
+    # CLI --yolo remains process-scoped via the env var for local use.
+    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -749,9 +822,10 @@ def check_all_command_guards(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass all approval prompts
+    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or approval_mode == "off":
+    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")

@@ -270,16 +270,11 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+
         ],
         "includes": []
     },
-
-    "hermes-myah": {
-        "description": "Myah web platform toolset",
-        "tools": [t for t in _HERMES_CORE_TOOLS if t not in ("clarify", "send_message", "text_to_speech")],
-        "includes": [],
-    },
-
+    
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
@@ -316,10 +311,22 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-bluebubbles": {
+        "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
+    },
+
+    "hermes-myah": {
+        "description": "Myah web platform toolset",
+        "tools": [t for t in _HERMES_CORE_TOOLS if t not in ("clarify", "send_message", "text_to_speech")],
+        "includes": [],
     },
 
     "hermes-email": {
@@ -352,8 +359,20 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-weixin": {
+        "description": "Weixin bot toolset - personal WeChat messaging via iLink (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-wecom-callback": {
+        "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
@@ -373,7 +392,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook", "hermes-myah"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-webhook", "hermes-myah"]
     }
 }
 

@@ -20,10 +20,13 @@ Requires:
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import os
+import socket as _socket
+import re
 import sqlite3
 import time
 import uuid
@@ -37,58 +40,111 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-
-# Module-level reference to the shared aiohttp app for cross-adapter route registration.
-# Set by APIServerAdapter.connect(), cleared by disconnect().
-_shared_app: Optional["web.Application"] = None
-
-# Pre-setup hooks: callbacks registered by other adapters (e.g. Myah) that need
-# to add routes to the shared app BEFORE the aiohttp router is frozen.
-# Each callback receives the web.Application and should add routes to it.
-_pre_setup_hooks: list = []
-
-
-def get_shared_app() -> Optional["web.Application"]:
-    """Return the shared aiohttp web.Application, if the API server is connected."""
-    return _shared_app
-
-
-def register_pre_setup_hook(hook) -> None:
-    """Register a callback to be invoked after the app is created but before runner.setup().
-
-    Use this when another adapter needs to add routes to the shared aiohttp app.
-    The hook signature is: hook(app: web.Application) -> None
-
-    Must be called BEFORE the API server's connect() — typically in the other
-    adapter's __init__() or from the gateway runner's adapter creation phase.
-    """
-    _pre_setup_hooks.append(hook)
-
-
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+    is_network_accessible,
 )
 
-# ── Myah: Sentry integration ──────────────────────────────────────────────
-try:
-    import sys as _sys
-    if '/opt/hermes-source' not in _sys.path:
-        _sys.path.insert(0, '/opt/hermes-source')
-    from logging_setup import setup_sentry as _setup_sentry
-    _setup_sentry()
-except Exception as _e:
-    import logging as _logging
-    _logging.warning('logging_setup failed: %s', _e)
-# ───────────────────────────────────────────────────────────────────────────
-
 logger = logging.getLogger(__name__)
+
+# ── Myah: shared app reference for cross-adapter access ──────────────
+_shared_app = None
+_pre_setup_hooks: list = []
+
+
+def get_shared_app():
+    """Return the aiohttp app shared by the API server adapter.
+
+    Other adapters (e.g. MyahAdapter) call this to access shared state
+    such as the adapter instance stored on ``app["myah_adapter"]``.
+    """
+    return _shared_app
+
+
+def register_pre_setup_hook(hook):
+    """Register a coroutine to run before runner.setup() in connect().
+
+    The Myah adapter uses this to register its routes on the shared app
+    before the HTTP server starts listening.
+    """
+    _pre_setup_hooks.append(hook)
+# ────────────────────────────────────────────────────────────────────
+
+# ── Myah: Sentry distributed tracing ──────────────────────────────
+try:
+    from logging_setup import setup_sentry
+    setup_sentry()
+except ImportError:
+    pass
+# ────────────────────────────────────────────────────────────────────
 
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
+MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _normalize_chat_content(
+    content: Any, *, _max_depth: int = 10, _depth: int = 0,
+) -> str:
+    """Normalize OpenAI chat message content into a plain text string.
+
+    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
+    typed parts instead of a plain string::
+
+        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
+
+    This function flattens those into a single string so the agent pipeline
+    (which expects strings) doesn't choke.
+
+    Defensive limits prevent abuse: recursion depth, list size, and output
+    length are all bounded.
+    """
+    if _depth > _max_depth:
+        return ""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        for item in items:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item[:MAX_NORMALIZED_TEXT_LENGTH])
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = item.get("text", "")
+                    if text:
+                        try:
+                            parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
+                        except Exception:
+                            pass
+                # Silently skip image_url / other non-text parts
+            elif isinstance(item, list):
+                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
+                if nested:
+                    parts.append(nested)
+            # Check accumulated size
+            if sum(len(p) for p in parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                break
+        result = "\n".join(parts)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+
+    # Fallback for unexpected types (int, float, bool, etc.)
+    try:
+        result = str(content)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+    except Exception:
+        return ""
 
 
 def check_api_server_requirements() -> bool:
@@ -283,42 +339,30 @@ if AIOHTTP_AVAILABLE:
 else:
     security_headers_middleware = None  # type: ignore[assignment]
 
+# ── Myah: Sentry distributed trace continuation ──────────────────
+try:
+    import sentry_sdk
 
-# ── Sentry distributed trace continuation middleware ─────────────────────
-# Reads the sentry-trace and baggage headers injected by the platform backend
-# and continues the trace so agent spans appear in the same Sentry trace as
-# the originating browser request.
-#
-# sentry-sdk 2.x API:
-#   continue_trace() sets propagation context on the isolation scope and
-#   returns an unstarted Transaction.  It must be passed to start_transaction()
-#   to actually register it with the hub and make it the active span, which
-#   child spans (gen_ai.*, http.client, etc.) can then attach to.
-#   Using `with continue_trace(...)` alone silently no-ops — the Transaction
-#   .__enter__ logs a warning and does nothing if it was never started.
-
-if AIOHTTP_AVAILABLE:
-    @web.middleware
-    async def sentry_trace_middleware(request, handler):
-        """Continue a Sentry distributed trace from the platform backend."""
-        try:
-            import sentry_sdk
-
-            sentry_trace = request.headers.get('sentry-trace')
-            baggage = request.headers.get('baggage')
+    if AIOHTTP_AVAILABLE:
+        @web.middleware
+        async def sentry_trace_middleware(request, handler):
+            """Continue a distributed trace from the Myah platform backend."""
+            sentry_trace = request.headers.get("sentry-trace")
+            baggage = request.headers.get("baggage")
             if sentry_trace:
                 transaction = sentry_sdk.continue_trace(
-                    {'sentry-trace': sentry_trace, 'baggage': baggage or ''},
-                    op='http.server',
-                    name=f'{request.method} {request.path}',
+                    {"sentry-trace": sentry_trace, "baggage": baggage or ""},
+                    op="http.server",
+                    name=f"{request.method} {request.path}",
                 )
                 with sentry_sdk.start_transaction(transaction):
                     return await handler(request)
-        except Exception:
-            pass  # Sentry not configured — fall through
-        return await handler(request)
-else:
-    sentry_trace_middleware = None  # type: ignore[assignment]
+            return await handler(request)
+    else:
+        sentry_trace_middleware = None
+except ImportError:
+    sentry_trace_middleware = None
+# ────────────────────────────────────────────────────────────────────
 
 
 class _IdempotencyCache:
@@ -359,6 +403,24 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _derive_chat_session_id(
+    system_prompt: Optional[str],
+    first_user_message: str,
+) -> str:
+    """Derive a stable session ID from the conversation's first user message.
+
+    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
+    conversation history with every request.  The system prompt and first user
+    message are constant across all turns of the same conversation, so hashing
+    them produces a deterministic session ID that lets the API server reuse
+    the same Hermes session (and therefore the same Docker container sandbox
+    directory) across turns.
+    """
+    seed = f"{system_prompt or ''}\n{first_user_message}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -376,6 +438,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
+        self._model_name: str = self._resolve_model_name(
+            extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -384,9 +449,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
-        # Session keys for active runs: run_id → session_key (for approval resolution)
-        self._run_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._run_sessions: Dict[str, str] = {}  # run_id -> session_key (Myah approval)
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -402,6 +466,26 @@ class APIServerAdapter(BasePlatformAdapter):
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _resolve_model_name(explicit: str) -> str:
+        """Derive the advertised model name for /v1/models.
+
+        Priority:
+        1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
+        2. Active profile name (so each profile advertises a distinct model)
+        3. Fallback: "hermes-agent"
+        """
+        if explicit and explicit.strip():
+            return explicit.strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile and profile not in ("default", "custom"):
+                return profile
+        except Exception:
+            pass
+        return "hermes-agent"
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -442,7 +526,8 @@ class APIServerAdapter(BasePlatformAdapter):
         Validate Bearer token from Authorization header.
 
         Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed.
+        If no API key is configured, all requests are allowed (only when API
+        server is local).
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
@@ -496,10 +581,6 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
-
-        model_override — when set, takes precedence over config.yaml and the
-        HERMES_MODEL env var.  Used so the platform can pass the user's
-        chosen model per-request without restarting the container.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
@@ -541,33 +622,32 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — health check with credential validation.
+        """GET /health — simple health check with deeper Myah credential validation."""
+        # ── Myah: deeper credential validation ───────────────────────
+        warnings = []
+        try:
+            from gateway.config import load_gateway_config
+            config = load_gateway_config()
+            model = config.model or os.getenv("HERMES_MODEL", "")
+            if not model:
+                warnings.append("No model configured")
+        except Exception as e:
+            warnings.append(f"Config load failed: {e}")
 
-        Returns 503 if no LLM API key is configured, allowing the platform
-        to detect broken agent containers at startup.
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            db.list_sessions(limit=1)
+        except Exception as e:
+            warnings.append(f"SessionDB: {e}")
 
-        Ref: T3-884
-        """
-        checks = {}
-
-        # Check LLM credentials — at least one must be present for the agent to function
-        llm_keys = ['OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']
-        checks['llm_credentials'] = any(
-            os.environ.get(k, '').strip() for k in llm_keys
-        )
-
-        # Check memory provider (Honcho) — only required if configured
-        honcho_key = os.environ.get('HONCHO_API_KEY', '').strip()
-        checks['memory_provider'] = bool(honcho_key) if honcho_key else True  # True if not configured
-
-        all_ok = all(checks.values())
-        status_code = 200 if all_ok else 503
-
-        return web.json_response({
-            "status": "ok" if all_ok else "degraded",
-            "platform": "hermes-agent",
-            "checks": checks,
-        }, status=status_code)
+        if warnings:
+            return web.json_response(
+                {"status": "degraded", "platform": "hermes-agent", "warnings": warnings},
+                status=200,
+            )
+        # ────────────────────────────────────────────────────────────
+        return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -579,12 +659,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": [
                 {
-                    "id": "hermes-agent",
+                    "id": self._model_name,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "hermes",
                     "permission": [],
-                    "root": "hermes-agent",
+                    "root": self._model_name,
                     "parent": None,
                 }
             ],
@@ -617,7 +697,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = _normalize_chat_content(msg.get("content", ""))
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -642,8 +722,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        #
+        # Security: session continuation exposes conversation history, so it is
+        # only allowed when the API key is configured and the request is
+        # authenticated.  Without this gate, any unauthenticated client could
+        # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            # Sanitize: reject control characters that could enable header injection.
+            if re.search(r'[\r\n\x00]', provided_session_id):
+                return web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
             session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
@@ -653,22 +757,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            session_id = str(uuid.uuid4())
+            # Derive a stable session ID from the conversation fingerprint so
+            # that consecutive messages from the same Open WebUI (or similar)
+            # conversation map to the same Hermes session.  The first user
+            # message + system prompt are constant across all turns.
+            first_user = ""
+            for cm in conversation_messages:
+                if cm.get("role") == "user":
+                    first_user = cm.get("content", "")
+                    break
+            session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", "hermes-agent")
+        model_name = body.get("model", self._model_name)
         created = int(time.time())
-
-        # Stash request metadata for correlation logging
-        self._last_request_metadata = body.get("metadata", {}) or {}
-        _corr = {
-            k: self._last_request_metadata.get(k, '')
-            for k in ('message_id', 'chat_id', 'user_id')
-            if self._last_request_metadata.get(k)
-        }
-        if _corr:
-            logger.debug('Chat completion request received: %s', _corr)
 
         if stream:
             import queue as _q
@@ -686,15 +789,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Inject tool progress into the SSE stream for Open WebUI."""
-                if name and name.startswith("_"):
-                    return
+                """Send tool progress as a separate SSE event.
+
+                Previously, progress markers like ``⏰ list`` were injected
+                directly into ``delta.content``.  OpenAI-compatible frontends
+                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
+                the assistant message and send it back on subsequent requests.
+                After enough turns the model learns to *emit* the markers as
+                plain text instead of issuing real tool calls — silently
+                hallucinating tool results.  See #6972.
+
+                The fix: push a tagged tuple ``("__tool_progress__", payload)``
+                onto the stream queue.  The SSE writer emits it as a custom
+                ``event: hermes.tool.progress`` line that compliant frontends
+                can render for UX but will *not* persist into conversation
+                history.  Clients that don't understand the custom event type
+                silently ignore it per the SSE specification.
+                """
                 if event_type != "tool.started":
+                    return
+                if name.startswith("_"):
                     return
                 from agent.display import get_tool_emoji
                 emoji = get_tool_emoji(name)
                 label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                _stream_q.put(("__tool_progress__", {
+                    "tool": name,
+                    "emoji": emoji,
+                    "label": label,
+                }))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -784,7 +907,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         import queue as _q
 
-        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
         # CORS middleware can't inject headers into StreamResponse after
         # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
@@ -797,6 +924,8 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
+            last_activity = time.monotonic()
+
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -804,6 +933,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+            last_activity = time.monotonic()
+
+            # Helper — route a queue item to the correct SSE event.
+            async def _emit(item):
+                """Write a single queue item to the SSE stream.
+
+                Plain strings are sent as normal ``delta.content`` chunks.
+                Tagged tuples ``("__tool_progress__", payload)`` are sent
+                as a custom ``event: hermes.tool.progress`` SSE event so
+                frontends can display them without storing the markers in
+                conversation history.  See #6972.
+                """
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                else:
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
@@ -818,26 +972,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                content_chunk = {
-                                    "id": completion_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                }
-                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                last_activity = await _emit(delta)
                             except _q.Empty:
                                 break
                         break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
                     continue
 
                 if delta is None:  # End of stream sentinel
                     break
 
-                content_chunk = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                last_activity = await _emit(delta)
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -923,18 +1070,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = item.get("content", "")
-                    # Handle content that may be a list of content parts
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "input_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, dict) and part.get("type") == "output_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
+                    content = _normalize_chat_content(item.get("content", ""))
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -1044,7 +1180,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", "hermes-agent"),
+            "model": body.get("model", self._model_name),
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -1439,6 +1575,7 @@ class APIServerAdapter(BasePlatformAdapter):
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                task_id="default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1467,14 +1604,14 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        _call_ids: dict = {}  # tool_name -> last call_id (for start/complete correlation)
+        _call_ids: Dict[str, str] = {}  # call_id -> tool name
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
-            call_id = kwargs.get('call_id') or kwargs.get('tool_call_id', '')
+            call_id = kwargs.get("call_id", "")
             if event_type == "tool.started":
                 if call_id:
-                    _call_ids[tool_name] = call_id
+                    _call_ids[call_id] = tool_name or ""
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -1482,11 +1619,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "preview": preview,
                     "call_id": call_id,
-                    "args": args if isinstance(args, dict) else {},
+                    "args": str(args)[:500] if args else "",
                 })
             elif event_type == "tool.completed":
-                if not call_id:
-                    call_id = _call_ids.pop(tool_name, '')
+                result = kwargs.get("result")
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -1495,8 +1631,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
                     "call_id": call_id,
-                    "args": args if isinstance(args, dict) else {},
-                    "result": kwargs.get("result", ""),
+                    "args": str(args)[:500] if args else "",
+                    "result": str(result)[:1000] if result else "",
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -1543,7 +1679,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
-        # Wire stream_delta_callback so message.delta events flow through.
+        # Also wire stream_delta_callback so message.delta events flow through
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
@@ -1553,21 +1689,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "delta": delta,
-                })
-            except Exception:
-                pass
-
-        # Wire reasoning_callback so actual chain-of-thought tokens stream
-        # through as reasoning.delta events — identical pipeline to message.delta.
-        def _reasoning_cb(text: str) -> None:
-            if not text:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "reasoning.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "text": text,
                 })
             except Exception:
                 pass
@@ -1619,63 +1740,68 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
-        # Per-request model override — platform passes the user's chosen model
-        # so it takes effect immediately without a container restart.
+
+        # ── Myah: per-request model override ─────────────────────────
         request_model = body.get("model") or None
+        # ────────────────────────────────────────────────────────────
 
-        # ── Set session context env vars ─────────────────────────────────
-        # These allow _origin_from_env() in cronjob_tools.py to capture the
-        # chat context when creating cron jobs, so deliver="origin" routes
-        # output back to the correct chat.
-        _body_meta = body.get("metadata", {})
-        _chat_id_from_body = _body_meta.get("chat_id", "")
-        if _chat_id_from_body:
-            os.environ["HERMES_SESSION_PLATFORM"] = "api_server"
-            os.environ["HERMES_SESSION_CHAT_ID"] = str(_chat_id_from_body)
-            os.environ["HERMES_SESSION_CHAT_NAME"] = ""
+        # ── Myah: session env vars for context ───────────────────────
+        # TODO: os.environ is process-global — concurrent requests will
+        # overwrite each other's CHAT_ID. Migrate to contextvars in a
+        # follow-up (see set_current_session_key() for the pattern).
+        if session_id:
+            os.environ["HERMES_SESSION_PLATFORM"] = "myah"
+            os.environ["CHAT_ID"] = session_id
+        # ────────────────────────────────────────────────────────────
 
-        # Link all AI spans for this run to the originating chat session so
-        # multi-turn conversations appear grouped in Sentry's AI monitoring
-        # dashboard. Uses the chat_id when available, falling back to run_id.
-        try:
-            import sentry_sdk as _sentry
-            _sentry.ai.set_conversation_id(_chat_id_from_body or run_id)
-        except Exception:
-            pass
+        # ── Myah: reasoning token streaming ──────────────────────────
+        def _reasoning_cb(text: str):
+            """Forward reasoning tokens as reasoning.delta SSE events."""
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "reasoning.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "text": text,
+                })
+            except Exception:
+                pass
+        # ────────────────────────────────────────────────────────────
 
         async def _run_and_close():
-            from tools.approval import (
-                register_gateway_notify,
-                unregister_gateway_notify,
-                set_current_session_key,
-                reset_current_session_key,
-            )
-            import uuid as _uuid_mod
-
             try:
-                # Register a gateway notify callback for this run's session.
-                # Enables request_action_confirmation() in cronjob_tools.py to
-                # emit tool.confirmation_required SSE events to the frontend.
-                def _confirmation_notify(data: dict) -> None:
-                    """Called from the agent thread when the agent needs user confirmation."""
-                    confirmation_id = _uuid_mod.uuid4().hex
-                    data["confirmation_id"] = confirmation_id
+                # ── Myah: approval callback for confirmation SSE ─────────
+                from tools.approval import (
+                    register_gateway_notify,
+                    unregister_gateway_notify,
+                    set_current_session_key,
+                    reset_current_session_key,
+                )
+
+                _approval_session_key = f"agent:main:myah:dm:{session_id}" if session_id else "default"
+
+                def _confirmation_notify(sk, payload):
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, {
-                            "event": "tool.confirmation_required",
+                            "event": payload.get("type", "tool.confirmation_required"),
                             "run_id": run_id,
-                            "timestamp": time.time(),
-                            "confirmation_id": confirmation_id,
-                            "action_type": data.get("action_type", "confirmation"),
-                            "description": data.get("description", ""),
-                            "options": data.get("options", ["approve", "deny"]),
-                            "metadata": data.get("metadata", {}),
+                            **payload,
                         })
                     except Exception:
                         pass
 
-                register_gateway_notify(session_id, _confirmation_notify)
-                self._run_sessions[run_id] = session_id
+                register_gateway_notify(_approval_session_key, _confirmation_notify)
+                _approval_session_token = set_current_session_key(_approval_session_key)
+                self._run_sessions[run_id] = _approval_session_key
+                # ────────────────────────────────────────────────────────
+
+                # ── Myah: Sentry AI monitoring ───────────────────────────
+                try:
+                    import sentry_sdk
+                    sentry_sdk.ai.set_conversation_id(session_id or run_id)
+                except (ImportError, AttributeError):
+                    pass
+                # ────────────────────────────────────────────────────────
 
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -1685,104 +1811,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     reasoning_callback=_reasoning_cb,
                     model_override=request_model,
                 )
-
-                # ── Sentry: per-tool span tracking ───────────────────────────
-                # Maps call_id -> sentry Span so we can close it on completion.
-                # All Sentry code is guarded — a failure here never affects the agent.
-                _sentry_tool_spans: dict = {}
-
-                def _tool_start_cb(call_id, name, args):
-                    event_cb("tool.started", name, None, args, call_id=call_id)
-                    try:
-                        import sentry_sdk as _sentry
-                        _span = _sentry.start_span(
-                            op="gen_ai.execute_tool",
-                            name=f"execute_tool {name}",
-                        )
-                        _span.set_data("gen_ai.tool.name", name)
-                        _span.set_data("gen_ai.tool.call_id", call_id)
-                        _span.set_data("gen_ai.request.model", _agent_model)
-                        _sentry_tool_spans[call_id] = _span
-                    except Exception:
-                        pass
-
-                def _tool_complete_cb(call_id, name, args, result):
-                    event_cb("tool.completed", name, None, args, call_id=call_id, result=result)
-                    try:
-                        _span = _sentry_tool_spans.pop(call_id, None)
-                        if _span is not None:
-                            _span.finish()
-                    except Exception:
-                        pass
-
-                agent.tool_start_callback = _tool_start_cb
-                agent.tool_complete_callback = _tool_complete_cb
-
                 def _run_sync():
-                    # Set the session key as a thread-local context var so approval.py
-                    # can find it without process-global os.environ (which is racy under
-                    # concurrent runs).
-                    _sk_token = set_current_session_key(session_id)
-                    try:
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                        )
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
-                        return r, u
-                    finally:
-                        reset_current_session_key(_sk_token)
+                    r = agent.run_conversation(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id="default",
+                    )
+                    u = {
+                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    }
+                    return r, u
 
-                # ── Sentry: agent run transaction ─────────────────────────────
-                # POST /v1/runs returns 202 immediately — the agent runs in a
-                # background asyncio task on a thread executor. The HTTP transaction
-                # is long closed by then. We create a standalone gen_ai.invoke_agent
-                # transaction INSIDE the thread so it properly measures the full
-                # agent execution duration and acts as root for child LLM/tool spans.
-                _agent_model = getattr(agent, 'model', '') or ''
-
-                def _run_sync_with_span():
-                    try:
-                        import sentry_sdk as _sentry
-                        _tx = _sentry.start_transaction(
-                            op="gen_ai.invoke_agent",
-                            name="invoke_agent Hermes",
-                            sampled=True,
-                        )
-                        _tx.set_data("gen_ai.agent.name", "Hermes")
-                        _tx.set_data("gen_ai.operation.name", "invoke_agent")
-                        _tx.set_data("gen_ai.request.model", _agent_model)
-                        _tx.set_data("gen_ai.agent.run_id", run_id)
-                        _tx.set_data("gen_ai.agent.session_id", session_id)
-                    except Exception:
-                        _tx = None
-
-                    if _tx is not None:
-                        # Use 'with' to set the transaction as the current span
-                        # on the scope so auto-instrumented child spans (OpenAI,
-                        # Anthropic, httpx) and our execute_tool spans attach to
-                        # this transaction instead of being orphaned.
-                        with _sentry.start_transaction(_tx):
-                            try:
-                                result, usage = _run_sync()
-                                try:
-                                    u_in = usage.get("input_tokens", 0)
-                                    u_out = usage.get("output_tokens", 0)
-                                    _tx.set_data("gen_ai.usage.input_tokens", u_in)
-                                    _tx.set_data("gen_ai.usage.output_tokens", u_out)
-                                except Exception:
-                                    pass
-                                return result, usage
-                            except Exception:
-                                raise
-                    else:
-                        return _run_sync()
-
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync_with_span)
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 q.put_nowait({
                     "event": "run.completed",
@@ -1803,8 +1845,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
-                unregister_gateway_notify(session_id)
-                self._run_sessions.pop(run_id, None)
+                # ── Myah: cleanup approval registration ──────────────
+                try:
+                    unregister_gateway_notify(_approval_session_key)
+                    reset_current_session_key(_approval_session_token)
+                    self._run_sessions.pop(run_id, None)
+                except Exception:
+                    pass
+                # ────────────────────────────────────────────────────
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1820,6 +1868,34 @@ class APIServerAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+
+    async def _handle_run_confirm(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/confirm — resolve a pending approval confirmation."""
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        confirmation_id = body.get("confirmation_id", "")
+        choice = body.get("choice", "deny")
+
+        session_key = self._run_sessions.get(run_id)
+        if not session_key:
+            return web.json_response(
+                {"error": f"No active session for run {run_id}"},
+                status=404,
+            )
+
+        from tools.approval import resolve_action_confirmation
+
+        resolved = resolve_action_confirmation(confirmation_id, choice)
+        if resolved:
+            return web.json_response({"status": "resolved", "choice": choice})
+        return web.json_response(
+            {"error": "Confirmation not found or already resolved"},
+            status=404,
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -1870,47 +1946,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
-    async def _handle_run_confirm(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/confirm — resolve a pending tool confirmation.
-
-        Called by the platform when the user clicks Approve/Deny on a
-        ConfirmationCard.  Unblocks the agent thread that is waiting in
-        request_action_confirmation().
-        """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        session_key = self._run_sessions.get(run_id)
-        if not session_key:
-            return web.json_response(
-                _openai_error(f"No active run or confirmation for run_id={run_id}", code="not_found"),
-                status=404,
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-
-        choice = body.get("choice", "deny")
-        if choice not in ("approve", "approve_session", "deny"):
-            return web.json_response(
-                _openai_error("choice must be 'approve', 'approve_session', or 'deny'"),
-                status=400,
-            )
-
-        from tools.approval import resolve_gateway_approval
-
-        resolved = resolve_gateway_approval(session_key, choice)
-        if resolved == 0:
-            return web.json_response(
-                _openai_error("No pending confirmation to resolve for this run"), status=404
-            )
-
-        return web.json_response({"ok": True, "resolved": resolved})
-
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -1940,8 +1975,6 @@ class APIServerAdapter(BasePlatformAdapter):
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware, sentry_trace_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
-            global _shared_app
-            _shared_app = self._app
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
@@ -1962,6 +1995,15 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/confirm", self._handle_run_confirm)
+            # ── Myah: expose shared app and run pre-setup hooks ──────────
+            global _shared_app
+            _shared_app = self._app
+            for hook in _pre_setup_hooks:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(self._app)
+                else:
+                    hook(self._app)
+            # ────────────────────────────────────────────────────────────
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -1971,8 +2013,33 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Refuse to start network-accessible without authentication
+            if is_network_accessible(self._host) and not self._api_key:
+                logger.error(
+                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
+                    "Set API_SERVER_KEY or use the default 127.0.0.1.",
+                    self.name, self._host,
+                )
+                return False
+
+            # Refuse to start network-accessible with a placeholder key.
+            # Ported from openclaw/openclaw#64586.
+            if is_network_accessible(self._host) and self._api_key:
+                try:
+                    from hermes_cli.auth import has_usable_secret
+                    if not has_usable_secret(self._api_key, min_length=8):
+                        logger.error(
+                            "[%s] Refusing to start: API_SERVER_KEY is set to a "
+                            "placeholder value. Generate a real secret "
+                            "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
+                            "before exposing the API server on %s.",
+                            self.name, self._host,
+                        )
+                        return False
+                except ImportError:
+                    pass
+
             # Port conflict detection — fail fast if port is already in use
-            import socket as _socket
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
@@ -1982,24 +2049,23 @@ class APIServerAdapter(BasePlatformAdapter):
             except (ConnectionRefusedError, OSError):
                 pass  # port is free
 
-            # Invoke pre-setup hooks so other adapters (e.g. Myah) can register
-            # routes before the aiohttp router is frozen by runner.setup().
-            for _hook in _pre_setup_hooks:
-                try:
-                    _hook(self._app)
-                except Exception as _he:
-                    logger.warning("[%s] pre-setup hook failed: %s", self.name, _he)
-            _pre_setup_hooks.clear()
-
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
 
             self._mark_connected()
+            if not self._api_key:
+                logger.warning(
+                    "[%s] ⚠️  No API key configured (API_SERVER_KEY / platforms.api_server.key). "
+                    "All requests will be accepted without authentication. "
+                    "Set an API key for production deployments to prevent "
+                    "unauthorized access to sessions, responses, and cron jobs.",
+                    self.name,
+                )
             logger.info(
-                "[%s] API server listening on http://%s:%d",
-                self.name, self._host, self._port,
+                "[%s] API server listening on http://%s:%d (model: %s)",
+                self.name, self._host, self._port, self._model_name,
             )
             return True
 
@@ -2009,6 +2075,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server."""
+        # ── Myah: clear shared app reference ─────────────────────────
+        global _shared_app
+        _shared_app = None
+        # ────────────────────────────────────────────────────────────
         self._mark_disconnected()
         if self._site:
             await self._site.stop()
@@ -2017,8 +2087,6 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._app = None
-        global _shared_app
-        _shared_app = None
         logger.info("[%s] API server stopped", self.name)
 
     async def send(
