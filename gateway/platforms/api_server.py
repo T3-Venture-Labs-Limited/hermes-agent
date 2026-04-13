@@ -622,30 +622,31 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check with deeper Myah credential validation."""
-        # ── Myah: deeper credential validation ───────────────────────
-        warnings = []
-        try:
-            from gateway.config import load_gateway_config
-            config = load_gateway_config()
-            model = config.model or os.getenv("HERMES_MODEL", "")
-            if not model:
-                warnings.append("No model configured")
-        except Exception as e:
-            warnings.append(f"Config load failed: {e}")
+        """GET /health — health check; extended validation when MYAH_ADAPTER_ENABLED is set."""
+        # ── Myah: deeper credential validation (only when Myah adapter is active)
+        if os.getenv("MYAH_ADAPTER_ENABLED", "").lower() in ("true", "1", "yes"):
+            warnings = []
+            try:
+                from gateway.config import load_gateway_config
+                config = load_gateway_config()
+                model = config.model or os.getenv("HERMES_MODEL", "")
+                if not model:
+                    warnings.append("No model configured")
+            except Exception as e:
+                warnings.append(f"Config load failed: {e}")
 
-        try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            db.list_sessions(limit=1)
-        except Exception as e:
-            warnings.append(f"SessionDB: {e}")
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                db.list_sessions(limit=1)
+            except Exception as e:
+                warnings.append(f"SessionDB: {e}")
 
-        if warnings:
-            return web.json_response(
-                {"status": "degraded", "platform": "hermes-agent", "warnings": warnings},
-                status=200,
-            )
+            if warnings:
+                return web.json_response(
+                    {"status": "degraded", "platform": "hermes-agent", "warnings": warnings},
+                    status=200,
+                )
         # ────────────────────────────────────────────────────────────
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
