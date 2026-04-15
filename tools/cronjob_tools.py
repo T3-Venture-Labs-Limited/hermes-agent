@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import display_hermes_home
+
 logger = logging.getLogger(__name__)
 
 # Import from cron module (will be available when properly installed)
@@ -410,42 +412,6 @@ def cronjob(
         return tool_error(str(e), success=False)
 
 
-# ---------------------------------------------------------------------------
-# Compatibility wrappers
-# ---------------------------------------------------------------------------
-
-def schedule_cronjob(
-    prompt: str,
-    schedule: str,
-    name: Optional[str] = None,
-    repeat: Optional[int] = None,
-    deliver: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    base_url: Optional[str] = None,
-    task_id: str = None,
-) -> str:
-    return cronjob(
-        action="create",
-        prompt=prompt,
-        schedule=schedule,
-        name=name,
-        repeat=repeat,
-        deliver=deliver,
-        model=model,
-        provider=provider,
-        base_url=base_url,
-        task_id=task_id,
-    )
-
-
-def list_cronjobs(include_disabled: bool = False, task_id: str = None) -> str:
-    return cronjob(action="list", include_disabled=include_disabled, task_id=task_id)
-
-
-def remove_cronjob(job_id: str, task_id: str = None) -> str:
-    return cronjob(action="remove", job_id=job_id, task_id=task_id)
-
 
 CRONJOB_SCHEMA = {
     "name": "cronjob",
@@ -454,6 +420,8 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job. REQUIRED: 'prompt' (full task instruction) and 'schedule' (e.g. '10m', 'every 1h', '0 9 * * *'). Both must always be provided.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+
+To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
@@ -493,7 +461,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), or platform:chat_id:thread_id for a specific destination. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), or platform:chat_id:thread_id for a specific destination. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting."
             },
             "skills": {
                 "type": "array",
@@ -517,7 +485,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "script": {
                 "type": "string",
-                "description": "Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under ~/.hermes/scripts/. On update, pass empty string to clear."
+                "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
             },
         },
         "required": ["action"]
