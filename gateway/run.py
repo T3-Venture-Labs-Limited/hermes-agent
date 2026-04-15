@@ -7431,6 +7431,8 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
         
+        _structured_cbs = None
+        
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
@@ -8874,17 +8876,23 @@ class GatewayRunner:
         # BUT: never suppress delivery when the agent failed — the error
         # message is new content the user hasn't seen, and it must reach
         # them even if streaming had sent earlier partial output.
-        _sc = stream_consumer_holder[0]
-        if _sc and isinstance(response, dict) and not response.get("failed"):
-            _response_previewed = bool(response.get("response_previewed"))
-            if (
-                getattr(_sc, "final_response_sent", False)
-                or (
-                    _response_previewed
-                    and getattr(_sc, "already_sent", False)
-                )
-            ):
+        if isinstance(response, dict) and not response.get("failed"):
+            if _structured_cbs:
+                # Structured callbacks (Myah SSE) already streamed the response
+                # to the client, bypassing the GatewayStreamConsumer.
                 response["already_sent"] = True
+            else:
+                _sc = stream_consumer_holder[0]
+                if _sc:
+                    _response_previewed = bool(response.get("response_previewed"))
+                    if (
+                        getattr(_sc, "final_response_sent", False)
+                        or (
+                            _response_previewed
+                            and getattr(_sc, "already_sent", False)
+                        )
+                    ):
+                        response["already_sent"] = True
         
         return response
 
