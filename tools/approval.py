@@ -290,6 +290,7 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+# ── Myah: generic action confirmation ────────────────────────
 # =========================================================================
 # Generic action confirmation (non-command, Myah platform)
 # =========================================================================
@@ -410,6 +411,7 @@ def resolve_action_confirmation(confirmation_id: str, choice: str) -> bool:
     entry["result"].append(choice)
     entry["event"].set()
     return True
+# ────────────────────────────────────────────────────────
 
 
 def submit_pending(session_key: str, approval: dict):
