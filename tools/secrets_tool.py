@@ -307,7 +307,7 @@ registry.register(
     emoji="🔐",
     schema={
         "name": "secrets",
-        "description": "Secure secret lifecycle management. Secret values are never returned to the model.",
+        "description": "Manage API keys and credentials. ALWAYS use this tool BEFORE attempting any API call that requires authentication. Use 'check' to see if a key is configured, 'request' to securely prompt the user for a missing key (the value never enters the conversation), 'list' to see all configured secret names, 'delete' to remove a key, or 'inject' to pass secrets to a sandboxed subprocess. Never try to use an API without first checking/requesting its key through this tool.",
         "parameters": {
             "type": "object",
             "properties": {
