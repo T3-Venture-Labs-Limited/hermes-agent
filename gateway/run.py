@@ -8187,10 +8187,10 @@ class GatewayRunner:
 
             _secret_cb_registered = False
             _secret_session_token = None
-            if _platform_adapter and hasattr(_platform_adapter, '_secret_capture_callback'):
-                _sid = _platform_adapter._session_streams.get(session_key) if hasattr(_platform_adapter, '_session_streams') else None
+            if _plat_adapter and hasattr(_plat_adapter, '_secret_capture_callback'):
+                _sid = _plat_adapter._session_streams.get(session_key) if hasattr(_plat_adapter, '_session_streams') else None
                 if _sid:
-                    def _secret_cb(var_name, prompt, metadata=None, _adapter=_platform_adapter, _stream_id=_sid):
+                    def _secret_cb(var_name, prompt, metadata=None, _adapter=_plat_adapter, _stream_id=_sid):
                         return _adapter._secret_capture_callback(
                             var_name, prompt, metadata, stream_id=_stream_id,
                         )

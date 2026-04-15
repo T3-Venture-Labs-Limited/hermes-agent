@@ -181,11 +181,11 @@ class MyahAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response({"error": "Invalid JSON"}, status=400)
 
-        message = body.get("message", "").strip()
+        message = (body.get("message") or "").strip()
         if not message:
             return web.json_response({"error": "Missing 'message' field"}, status=400)
 
-        session_id = body.get("session_id", "").strip() or str(uuid.uuid4())
+        session_id = (body.get("session_id") or "").strip() or str(uuid.uuid4())
         user_name = body.get("user_name")
         user_id = body.get("user_id")
         chat_name = body.get("chat_name")
