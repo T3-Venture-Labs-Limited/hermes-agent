@@ -8112,6 +8112,26 @@ class GatewayRunner:
                 set_secret_session_key,
                 reset_secret_session_key,
             )
+            from tools.secrets_tool import (
+                set_secrets_request_callback,
+                set_secret_request_session_key,
+                reset_secret_request_session_key,
+            )
+
+            def _cleanup_secret_callbacks(
+                session_key,
+                skills_registered, skills_token,
+                secrets_registered, secrets_token,
+            ):
+                """Unregister all secret capture callbacks for the session."""
+                if skills_registered:
+                    set_secret_capture_callback(session_key, None)
+                    if skills_token is not None:
+                        reset_secret_session_key(skills_token)
+                if secrets_registered:
+                    set_secrets_request_callback(session_key, None)
+                    if secrets_token is not None:
+                        reset_secret_request_session_key(secrets_token)
 
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
@@ -8187,6 +8207,8 @@ class GatewayRunner:
 
             _secret_cb_registered = False
             _secret_session_token = None
+            _secrets_tool_registered = False
+            _secrets_tool_token = None
             if _platform_adapter and hasattr(_platform_adapter, '_secret_capture_callback'):
                 _sid = _platform_adapter._session_streams.get(session_key) if hasattr(_platform_adapter, '_session_streams') else None
                 if _sid:
@@ -8197,6 +8219,10 @@ class GatewayRunner:
                     _secret_session_token = set_secret_session_key(_approval_session_key)
                     set_secret_capture_callback(_approval_session_key, _secret_cb)
                     _secret_cb_registered = True
+                    # Also wire the same callback for the generic secrets tool.
+                    _secrets_tool_token = set_secret_request_session_key(_approval_session_key)
+                    set_secrets_request_callback(_approval_session_key, _secret_cb)
+                    _secrets_tool_registered = True
 
             if _sentry_tx is not None:
                 try:
@@ -8213,10 +8239,11 @@ class GatewayRunner:
                     finally:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
-                        if _secret_cb_registered:
-                            set_secret_capture_callback(_approval_session_key, None)
-                            if _secret_session_token is not None:
-                                reset_secret_session_key(_secret_session_token)
+                        _cleanup_secret_callbacks(
+                            _approval_session_key,
+                            _secret_cb_registered, _secret_session_token,
+                            _secrets_tool_registered, _secrets_tool_token,
+                        )
                         if _sentry_tx:
                             try:
                                 _a = agent_holder[0]
@@ -8240,20 +8267,22 @@ class GatewayRunner:
                     finally:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
-                        if _secret_cb_registered:
-                            set_secret_capture_callback(_approval_session_key, None)
-                            if _secret_session_token is not None:
-                                reset_secret_session_key(_secret_session_token)
+                        _cleanup_secret_callbacks(
+                            _approval_session_key,
+                            _secret_cb_registered, _secret_session_token,
+                            _secrets_tool_registered, _secrets_tool_token,
+                        )
             else:
                 try:
                     result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
                 finally:
                     unregister_gateway_notify(_approval_session_key)
                     reset_current_session_key(_approval_session_token)
-                    if _secret_cb_registered:
-                        set_secret_capture_callback(_approval_session_key, None)
-                        if _secret_session_token is not None:
-                            reset_secret_session_key(_secret_session_token)
+                    _cleanup_secret_callbacks(
+                        _approval_session_key,
+                        _secret_cb_registered, _secret_session_token,
+                        _secrets_tool_registered, _secrets_tool_token,
+                    )
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
