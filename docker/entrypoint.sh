@@ -68,4 +68,9 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+# ── Myah: platform base URL for media fetches ──────────────────────────────
+export MYAH_PLATFORM_BASE_URL="${MYAH_PLATFORM_BASE_URL:-http://platform:8081}"
+export MYAH_PLATFORM_BEARER="${MYAH_PLATFORM_BEARER:-${API_SERVER_KEY:-}}"
+# ────────────────────────────────────────────────────────────────────────────
+
 exec hermes "$@"

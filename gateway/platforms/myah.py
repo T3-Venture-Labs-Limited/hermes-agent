@@ -35,6 +35,26 @@ except ImportError:
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.config import Platform, PlatformConfig
 
+# ── Myah: attachments support ──────────────────────────────────────────────
+import mimetypes as _myah_mimetypes
+import os as _myah_os
+try:
+    import aiohttp as _myah_aiohttp
+    _MYAH_AIOHTTP_AVAILABLE = True
+except ImportError:
+    _myah_aiohttp = None  # type: ignore[assignment]
+    _MYAH_AIOHTTP_AVAILABLE = False
+from gateway.platforms.base import (
+    cache_image_from_bytes,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+)
+
+_MYAH_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Myah: per-attachment cap (defense-in-depth)
+_MYAH_PLATFORM_BASE_URL = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')  # Myah: platform URL
+_MYAH_PLATFORM_BEARER = _myah_os.environ.get('MYAH_PLATFORM_BEARER')      # Myah: shared bearer
+# ────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────────
