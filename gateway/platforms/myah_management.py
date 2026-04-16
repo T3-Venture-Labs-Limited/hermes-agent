@@ -145,6 +145,137 @@ async def handle_put_model(request: web.Request) -> web.Response:
     return web.json_response({'model': model})
 
 
+# ── Myah: Session-scoped model override (T3-932) ─────────────────────────────
+# Per-session model overrides via HTTP. Writes directly to the gateway
+# runner's _session_model_overrides dict — the same primitive that the
+# /model slash command uses in gateway/run.py:_handle_model_command.
+# Does NOT persist to config.yaml; override lives for the session lifetime.
+
+
+async def handle_get_session_model(request: web.Request) -> web.Response:
+    """GET /myah/api/sessions/{id}/model — Read current session override."""
+    session_key = (request._match_info or {}).get('id', '')  # noqa: SLF001
+    app = request._app  # noqa: SLF001 — use _app for test compatibility
+    adapter = app.get('myah_adapter')
+    if adapter is None or adapter.gateway_runner is None:
+        return web.json_response({'error': 'Gateway runner not available'}, status=503)
+
+    overrides = getattr(adapter.gateway_runner, '_session_model_overrides', {}) or {}
+    override = overrides.get(session_key, {})
+    return web.json_response({
+        'model': override.get('model', ''),
+        'provider': override.get('provider', ''),
+    })
+
+
+async def handle_put_session_model(request: web.Request) -> web.Response:
+    """PUT /myah/api/sessions/{id}/model — Set per-session model override.
+
+    Body: {"model": "<model-id>", "provider": "<optional-provider>"}
+
+    Writes to gateway_runner._session_model_overrides[session_key] and
+    evicts the cached agent so the next turn rebuilds with the new model.
+    Mirrors the --session (non-global) branch of the /model slash command
+    in gateway/run.py:_handle_model_command.
+    """
+    session_key = (request._match_info or {}).get('id', '')  # noqa: SLF001
+    if not session_key:
+        return web.json_response({'error': 'session_key is required'}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({'error': 'Invalid JSON'}, status=400)
+
+    raw_input = (body.get('model') or '').strip()
+    if not raw_input:
+        return web.json_response({'error': 'model is required'}, status=400)
+
+    explicit_provider = (body.get('provider') or '').strip()
+
+    app = request._app  # noqa: SLF001 — use _app for test compatibility
+    adapter = app.get('myah_adapter')
+    if adapter is None or adapter.gateway_runner is None:
+        return web.json_response({'error': 'Gateway runner not available'}, status=503)
+    runner = adapter.gateway_runner
+
+    # Load current config to build switch_model() context
+    config_path = _hermes_home() / 'config.yaml'
+    cfg: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            cfg = yaml.safe_load(config_path.read_text()) or {}
+        except Exception:
+            cfg = {}
+
+    model_cfg = cfg.get('model', {}) if isinstance(cfg.get('model'), dict) else {}
+    current_model = model_cfg.get('default') or (cfg.get('model') if isinstance(cfg.get('model'), str) else '')
+    current_provider = model_cfg.get('provider', '') or 'openrouter'
+    current_base_url = model_cfg.get('base_url', '') or ''
+    user_providers = cfg.get('providers')
+    custom_providers = cfg.get('custom_providers')
+
+    # Layer current session override on top if present (so we preserve
+    # unset fields when the user switches providers).
+    existing = (runner._session_model_overrides or {}).get(session_key, {})
+    if existing:
+        current_model = existing.get('model', current_model)
+        current_provider = existing.get('provider', current_provider)
+        current_base_url = existing.get('base_url', current_base_url)
+
+    # switch_model() performs network validation calls — run in executor
+    # to avoid blocking the event loop.
+    from hermes_cli.model_switch import switch_model
+
+    def _run_switch_model():
+        return switch_model(
+            raw_input=raw_input,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key='',
+            is_global=False,
+            explicit_provider=explicit_provider,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+        )
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, _run_switch_model)
+    except Exception as exc:
+        logger.exception('[myah] switch_model failed for session %s', session_key)
+        return web.json_response({'error': f'switch_model failed: {exc}'}, status=500)
+
+    if not getattr(result, 'success', False):
+        error_msg = getattr(result, 'error_message', '') or 'Model not recognized'
+        return web.json_response({'error': error_msg}, status=400)
+
+    # Write the override and evict cached agent
+    if runner._session_model_overrides is None:
+        runner._session_model_overrides = {}
+    runner._session_model_overrides[session_key] = {
+        'model': result.new_model,
+        'provider': result.target_provider,
+        'api_key': getattr(result, 'api_key', '') or '',
+        'base_url': getattr(result, 'base_url', '') or '',
+        'api_mode': getattr(result, 'api_mode', '') or '',
+    }
+    try:
+        runner._evict_cached_agent(session_key)
+    except Exception:
+        logger.warning('[myah] _evict_cached_agent failed for %s', session_key, exc_info=True)
+
+    return web.json_response({
+        'model': result.new_model,
+        'provider': result.target_provider,
+        'provider_label': getattr(result, 'provider_label', '') or '',
+        'warning': getattr(result, 'warning_message', None) or None,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # ── SOUL.md endpoints ─────────────────────────────────────────────────────────
 
 
@@ -923,9 +1054,14 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_post('/myah/api/sessions/{id}/title', _a(handle_set_session_title))
     app.router.add_post('/myah/api/sessions/{id}/append', _a(handle_append_session_message))
 
+    # ── Myah: Session-scoped model override (T3-932) ──────────────────────────
+    app.router.add_get('/myah/api/sessions/{id}/model', _a(handle_get_session_model))
+    app.router.add_put('/myah/api/sessions/{id}/model', _a(handle_put_session_model))
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Env var (secrets) management
     app.router.add_get('/myah/api/config/env', _a(handle_list_env))
     app.router.add_put('/myah/api/config/env', _a(handle_set_env))
     app.router.add_delete('/myah/api/config/env/{key}', _a(handle_delete_env))
 
-    logger.info('Myah management routes registered (%d endpoints)', 27)
+    logger.info('Myah management routes registered (%d endpoints)', 29)
