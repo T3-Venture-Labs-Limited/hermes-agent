@@ -704,31 +704,63 @@ _DENIED_ENV_VARS = frozenset({
     'NODE_PATH', 'NODE_OPTIONS',
 })
 
+# ── Myah: internal env var prefixes hidden from settings UI ───────────────
+# Infrastructure vars set by the platform — not user-configurable secrets.
+_INTERNAL_PREFIXES = ('MYAH_', 'API_SERVER_', 'HONCHO_', 'HERMES_', 'SENTRY_')
+# ──────────────────────────────────────────────────────────────────────────
+
 
 async def handle_list_env(request: web.Request) -> web.Response:
     """List all known env vars with redacted values and metadata.
 
-    Returns only vars defined in OPTIONAL_ENV_VARS — never exposes
-    raw .env contents. Values are always redacted (first 4 + last 4 chars).
+    Returns vars defined in OPTIONAL_ENV_VARS plus any user-added secrets
+    found in .env that are not internal infrastructure vars.
+    Values are always redacted (first 4 + last 4 chars).
     """
     from hermes_cli.config import OPTIONAL_ENV_VARS, load_env
 
     env_on_disk = load_env()
     result = {}
+
+    def _redact(value: str) -> str | None:
+        if not value:
+            return None
+        return value[:4] + '...' + value[-4:] if len(value) >= 12 else '***'
+
+    # Known vars with rich metadata from OPTIONAL_ENV_VARS
     for var_name, info in OPTIONAL_ENV_VARS.items():
         value = env_on_disk.get(var_name)
-        redacted = None
-        if value:
-            redacted = value[:4] + '...' + value[-4:] if len(value) >= 12 else '***'
         result[var_name] = {
             'is_set': bool(value),
-            'redacted_value': redacted,
+            'redacted_value': _redact(value),
             'description': info.get('description', ''),
             'url': info.get('url'),
             'category': info.get('category', ''),
             'is_password': info.get('password', False),
             'tools': info.get('tools', []),
         }
+
+    # ── Myah: include user-added secrets not in OPTIONAL_ENV_VARS ─────────
+    # Custom secrets the user added via the settings UI or secrets tool.
+    # Exclude system vars, denied vars, and internal infrastructure vars.
+    for var_name, value in env_on_disk.items():
+        if var_name in result:
+            continue
+        if var_name.upper() in _DENIED_ENV_VARS:
+            continue
+        if any(var_name.startswith(p) for p in _INTERNAL_PREFIXES):
+            continue
+        result[var_name] = {
+            'is_set': bool(value),
+            'redacted_value': _redact(value),
+            'description': 'User-configured secret',
+            'url': None,
+            'category': 'custom',
+            'is_password': True,
+            'tools': [],
+        }
+    # ──────────────────────────────────────────────────────────────────────
+
     return web.json_response(result)
 
 

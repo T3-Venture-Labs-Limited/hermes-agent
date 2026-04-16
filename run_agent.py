@@ -9496,13 +9496,7 @@ class AIAgent:
                             self.tool_progress_callback("_thinking", first_line)
                         except Exception:
                             pass
-                    elif _think_text and not self._reasoning_deltas_fired:
-                        # Only emit reasoning.available when the model did NOT provide
-                        # structured reasoning deltas (e.g. XML-scratchpad models that
-                        # embed thinking inside the assistant content).  When
-                        # _reasoning_deltas_fired is True, the real tokens already
-                        # streamed via reasoning_callback — emitting content here would
-                        # duplicate the final answer text as reasoning.
+                    elif _think_text:
                         try:
                             self.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                         except Exception:

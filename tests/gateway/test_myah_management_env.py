@@ -8,6 +8,7 @@ import pytest
 
 from gateway.platforms.myah_management import (
     _DENIED_ENV_VARS,
+    _INTERNAL_PREFIXES,
     _auth_middleware,
     handle_delete_env,
     handle_list_env,
@@ -54,8 +55,8 @@ def _list_env_patches(env_on_disk: dict):
 
 class TestListEnv:
     @pytest.mark.asyncio
-    async def test_returns_known_vars_only(self, mock_env_on_disk):
-        """Only vars in OPTIONAL_ENV_VARS appear in the response."""
+    async def test_returns_known_vars(self, mock_env_on_disk):
+        """Vars in OPTIONAL_ENV_VARS appear in the response."""
         p1, p2 = _list_env_patches(mock_env_on_disk)
         with p1, p2:
             request = MagicMock()
@@ -63,7 +64,8 @@ class TestListEnv:
 
         data = json.loads(response.body)
         assert isinstance(data, dict)
-        assert set(data.keys()) == {'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'}
+        assert 'ANTHROPIC_API_KEY' in data
+        assert 'OPENAI_API_KEY' in data
 
     @pytest.mark.asyncio
     async def test_set_key_is_marked_is_set_true(self, mock_env_on_disk):
@@ -123,6 +125,77 @@ class TestListEnv:
             assert 'category' in info, f'{key} missing category'
             assert 'is_password' in info, f'{key} missing is_password'
             assert 'tools' in info, f'{key} missing tools'
+
+    @pytest.mark.asyncio
+    async def test_custom_env_vars_appear_in_list(self):
+        """User-added keys not in OPTIONAL_ENV_VARS appear as custom."""
+        env = {'REPLICATE_API_TOKEN': 'r8_abcdef1234567890'}
+        p1, p2 = _list_env_patches(env)
+        with p1, p2:
+            request = MagicMock()
+            response = await handle_list_env(request)
+
+        data = json.loads(response.body)
+        assert 'REPLICATE_API_TOKEN' in data
+        info = data['REPLICATE_API_TOKEN']
+        assert info['is_set'] is True
+        assert info['category'] == 'custom'
+        assert info['is_password'] is True
+        assert '...' in info['redacted_value']
+
+    @pytest.mark.asyncio
+    async def test_internal_prefixes_hidden_from_list(self):
+        """Infrastructure vars with internal prefixes are excluded."""
+        env = {
+            'MYAH_AGENT_TOKEN': 'secret',
+            'API_SERVER_KEY': 'secret',
+            'HONCHO_WORKSPACE_ID': 'ws-123',
+            'HERMES_MODEL': 'gpt-4',
+            'SENTRY_DSN_AGENT': 'https://sentry.io/...',
+            'CUSTOM_USER_KEY': 'user-value-1234567890ab',
+        }
+        p1, p2 = _list_env_patches(env)
+        with p1, p2:
+            request = MagicMock()
+            response = await handle_list_env(request)
+
+        data = json.loads(response.body)
+        # Internal vars must NOT appear
+        for prefix_var in ['MYAH_AGENT_TOKEN', 'API_SERVER_KEY',
+                           'HONCHO_WORKSPACE_ID', 'HERMES_MODEL',
+                           'SENTRY_DSN_AGENT']:
+            assert prefix_var not in data, f'{prefix_var} should be hidden'
+        # Custom user key SHOULD appear
+        assert 'CUSTOM_USER_KEY' in data
+        assert data['CUSTOM_USER_KEY']['category'] == 'custom'
+
+    @pytest.mark.asyncio
+    async def test_denied_vars_hidden_from_custom(self):
+        """System vars in _DENIED_ENV_VARS are excluded even from custom."""
+        env = {'PATH': '/usr/bin', 'MY_API_KEY': 'secret-value-1234567890'}
+        p1, p2 = _list_env_patches(env)
+        with p1, p2:
+            request = MagicMock()
+            response = await handle_list_env(request)
+
+        data = json.loads(response.body)
+        assert 'PATH' not in data
+        assert 'MY_API_KEY' in data
+
+    @pytest.mark.asyncio
+    async def test_custom_vars_have_all_metadata_fields(self):
+        """Custom entries have the same schema shape as known vars."""
+        env = {'STRIPE_SECRET_KEY': 'sk_test_1234567890abcdef'}
+        p1, p2 = _list_env_patches(env)
+        with p1, p2:
+            request = MagicMock()
+            response = await handle_list_env(request)
+
+        data = json.loads(response.body)
+        info = data['STRIPE_SECRET_KEY']
+        for field in ['is_set', 'description', 'redacted_value',
+                      'url', 'category', 'is_password', 'tools']:
+            assert field in info, f'custom var missing {field}'
 
 
 # ── handle_set_env ───────────────────────────────────────────────────────────
