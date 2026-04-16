@@ -8,6 +8,7 @@ from hermes_cli.tools_config import (
     _platform_toolset_summary,
     _save_platform_tools,
     _toolset_has_keys,
+    CONFIGURABLE_TOOLSETS,
     TOOL_CATEGORIES,
     _visible_providers,
     tools_command,
@@ -20,6 +21,15 @@ def test_get_platform_tools_uses_default_when_platform_not_configured():
     enabled = _get_platform_tools(config, "cli")
 
     assert enabled
+
+
+def test_configurable_toolsets_include_messaging():
+    assert any(ts_key == "messaging" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+
+def test_get_platform_tools_default_telegram_includes_messaging():
+    enabled = _get_platform_tools({}, "telegram")
+
+    assert "messaging" in enabled
 
 
 def test_get_platform_tools_preserves_explicit_empty_selection():
@@ -119,8 +129,7 @@ def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("AUXILIARY_VISION_PROVIDER", raising=False)
-    monkeypatch.delenv("CONTEXT_VISION_PROVIDER", raising=False)
+
     monkeypatch.setattr(
         "agent.auxiliary_client.resolve_vision_provider_client",
         lambda: ("openai-codex", object(), "gpt-4.1"),
@@ -456,3 +465,42 @@ def test_numeric_mcp_server_name_does_not_crash_sorted():
 
     # sorted() must not raise TypeError
     sorted(enabled)
+
+
+class TestMyahPlatformSecrets:
+    """Regression: secrets toolset must be exposed to the Myah platform.
+
+    Previously the secrets tool was registered but missing from CONFIGURABLE_TOOLSETS
+    and the TOOLSETS dict, so _get_platform_tools never included it. Agents on
+    the Myah platform couldn't see the secrets tool in their schema and would
+    tell users "there is no secrets tool" when asked to use it.
+    """
+
+    def test_secrets_in_myah_default_toolsets(self):
+        """Default (no explicit platform_toolsets) — secrets must be enabled."""
+        config = {}
+        enabled = _get_platform_tools(config, "myah")
+        assert "secrets" in enabled, (
+            f"secrets toolset missing from myah default platform tools: "
+            f"{sorted(enabled)}"
+        )
+
+    def test_secrets_in_myah_with_explicit_config(self):
+        """Explicit platform_toolsets config containing secrets — must be enabled."""
+        config = {"platform_toolsets": {"myah": ["secrets", "terminal"]}}
+        enabled = _get_platform_tools(config, "myah")
+        assert "secrets" in enabled
+
+    def test_secrets_excluded_when_explicitly_omitted(self):
+        """Explicit config without secrets — must be excluded (user opt-out)."""
+        config = {"platform_toolsets": {"myah": ["terminal"]}}
+        enabled = _get_platform_tools(config, "myah")
+        assert "secrets" not in enabled
+        assert "terminal" in enabled
+
+    def test_secrets_configurable_entry_exists(self):
+        """secrets must appear in CONFIGURABLE_TOOLSETS so `hermes tools` shows it."""
+        from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS
+
+        keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+        assert "secrets" in keys

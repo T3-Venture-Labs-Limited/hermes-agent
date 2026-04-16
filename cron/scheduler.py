@@ -45,7 +45,8 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "myah",
+    "qqbot",
+    "myah",  # Myah: delivery platform
 })
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
@@ -255,7 +256,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
         "bluebubbles": Platform.BLUEBUBBLES,
-        "myah": Platform.MYAH,
+        "qqbot": Platform.QQBOT,
+        "myah": Platform.MYAH,  # Myah: platform mapping
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
@@ -288,11 +290,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     if wrap_response:
         task_name = job.get("name", job["id"])
+        job_id = job.get("id", "")
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"Note: The agent cannot see this message, and therefore cannot respond to it."
+            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
         )
     else:
         delivery_content = content
@@ -574,7 +578,7 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str], list]:
+def run_job(job: dict) -> tuple[bool, str, str, Optional[str], list]:  # Myah: added messages to return tuple
     """
     Execute a single cron job.
 
@@ -850,7 +854,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], list]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None, result.get("messages", [])
+        return True, output, final_response, None, result.get("messages", [])  # Myah: messages for webhook
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -872,7 +876,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], list]:
 {error_msg}
 ```
 """
-        return False, output, "", error_msg, []
+        return False, output, "", error_msg, []  # Myah: messages for webhook
 
     finally:
         # Clean up injected env vars so they don't leak to other jobs
@@ -978,7 +982,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         logger.warning("Myah cron webhook run-started failed: %s", _wh_err)
                 # ────────────────────────────────────────────────────────────
 
-                success, output, final_response, error, _run_messages = run_job(job)
+                success, output, final_response, error, _run_messages = run_job(job)  # Myah: 5-tuple (messages for webhook)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:

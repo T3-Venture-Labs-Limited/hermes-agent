@@ -1,7 +1,6 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
-import pytest
-
+from tools.registry import ToolRegistry
 from toolsets import (
     TOOLSETS,
     get_toolset,
@@ -13,6 +12,18 @@ from toolsets import (
     create_custom_toolset,
     get_toolset_info,
 )
+
+
+def _dummy_handler(args, **kwargs):
+    return "{}"
+
+
+def _make_schema(name: str, description: str = "test tool"):
+    return {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": {}},
+    }
 
 
 class TestGetToolset:
@@ -52,6 +63,25 @@ class TestResolveToolset:
     def test_unknown_toolset_returns_empty(self):
         assert resolve_toolset("nonexistent") == []
 
+    def test_plugin_toolset_uses_registry_snapshot(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="plugin_b",
+            toolset="plugin_example",
+            schema=_make_schema("plugin_b", "B"),
+            handler=_dummy_handler,
+        )
+        reg.register(
+            name="plugin_a",
+            toolset="plugin_example",
+            schema=_make_schema("plugin_a", "A"),
+            handler=_dummy_handler,
+        )
+
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        assert resolve_toolset("plugin_example") == ["plugin_a", "plugin_b"]
+
     def test_all_alias(self):
         tools = resolve_toolset("all")
         assert len(tools) > 10  # Should resolve all tools from all toolsets
@@ -85,6 +115,22 @@ class TestValidateToolset:
 
     def test_invalid(self):
         assert validate_toolset("nonexistent") is False
+
+    def test_mcp_alias_uses_live_registry(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp_dynserver_ping",
+            toolset="mcp-dynserver",
+            schema=_make_schema("mcp_dynserver_ping", "Ping"),
+            handler=_dummy_handler,
+        )
+        reg.register_toolset_alias("dynserver", "mcp-dynserver")
+
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        assert validate_toolset("dynserver") is True
+        assert validate_toolset("mcp-dynserver") is True
+        assert "mcp_dynserver_ping" in resolve_toolset("dynserver")
 
 
 class TestGetToolsetInfo:
@@ -120,6 +166,23 @@ class TestCreateCustomToolset:
             del TOOLSETS["_test_custom"]
 
 
+class TestRegistryOwnedToolsets:
+    def test_registry_membership_is_live(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="test_live_toolset_tool",
+            toolset="test-live-toolset",
+            schema=_make_schema("test_live_toolset_tool", "Live"),
+            handler=_dummy_handler,
+        )
+
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        assert validate_toolset("test-live-toolset") is True
+        assert get_toolset("test-live-toolset")["tools"] == ["test_live_toolset_tool"]
+        assert resolve_toolset("test-live-toolset") == ["test_live_toolset_tool"]
+
+
 class TestToolsetConsistency:
     """Verify structural integrity of the built-in TOOLSETS dict."""
 
@@ -141,3 +204,53 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+
+class TestPluginToolsets:
+    def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="plugin_tool",
+            toolset="plugin_bundle",
+            schema=_make_schema("plugin_tool", "Plugin tool"),
+            handler=_dummy_handler,
+        )
+
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        all_toolsets = get_all_toolsets()
+        assert "plugin_bundle" in all_toolsets
+        assert all_toolsets["plugin_bundle"]["tools"] == ["plugin_tool"]
+
+
+class TestSecretsToolset:
+    """Verify the secrets toolset is registered so platform filters expose it."""
+
+    def test_secrets_toolset_in_TOOLSETS(self):
+        """secrets must have a static toolset definition for platform resolution."""
+        assert "secrets" in TOOLSETS, (
+            "secrets toolset missing from TOOLSETS dict — "
+            "_get_platform_tools will never surface the secrets tool to agents"
+        )
+
+    def test_secrets_toolset_resolves_to_tool(self):
+        """resolve_toolset('secrets') must return the secrets tool name."""
+        tools = resolve_toolset("secrets")
+        assert tools == ["secrets"]
+
+    def test_secrets_toolset_has_description(self):
+        """Non-empty description so 'hermes tools' CLI can display it."""
+        ts = get_toolset("secrets")
+        assert ts is not None
+        assert ts.get("description"), "secrets toolset missing description"
+
+    def test_hermes_myah_includes_secrets(self):
+        """The hermes-myah composite must expand to include the secrets tool.
+
+        This is what _get_platform_tools relies on to surface secrets to the
+        agent when no explicit platform_toolsets config is set.
+        """
+        myah_tools = resolve_toolset("hermes-myah")
+        assert "secrets" in myah_tools, (
+            f"secrets tool missing from hermes-myah expansion: {myah_tools}"
+        )

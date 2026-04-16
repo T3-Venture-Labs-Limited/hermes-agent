@@ -39,7 +39,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, display_hermes_home
 from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,17 @@ try:
     _GUARD_AVAILABLE = True
 except ImportError:
     _GUARD_AVAILABLE = False
+
+try:
+    from tools.skills_tool import (
+        _get_required_environment_variables,
+        _capture_required_environment_variables,
+        _is_env_var_persisted,
+    )
+    from agent.skill_utils import parse_frontmatter
+    _ENV_CAPTURE_AVAILABLE = True
+except ImportError:
+    _ENV_CAPTURE_AVAILABLE = False
 
 
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
@@ -64,11 +75,11 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
-            # "ask" — allow but include the warning so the user sees the findings
+            # "ask" verdict — for agent-created skills this means dangerous
+            # findings were detected.  Block the skill and include the report.
             report = format_scan_report(result)
-            logger.warning("Agent-created skill has security findings: %s", reason)
-            # Don't block — return None to allow, but log the warning
-            return None
+            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
@@ -331,6 +342,26 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    # ── Check and capture missing environment variables ──────────────
+    _env_capture_result = None
+    if _ENV_CAPTURE_AVAILABLE:
+        try:
+            fm, _ = parse_frontmatter(content)
+            required = _get_required_environment_variables(fm)
+            if required:
+                missing = [
+                    entry for entry in required
+                    if not _is_env_var_persisted(entry['name'])
+                ]
+                if missing:
+                    _env_capture_result = _capture_required_environment_variables(
+                        name, missing,
+                    )
+        except Exception:
+            logger.warning(
+                'env capture failed for skill %s', name, exc_info=True,
+            )
+
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
@@ -343,6 +374,20 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+    if _env_capture_result is not None:
+        # 'missing_names' is returned by _capture_required_environment_variables
+        # (skills_tool.py) — list of var names not provided during the capture flow.
+        _still_missing = _env_capture_result.get('missing_names', [])
+        if _still_missing:
+            result['setup_needed'] = True
+            result['missing_env_vars'] = _still_missing
+            result['hint'] = (
+                f"Missing environment variables: {', '.join(_still_missing)}. "
+                f"Call skill_view('{name}') to retry setup, or use "
+                f"secrets(action='request', key='<name>') to provide them."
+            )
+        else:
+            result['setup_complete'] = True
     return result
 
 
@@ -655,7 +700,7 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        "New skills go to ~/.hermes/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

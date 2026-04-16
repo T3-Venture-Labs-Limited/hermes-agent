@@ -237,7 +237,6 @@ def load_cli_config() -> Dict[str, Any]:
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
             "threshold": 0.50,    # Compress at 50% of model's context limit
-            "summary_model": "",  # Model for summaries (empty = use main model)
         },
         "smart_model_routing": {
             "enabled": False,
@@ -989,19 +988,20 @@ def _prune_orphaned_branches(repo_root: str) -> None:
 # ANSI building blocks for conversation display
 _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — fallback
 _BOLD = "\033[1m"
-_DIM = "\033[2m"
 _RST = "\033[0m"
+_STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
 
 
-def _hex_to_ansi_bold(hex_color: str) -> str:
-    """Convert a hex color like '#268bd2' to a bold true-color ANSI escape."""
+def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
+    """Convert a hex color like '#268bd2' to a true-color ANSI escape."""
     try:
         r = int(hex_color[1:3], 16)
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
-        return f"\033[1;38;2;{r};{g};{b}m"
+        prefix = "1;" if bold else ""
+        return f"\033[{prefix}38;2;{r};{g};{b}m"
     except (ValueError, IndexError):
-        return _ACCENT_ANSI_DEFAULT
+        return _ACCENT_ANSI_DEFAULT if bold else "\033[38;2;184;134;11m"
 
 
 class _SkinAwareAnsi:
@@ -1011,20 +1011,22 @@ class _SkinAwareAnsi:
     force re-resolution after a ``/skin`` switch.
     """
 
-    def __init__(self, skin_key: str, fallback_hex: str = "#FFD700"):
+    def __init__(self, skin_key: str, fallback_hex: str = "#FFD700", *, bold: bool = False):
         self._skin_key = skin_key
         self._fallback_hex = fallback_hex
+        self._bold = bold
         self._cached: str | None = None
 
     def __str__(self) -> str:
         if self._cached is None:
             try:
                 from hermes_cli.skin_engine import get_active_skin
-                self._cached = _hex_to_ansi_bold(
-                    get_active_skin().get_color(self._skin_key, self._fallback_hex)
+                self._cached = _hex_to_ansi(
+                    get_active_skin().get_color(self._skin_key, self._fallback_hex),
+                    bold=self._bold,
                 )
             except Exception:
-                self._cached = _hex_to_ansi_bold(self._fallback_hex)
+                self._cached = _hex_to_ansi(self._fallback_hex, bold=self._bold)
         return self._cached
 
     def __add__(self, other: str) -> str:
@@ -1038,7 +1040,8 @@ class _SkinAwareAnsi:
         self._cached = None
 
 
-_ACCENT = _SkinAwareAnsi("response_border", "#FFD700")
+_ACCENT = _SkinAwareAnsi("response_border", "#FFD700", bold=True)
+_DIM = _SkinAwareAnsi("banner_dim", "#B8860B")
 
 
 def _accent_hex() -> str:
@@ -1710,9 +1713,9 @@ class HermesCLI:
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
         if toolsets and "all" not in toolsets and "*" not in toolsets:
-            # Validate each toolset — MCP server names are added by
-            # _get_platform_tools() but aren't registered in TOOLSETS yet
-            # (that happens later in _sync_mcp_toolsets), so exclude them.
+            # Validate each toolset — MCP server names are resolved via
+            # live registry aliases (registered during discover_mcp_tools),
+            # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
@@ -2578,7 +2581,7 @@ class HermesCLI:
         _tc = getattr(self, "_stream_text_ansi", "")
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
-            _cprint(f"{_tc}{line}{_RST}" if _tc else line)
+            _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -2595,7 +2598,7 @@ class HermesCLI:
 
         if self._stream_buf:
             _tc = getattr(self, "_stream_text_ansi", "")
-            _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+            _cprint(f"{_STREAM_PAD}{_tc}{self._stream_buf}{_RST}" if _tc else f"{_STREAM_PAD}{self._stream_buf}")
             self._stream_buf = ""
 
         # Close the response box
@@ -2999,8 +3002,10 @@ class HermesCLI:
                 )
 
         # Warn if the configured model is a Nous Hermes LLM (not agentic)
+        from hermes_cli.model_switch import is_nous_hermes_non_agentic
+
         model_name = getattr(self, "model", "") or ""
-        if "hermes" in model_name.lower():
+        if is_nous_hermes_non_agentic(model_name):
             self.console.print()
             self.console.print(
                 "[bold yellow]⚠  Nous Research Hermes 3 & 4 models are NOT agentic and are not "
@@ -3375,6 +3380,93 @@ class HermesCLI:
         except ValueError:
             # Treat as a git hash
             return ref
+
+    def _handle_snapshot_command(self, command: str):
+        """Handle /snapshot — lightweight state snapshots for Hermes config/state.
+
+        Syntax:
+            /snapshot                  — list recent snapshots
+            /snapshot create [label]   — create a snapshot
+            /snapshot restore <id>     — restore state from snapshot
+            /snapshot prune [N]        — prune to N snapshots (default 20)
+        """
+        from hermes_cli.backup import (
+            create_quick_snapshot, list_quick_snapshots,
+            restore_quick_snapshot, prune_quick_snapshots,
+        )
+        from hermes_constants import display_hermes_home
+
+        parts = command.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else "list"
+
+        if subcmd in ("list", "ls"):
+            snaps = list_quick_snapshots()
+            if not snaps:
+                print("  No state snapshots yet.")
+                print("  Create one: /snapshot create [label]")
+                return
+            print(f"  State snapshots ({display_hermes_home()}/state-snapshots/):\n")
+            print(f"  {'#':>3}  {'ID':<35} {'Files':>5} {'Size':>10} {'Label'}")
+            print(f"  {'─'*3}  {'─'*35} {'─'*5} {'─'*10} {'─'*20}")
+            for i, s in enumerate(snaps, 1):
+                size = s.get("total_size", 0)
+                if size < 1024:
+                    size_str = f"{size} B"
+                elif size < 1024 * 1024:
+                    size_str = f"{size / 1024:.0f} KB"
+                else:
+                    size_str = f"{size / 1024 / 1024:.1f} MB"
+                label = s.get("label") or ""
+                print(f"  {i:3}  {s['id']:<35} {s.get('file_count', 0):>5} {size_str:>10} {label}")
+
+        elif subcmd == "create":
+            label = " ".join(parts[2:]) if len(parts) > 2 else None
+            snap_id = create_quick_snapshot(label=label)
+            if snap_id:
+                print(f"  Snapshot created: {snap_id}")
+            else:
+                print("  No state files found to snapshot.")
+
+        elif subcmd in ("restore", "rewind"):
+            if len(parts) < 3:
+                print("  Usage: /snapshot restore <snapshot-id>")
+                # Show hint with most recent snapshot
+                snaps = list_quick_snapshots(limit=1)
+                if snaps:
+                    print(f"  Most recent: {snaps[0]['id']}")
+                return
+            snap_id = parts[2]
+            # Allow restore by number (1-indexed)
+            try:
+                idx = int(snap_id)
+                snaps = list_quick_snapshots()
+                if 1 <= idx <= len(snaps):
+                    snap_id = snaps[idx - 1]["id"]
+                else:
+                    print(f"  Invalid snapshot number. Use 1-{len(snaps)}.")
+                    return
+            except ValueError:
+                pass
+            if restore_quick_snapshot(snap_id):
+                print(f"  Restored state from: {snap_id}")
+                print("  Restart recommended for state.db changes to take effect.")
+            else:
+                print(f"  Snapshot not found: {snap_id}")
+
+        elif subcmd == "prune":
+            keep = 20
+            if len(parts) > 2:
+                try:
+                    keep = int(parts[2])
+                except ValueError:
+                    print("  Usage: /snapshot prune [keep-count]")
+                    return
+            deleted = prune_quick_snapshots(keep=keep)
+            print(f"  Pruned {deleted} old snapshot(s) (keeping {keep}).")
+
+        else:
+            print(f"  Unknown subcommand: {subcmd}")
+            print("  Usage: /snapshot [list|create [label]|restore <id>|prune [N]]")
 
     def _handle_stop_command(self):
         """Handle /stop — kill all running background processes.
@@ -4386,53 +4478,6 @@ class HermesCLI:
             _ask()
         return result[0]
 
-    def _interactive_provider_selection(
-        self, providers: list, current_model: str, current_provider: str
-    ) -> str | None:
-        """Show provider picker, return slug or None on cancel."""
-        choices = []
-        for p in providers:
-            count = p.get("total_models", len(p.get("models", [])))
-            label = f"{p['name']} ({count} model{'s' if count != 1 else ''})"
-            if p.get("is_current"):
-                label += "  ← current"
-            choices.append(label)
-
-        default_idx = next(
-            (i for i, p in enumerate(providers) if p.get("is_current")), 0
-        )
-
-        idx = self._run_curses_picker(
-            f"Select a provider (current: {current_model} on {current_provider}):",
-            choices,
-            default_index=default_idx,
-        )
-        if idx is None:
-            return None
-        return providers[idx]["slug"]
-
-    def _interactive_model_selection(
-        self, model_list: list, provider_data: dict
-    ) -> str | None:
-        """Show model picker for a given provider, return model_id or None on cancel."""
-        pname = provider_data.get("name", provider_data.get("slug", ""))
-        total = provider_data.get("total_models", len(model_list))
-
-        if not model_list:
-            _cprint(f"\n  No models listed for {pname}.")
-            return self._prompt_text_input("  Enter model name manually (or Enter to cancel): ")
-
-        choices = list(model_list) + ["Enter custom model name"]
-        idx = self._run_curses_picker(
-            f"Select model from {pname} ({len(model_list)} of {total}):",
-            choices,
-        )
-        if idx is None:
-            return None
-        if idx < len(model_list):
-            return model_list[idx]
-        return self._prompt_text_input("  Enter model name: ")
-
     def _open_model_picker(self, providers: list, current_model: str, current_provider: str, user_provs=None, custom_provs=None) -> None:
         """Open prompt_toolkit-native /model picker modal."""
         self._capture_modal_input_snapshot()
@@ -4543,16 +4588,19 @@ class HermesCLI:
                 self._close_model_picker()
                 return
             provider_data = providers[selected]
-            model_list = []
-            try:
-                from hermes_cli.models import provider_model_ids
-                live = provider_model_ids(provider_data["slug"])
-                if live:
-                    model_list = live
-            except Exception:
-                pass
+            # Use the curated model list from list_authenticated_providers()
+            # (same lists as `hermes model` and gateway pickers).
+            # Only fall back to the live provider catalog when the curated
+            # list is empty (e.g. user-defined endpoints with no curated list).
+            model_list = provider_data.get("models", [])
             if not model_list:
-                model_list = provider_data.get("models", [])
+                try:
+                    from hermes_cli.models import provider_model_ids
+                    live = provider_model_ids(provider_data["slug"])
+                    if live:
+                        model_list = live
+                except Exception:
+                    pass
             state["stage"] = "model"
             state["provider_data"] = provider_data
             state["model_list"] = model_list
@@ -4622,10 +4670,10 @@ class HermesCLI:
             user_provs = None
             custom_provs = None
             try:
-                from hermes_cli.config import load_config
+                from hermes_cli.config import get_compatible_custom_providers, load_config
                 cfg = load_config()
                 user_provs = cfg.get("providers")
-                custom_provs = cfg.get("custom_providers")
+                custom_provs = get_compatible_custom_providers(cfg)
             except Exception:
                 pass
 
@@ -5451,6 +5499,8 @@ class HermesCLI:
                 print(f"Plugin system error: {e}")
         elif canonical == "rollback":
             self._handle_rollback_command(cmd_original)
+        elif canonical == "snapshot":
+            self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "background":
@@ -5715,7 +5765,7 @@ class HermesCLI:
                         border_style=_resp_color,
                         style=_resp_text,
                         box=rich_box.HORIZONTALS,
-                        padding=(1, 2),
+                        padding=(1, 4),
                     ))
                 else:
                     _cprint("  (No response generated)")
@@ -5839,7 +5889,7 @@ class HermesCLI:
                         title_align="left",
                         border_style=_resp_color,
                         box=rich_box.HORIZONTALS,
-                        padding=(1, 2),
+                        padding=(1, 4),
                     ))
                 else:
                     _cprint("  💬 /btw: (no response)")
@@ -5906,7 +5956,7 @@ class HermesCLI:
         parts = cmd.strip().split(None, 1)
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
 
-        _DEFAULT_CDP = "http://localhost:9222"
+        _DEFAULT_CDP = "http://127.0.0.1:9222"
         current = os.environ.get("BROWSER_CDP_URL", "").strip()
 
         if sub.startswith("connect"):
@@ -6113,6 +6163,7 @@ class HermesCLI:
 
         set_active_skin(new_skin)
         _ACCENT.reset()  # Re-resolve ANSI color for the new skin
+        _DIM.reset()     # Re-resolve dim/secondary ANSI color for the new skin
         if save_config_value("display.skin", new_skin):
             print(f"  Skin set to: {new_skin} (saved)")
         else:
@@ -7601,7 +7652,7 @@ class HermesCLI:
                         label = " ⚕ Hermes "
                         fill = w - 2 - len(label)
                         _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
-                    _cprint(sentence.rstrip())
+                    _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
 
                 tts_thread = threading.Thread(
                     target=stream_tts_to_speaker,
@@ -7832,7 +7883,7 @@ class HermesCLI:
                         border_style=_resp_color,
                         style=_resp_text,
                         box=rich_box.HORIZONTALS,
-                        padding=(1, 2),
+                        padding=(1, 4),
                     ))
 
 
@@ -7841,6 +7892,17 @@ class HermesCLI:
             if self.bell_on_complete:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
+
+            # Notify when iteration budget was hit
+            if result and not result.get("completed") and not result.get("interrupted"):
+                _api_calls = result.get("api_calls", 0)
+                if _api_calls >= getattr(self.agent, "max_iterations", 90):
+                    _max_iter = getattr(self.agent, "max_iterations", 90)
+                    _cprint(
+                        f"\n{_DIM}⚠ Iteration budget reached "
+                        f"({_api_calls}/{_max_iter}) — "
+                        f"response may be incomplete{_RST}"
+                    )
 
             # Speak response aloud if voice TTS is enabled
             # Skip batch TTS when streaming TTS already handled it
@@ -8573,6 +8635,24 @@ class HermesCLI:
             self._should_exit = True
             event.app.exit()
 
+        _modal_prompt_active = Condition(
+            lambda: bool(self._secret_state or self._sudo_state)
+        )
+
+        @kb.add('escape', filter=_modal_prompt_active, eager=True)
+        def handle_escape_modal(event):
+            """ESC cancels active secret/sudo prompts."""
+            if self._secret_state:
+                self._cancel_secret_capture()
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+            if self._sudo_state:
+                self._sudo_state["response_queue"].put("")
+                self._sudo_state = None
+                event.app.invalidate()
+                return
+
         @kb.add('c-z')
         def handle_ctrl_z(event):
             """Handle Ctrl+Z - suspend process to background (Unix only)."""
@@ -8682,6 +8762,9 @@ class HermesCLI:
             if _should_auto_attach_clipboard_image_on_paste(pasted_text) and self._try_attach_clipboard_image():
                 event.app.invalidate()
             if pasted_text:
+                # Sanitize surrogate characters (e.g. from Word/Google Docs paste) before writing
+                from run_agent import _sanitize_surrogates
+                pasted_text = _sanitize_surrogates(pasted_text)
                 line_count = pasted_text.count('\n')
                 buf = event.current_buffer
                 if line_count >= 5 and not buf.text.strip().startswith('/'):
@@ -8867,9 +8950,9 @@ class HermesCLI:
             if cli_ref._voice_processing:
                 return "transcribing..."
             if cli_ref._sudo_state:
-                return "type password (hidden), Enter to skip"
+                return "type password (hidden), Enter to submit · ESC to skip"
             if cli_ref._secret_state:
-                return "type secret (hidden), Enter to skip"
+                return "type secret (hidden), Enter to submit · ESC to skip"
             if cli_ref._approval_state:
                 return ""
             if cli_ref._clarify_freetext:
@@ -9112,7 +9195,7 @@ class HermesCLI:
             prompt = state.get("prompt") or f"Enter value for {state.get('var_name', 'secret')}"
             metadata = state.get("metadata") or {}
             help_text = metadata.get("help")
-            body = 'Enter secret below (hidden), or press Enter to skip'
+            body = 'Enter secret below (hidden), ESC or Ctrl+C to skip'
             content_lines = [prompt, body]
             if help_text:
                 content_lines.insert(1, str(help_text))
