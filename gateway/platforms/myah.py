@@ -38,6 +38,7 @@ from gateway.config import Platform, PlatformConfig
 # ── Myah: attachments support ──────────────────────────────────────────────
 import mimetypes as _myah_mimetypes
 import os as _myah_os
+from pathlib import Path as _myah_Path
 try:
     import aiohttp as _myah_aiohttp
     _MYAH_AIOHTTP_AVAILABLE = True
@@ -971,6 +972,85 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── BasePlatformAdapter interface ───────────────────────────────────
 
+    # ── Myah: media streaming endpoint ─────────────────────────────────────────
+    def _myah_allowed_media_roots(self) -> 'list[_myah_Path]':
+        """Return the list of allowed cache directories for media streaming."""
+        from hermes_constants import get_hermes_home, get_hermes_dir
+        base = get_hermes_home()
+        return [
+            get_hermes_dir('cache/images', 'image_cache').resolve(),
+            get_hermes_dir('cache/audio', 'audio_cache').resolve(),
+            get_hermes_dir('cache/documents', 'document_cache').resolve(),
+            get_hermes_dir('cache/screenshots', 'browser_screenshots').resolve(),
+        ]
+
+    async def _handle_media_get(self, request: 'web.Request') -> 'web.Response':
+        """GET /myah/v1/media?path=<path> — stream a cached media file.
+
+        Security:
+        - Bearer auth (same as other /myah/v1/* routes)
+        - strict path resolution defeats symlink traversal
+        - whitelist of allowed cache directories
+        - no directory listing, no write, no delete
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        path_str = request.rel_url.query.get('path', '')
+        if not path_str:
+            return web.json_response({'error': "Missing 'path' query parameter"}, status=400)
+
+        try:
+            resolved = _myah_Path(path_str).resolve(strict=True)
+        except (FileNotFoundError, RuntimeError, OSError):
+            return web.json_response({'error': 'File not found'}, status=404)
+
+        allowed_roots = self._myah_allowed_media_roots()
+
+        def _is_subpath(child: '_myah_Path', parent: '_myah_Path') -> bool:
+            try:
+                child.relative_to(parent)
+                return True
+            except ValueError:
+                return False
+
+        if not any(_is_subpath(resolved, root) for root in allowed_roots):
+            return web.json_response(
+                {'error': 'Path not in an allowed cache directory'}, status=403,
+            )
+
+        mime, _ = _myah_mimetypes.guess_type(str(resolved))
+        if not mime:
+            mime = 'application/octet-stream'
+
+        try:
+            file_size = resolved.stat().st_size
+        except OSError:
+            return web.json_response({'error': 'File not accessible'}, status=404)
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': mime,
+                'Content-Length': str(file_size),
+                'Cache-Control': 'private, max-age=300',
+            },
+        )
+        await response.prepare(request)
+        try:
+            with resolved.open('rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+        except Exception:
+            pass  # client disconnected mid-stream
+        await response.write_eof()
+        return response
+    # ────────────────────────────────────────────────────────────────────────────
+
     def _register_routes_on_app(self, app: "web.Application") -> None:
         """Pre-setup hook: add Myah routes to the shared aiohttp app.
 
@@ -983,6 +1063,7 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_get("/myah/v1/events/{stream_id}", self._handle_events_endpoint)
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
         app.router.add_post("/myah/v1/secret/{stream_id}", self._handle_secret_endpoint)
+        app.router.add_get("/myah/v1/media", self._handle_media_get)  # Myah: media endpoint
 
         # Register management API routes (config, skills, plugins, MCP,
         # toolsets, sessions) with the same bearer token auth.
