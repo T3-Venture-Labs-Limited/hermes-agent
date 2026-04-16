@@ -190,6 +190,16 @@ class MyahAdapter(BasePlatformAdapter):
         user_id = body.get("user_id")
         chat_name = body.get("chat_name")
 
+        # ── Myah: one-shot session-scoped model override (T3-932) ────
+        # If the client supplies a 'model' field, apply it to
+        # _session_model_overrides BEFORE dispatching the message so the
+        # gateway picks it up when constructing/resolving the agent.
+        # This is the inline equivalent of calling
+        # PUT /myah/api/sessions/{id}/model, useful for
+        # "regenerate with different model" flows.
+        _override_model = (body.get("model") or "").strip()
+        # ────────────────────────────────────────────────────────────
+
         # Create the SSE stream
         stream_id = f"myah_{uuid.uuid4().hex}"
         q: asyncio.Queue = asyncio.Queue()
@@ -212,6 +222,66 @@ class MyahAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+        # ── Myah: apply one-shot model override if present ───────────
+        if _override_model and self.gateway_runner is not None:
+            try:
+                from hermes_cli.model_switch import switch_model
+                # Load current config for switch_model context
+                import yaml as _yaml
+                from hermes_constants import get_hermes_home as _ghm
+                _cfg_path = _ghm() / "config.yaml"
+                _cfg = {}
+                if _cfg_path.exists():
+                    try:
+                        _cfg = _yaml.safe_load(_cfg_path.read_text()) or {}
+                    except Exception:
+                        _cfg = {}
+                _mc = _cfg.get("model", {}) if isinstance(_cfg.get("model"), dict) else {}
+                _current_model = _mc.get("default") or (_cfg.get("model") if isinstance(_cfg.get("model"), str) else "")
+                _current_provider = _mc.get("provider", "") or "openrouter"
+                _current_base_url = _mc.get("base_url", "") or ""
+
+                _result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: switch_model(
+                        raw_input=_override_model,
+                        current_provider=_current_provider,
+                        current_model=_current_model,
+                        current_base_url=_current_base_url,
+                        current_api_key="",
+                        is_global=False,
+                        explicit_provider="",
+                        user_providers=_cfg.get("providers"),
+                        custom_providers=_cfg.get("custom_providers"),
+                    ),
+                )
+                if getattr(_result, "success", False):
+                    runner = self.gateway_runner
+                    if runner._session_model_overrides is None:
+                        runner._session_model_overrides = {}
+                    runner._session_model_overrides[session_key] = {
+                        "model": _result.new_model,
+                        "provider": _result.target_provider,
+                        "api_key": getattr(_result, "api_key", "") or "",
+                        "base_url": getattr(_result, "base_url", "") or "",
+                        "api_mode": getattr(_result, "api_mode", "") or "",
+                    }
+                    try:
+                        runner._evict_cached_agent(session_key)
+                    except Exception:
+                        logger.warning(
+                            "[myah] _evict_cached_agent failed during one-shot override",
+                            exc_info=True,
+                        )
+                else:
+                    logger.warning(
+                        "[myah] one-shot model override failed: %s",
+                        getattr(_result, "error_message", "unknown"),
+                    )
+            except Exception:
+                logger.exception("[myah] one-shot model override error")
+        # ────────────────────────────────────────────────────────────
 
         # Dual mapping (Fix 1): map both the raw chat_id and full session_key
         self._chat_id_streams[session_id] = stream_id
@@ -314,11 +384,34 @@ class MyahAdapter(BasePlatformAdapter):
                 # Check if run.completed or run.failed was already emitted
                 # by looking at stream state.  If the queue still exists and
                 # we haven't sent a terminal event, send run.completed now.
+
+                # ── Myah: per-message model attribution (T3-932) ──
+                # Read the cached agent's model + provider so the
+                # frontend can show "answered by X via Y" per message.
+                _attribution_model = ""
+                _attribution_provider = ""
+                try:
+                    runner = self.gateway_runner
+                    if runner is not None:
+                        cached = (runner._agent_cache or {}).get(session_key)
+                        if cached and cached[0] is not None:
+                            _attribution_model = getattr(cached[0], "model", "") or ""
+                            _attribution_provider = getattr(cached[0], "provider", "") or ""
+                        # Fallback to session override if cache was evicted mid-flight
+                        if not _attribution_model:
+                            _override = (runner._session_model_overrides or {}).get(session_key, {})
+                            _attribution_model = _override.get("model", "") or _attribution_model
+                            _attribution_provider = _override.get("provider", "") or _attribution_provider
+                except Exception:
+                    logger.debug("[myah] model attribution lookup failed", exc_info=True)
+                # ────────────────────────────────────────────────
                 self._push_event_sync(stream_id, {
                     "event": "run.completed",
                     "stream_id": stream_id,
                     "run_id": stream_id,
                     "timestamp": time.time(),
+                    "model": _attribution_model,       # Myah: per-message attribution
+                    "provider": _attribution_provider,  # Myah: per-message attribution
                 })
                 # Sentinel to close the SSE stream
                 try:

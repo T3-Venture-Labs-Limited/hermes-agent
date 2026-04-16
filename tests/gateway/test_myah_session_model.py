@@ -150,3 +150,103 @@ async def test_get_session_model_no_override_returns_empty(app_with_runner, mock
     data = json.loads(response.body)
     assert data["model"] == ""
     assert data["provider"] == ""
+
+
+@pytest.mark.asyncio
+async def test_message_body_model_override_sets_session_override(fake_switch_model, monkeypatch):
+    """Test that POST /myah/v1/message with 'model' field applies session override."""
+    from gateway.platforms.myah import MyahAdapter
+    from gateway.config import PlatformConfig
+
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    mock_runner = MagicMock()
+    mock_runner._session_model_overrides = {}
+    mock_runner._evict_cached_agent = MagicMock()
+    adapter.gateway_runner = mock_runner
+
+    # Stub handle_message so we don't dispatch for real
+    adapter.handle_message = AsyncMock()
+    adapter._push_event_sync = MagicMock()
+
+    # Build a request with model in body
+    request = MagicMock()
+    request.headers = {}
+    request.json = AsyncMock(return_value={
+        'message': 'hello',
+        'session_id': 'chat123',
+        'user_id': 'user1',
+        'model': 'anthropic/claude-opus-4.6',
+    })
+    request.path = '/myah/v1/message'
+
+    # Set the adapter's loop
+    import asyncio
+    adapter._loop = asyncio.get_running_loop()
+
+    response = await adapter._handle_message_endpoint(request)
+
+    # The override should have been applied before handle_message dispatch
+    assert any(
+        ov.get('model') == 'anthropic/claude-opus-4.6'
+        for ov in mock_runner._session_model_overrides.values()
+    ), f"override not set: {mock_runner._session_model_overrides}"
+
+
+@pytest.mark.asyncio
+async def test_run_completed_emits_model_and_provider(monkeypatch):
+    """run.completed event includes model + provider read from cached agent."""
+    from gateway.platforms.myah import MyahAdapter
+    from gateway.config import PlatformConfig
+
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+
+    mock_agent = MagicMock()
+    mock_agent.model = 'anthropic/claude-opus-4.6'
+    mock_agent.provider = 'anthropic'
+
+    mock_runner = MagicMock()
+    mock_runner._session_model_overrides = {}
+    adapter.gateway_runner = mock_runner
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter._active_sessions = {}
+
+    emitted = []
+
+    def _capture(stream_id, event):
+        emitted.append(event)
+
+    adapter._push_event_sync = _capture
+    adapter._streams = {'myah_test': MagicMock()}
+
+    from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+    from gateway.config import Platform
+    source = SessionSource(
+        platform=Platform.MYAH,
+        chat_id='chat123',
+        chat_type='dm',
+        user_id='user1',
+    )
+    event = MessageEvent(
+        text='hello',
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id='myah_test',
+    )
+
+    # Pre-populate session_key -> stream mapping as _handle_message_endpoint would
+    from gateway.session import build_session_key
+    _sk = build_session_key(source, group_sessions_per_user=True, thread_sessions_per_user=False)
+    adapter._session_streams[_sk] = 'myah_test'
+    adapter._chat_id_streams['chat123'] = 'myah_test'
+    adapter._stream_sessions['myah_test'] = _sk
+
+    # Seed agent cache under the correct session_key
+    mock_runner._agent_cache = {_sk: (mock_agent, 'sig_hash')}
+
+    await adapter._dispatch_message(event, 'myah_test', 'chat123', _sk)
+
+    run_completed = [e for e in emitted if e.get('event') == 'run.completed']
+    assert run_completed, f"no run.completed event; got events: {[e.get('event') for e in emitted]}"
+    assert run_completed[0].get('model') == 'anthropic/claude-opus-4.6'
+    assert run_completed[0].get('provider') == 'anthropic'
