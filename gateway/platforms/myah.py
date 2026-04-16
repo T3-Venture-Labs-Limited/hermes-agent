@@ -69,6 +69,18 @@ def check_myah_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+# ── Myah: mime/extension helper ────────────────────────────────────────────
+def _myah_ext(mime: str, filename: str, default: str) -> str:
+    """Return a file extension (with leading dot) from MIME, filename, or default."""
+    if filename and '.' in filename:
+        ext = '.' + filename.rsplit('.', 1)[1].lower()
+        if 2 <= len(ext) <= 6:
+            return ext
+    guessed = _myah_mimetypes.guess_extension(mime) if mime else None
+    return guessed or default
+# ────────────────────────────────────────────────────────────────────────────
+
+
 class MyahAdapter(BasePlatformAdapter):
     """
     Gateway platform adapter for the Myah web frontend.
@@ -314,13 +326,89 @@ class MyahAdapter(BasePlatformAdapter):
         self._session_streams[session_key] = stream_id
         self._stream_sessions[stream_id] = session_key
 
+        # ── Myah: media attachments ingestion ──────────────────────────────
+        attachments = body.get('attachments') or []
+        _myah_media_urls: list = []
+        _myah_media_types: list = []
+        _myah_msg_type = MessageType.TEXT  # will be upgraded by mime routing below
+
+        if attachments and not (_MYAH_PLATFORM_BASE_URL and _MYAH_PLATFORM_BEARER):
+            return web.json_response(
+                {'error': 'Adapter missing MYAH_PLATFORM_BASE_URL / MYAH_PLATFORM_BEARER env'},
+                status=500,
+            )
+
+        if attachments:
+            async def _fetch_one(att: dict) -> tuple:
+                file_id = att.get('file_id')
+                filename = att.get('filename') or 'attachment'
+                declared_mime = (att.get('mime_type') or 'application/octet-stream').lower()
+                declared_size = int(att.get('size') or 0)
+                if not file_id:
+                    raise ValueError(f"Attachment '{filename}' missing file_id")
+                if declared_size > _MYAH_MAX_ATTACHMENT_BYTES:
+                    raise ValueError(
+                        f'{filename} exceeds {_MYAH_MAX_ATTACHMENT_BYTES // (1024*1024)} MB limit'
+                    )
+                fetch_url = (
+                    f"{_MYAH_PLATFORM_BASE_URL.rstrip('/')}"
+                    f"/api/v1/files/{file_id}/content"
+                )
+                timeout = _myah_aiohttp.ClientTimeout(total=30)
+                async with _myah_aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(
+                        fetch_url,
+                        headers={'Authorization': f'Bearer {_MYAH_PLATFORM_BEARER}'},
+                    ) as r:
+                        if r.status != 200:
+                            raise ValueError(
+                                f'Platform returned {r.status} for {filename}'
+                            )
+                        raw = await r.read()
+                if len(raw) > _MYAH_MAX_ATTACHMENT_BYTES:
+                    raise ValueError(
+                        f'{filename} body exceeds {_MYAH_MAX_ATTACHMENT_BYTES // (1024*1024)} MB'
+                    )
+                return raw, declared_mime, filename
+
+            try:
+                fetched = await asyncio.gather(
+                    *(_fetch_one(a) for a in attachments), return_exceptions=False,
+                )
+            except Exception as _att_err:
+                return web.json_response(
+                    {'error': f'Attachment fetch failed: {_att_err}'},
+                    status=502,
+                )
+
+            for _raw, _mime, _fname in fetched:
+                if _mime.startswith('image/'):
+                    _ext = _myah_ext(_mime, _fname, '.jpg')
+                    _cached = cache_image_from_bytes(_raw, ext=_ext)
+                    if _myah_msg_type == MessageType.TEXT:
+                        _myah_msg_type = MessageType.PHOTO
+                elif _mime.startswith('audio/'):
+                    _ext = _myah_ext(_mime, _fname, '.ogg')
+                    _cached = cache_audio_from_bytes(_raw, ext=_ext)
+                    if _myah_msg_type == MessageType.TEXT:
+                        _myah_msg_type = MessageType.VOICE
+                else:
+                    _cached = cache_document_from_bytes(_raw, _fname)
+                    if _myah_msg_type == MessageType.TEXT:
+                        _myah_msg_type = MessageType.DOCUMENT
+                _myah_media_urls.append(_cached)
+                _myah_media_types.append(_mime)
+        # ── End Myah: media attachments ingestion ─────────────────────────
+
         # Build the message event
-        msg_type = MessageType.COMMAND if message.startswith("/") else MessageType.TEXT
+        msg_type = MessageType.COMMAND if message.startswith('/') else _myah_msg_type  # Myah: upgraded by attachments
         event = MessageEvent(
             text=message,
             message_type=msg_type,
             source=source,
             message_id=stream_id,
+            media_urls=_myah_media_urls,    # Myah: propagate attachments
+            media_types=_myah_media_types,  # Myah: propagate attachments
         )
 
         # Dispatch in background — the gateway's handle_message spawns its
