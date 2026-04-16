@@ -224,7 +224,8 @@ class MyahAdapter(BasePlatformAdapter):
         )
 
         # ── Myah: apply one-shot model override if present ───────────
-        if _override_model and self.gateway_runner is not None:
+        runner = self.gateway_runner
+        if _override_model and runner is not None:
             try:
                 from hermes_cli.model_switch import switch_model
                 # Load current config for switch_model context
@@ -241,6 +242,12 @@ class MyahAdapter(BasePlatformAdapter):
                 _current_model = _mc.get("default") or (_cfg.get("model") if isinstance(_cfg.get("model"), str) else "")
                 _current_provider = _mc.get("provider", "") or "openrouter"
                 _current_base_url = _mc.get("base_url", "") or ""
+                # Layer current session override on top if present
+                _existing_override = (runner._session_model_overrides or {}).get(session_key, {})
+                if _existing_override:
+                    _current_model = _existing_override.get('model', _current_model)
+                    _current_provider = _existing_override.get('provider', _current_provider)
+                    _current_base_url = _existing_override.get('base_url', _current_base_url)
 
                 _result = await asyncio.get_running_loop().run_in_executor(
                     None,
@@ -257,7 +264,6 @@ class MyahAdapter(BasePlatformAdapter):
                     ),
                 )
                 if getattr(_result, "success", False):
-                    runner = self.gateway_runner
                     if runner._session_model_overrides is None:
                         runner._session_model_overrides = {}
                     runner._session_model_overrides[session_key] = {
@@ -400,8 +406,8 @@ class MyahAdapter(BasePlatformAdapter):
                         # Fallback to session override if cache was evicted mid-flight
                         if not _attribution_model:
                             _override = (runner._session_model_overrides or {}).get(session_key, {})
-                            _attribution_model = _override.get("model", "") or _attribution_model
-                            _attribution_provider = _override.get("provider", "") or _attribution_provider
+                            _attribution_model = _override.get("model", "")
+                            _attribution_provider = _override.get("provider", "")
                 except Exception:
                     logger.debug("[myah] model attribution lookup failed", exc_info=True)
                 # ────────────────────────────────────────────────
