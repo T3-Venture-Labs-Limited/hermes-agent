@@ -8285,18 +8285,26 @@ class GatewayRunner:
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         # ── Myah: track whether native SSE streaming delivered the response ──
-        # Set to True inside run_sync only when BOTH (a) structured callbacks
-        # are active (adapter.get_structured_callbacks() returns a dict) AND
-        # (b) streaming is enabled in config (_want_stream_deltas).  Honored
-        # at the end of _run_agent to set response["already_sent"]=True so
-        # base._process_message_background skips the duplicate final send().
+        # Set to True inside run_sync whenever the platform adapter wires
+        # its own stream_delta callback via get_structured_callbacks().
+        # Honored at the end of _run_agent to set response["already_sent"]=True
+        # so base._process_message_background skips the duplicate final send().
         #
-        # Subtlety: we deliberately do NOT suppress the fallback send when
-        # structured callbacks exist but streaming is disabled — in that
-        # case the fallback IS the only delivery path and the user would
-        # see nothing.  (This replaces PR #1's broader _structured_cbs_holder
-        # check which would incorrectly suppress the fallback when streaming
-        # is off.)
+        # We gate on callback presence alone — NOT on the top-level
+        # `streaming:` config flag — because:
+        #   1. agent.stream_delta_callback is wired below unconditionally
+        #      whenever structured callbacks exist (independent of
+        #      _want_stream_deltas).
+        #   2. AIAgent defaults to _use_streaming=True for every LLM call.
+        #      The top-level streaming config only governs the messaging-
+        #      platform GatewayStreamConsumer "edit" transport — it does
+        #      NOT gate whether the agent streams tokens from the LLM.
+        #   3. Therefore, once the callback is assigned, tokens WILL push
+        #      via SSE — so the fallback send() must be suppressed or the
+        #      user sees the response twice (tokens + full response).
+        #
+        # For failed responses we still deliver via send() so the error
+        # message reaches the user even if partial tokens streamed first.
         _native_streaming_used = [False]
         # ────────────────────────────────────────────────────────────────
         
@@ -8561,7 +8569,12 @@ class GatewayRunner:
                 # ── Myah: flag native SSE streaming so the outer _run_agent can
                 # set already_sent=True and skip the fallback send() in
                 # base._process_message_background, preventing duplicate delivery.
-                if _want_stream_deltas and _structured_cbs.get("stream_delta"):
+                # Gate on callback presence only — see the outer-scope comment
+                # at _native_streaming_used declaration for full rationale.
+                # (Callback wiring above is unconditional on _want_stream_deltas,
+                # and AIAgent streams by default regardless of top-level
+                # `streaming:` config — so the gate must follow the same logic.)
+                if _structured_cbs.get("stream_delta"):
                     _native_streaming_used[0] = True
                 # ────────────────────────────────────────────────────
             else:

@@ -185,20 +185,38 @@ async def test_myah_streaming_sets_already_sent(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_myah_no_streaming_does_not_mark_already_sent(monkeypatch, tmp_path):
-    """When streaming is disabled, already_sent must NOT be set.
+async def test_myah_structured_callbacks_mark_already_sent_regardless_of_streaming_config(
+    monkeypatch, tmp_path
+):
+    """Native SSE streaming must set already_sent even when top-level streaming is off.
 
-    Without streaming, the fallback send IS needed to deliver the response,
-    so suppressing it would leave the user with no message.
+    The Myah adapter's get_structured_callbacks() wiring is independent of the
+    top-level `streaming:` config — agent.stream_delta_callback is assigned
+    unconditionally when structured callbacks exist, and AIAgent streams from
+    the LLM by default. So tokens WILL push via SSE regardless of the top-level
+    flag, and the fallback send() must be suppressed to prevent duplicates.
+
+    Previously this test asserted the opposite (that already_sent stays unset
+    when streaming.enabled=False). That codified the duplicate-delivery bug:
+    the mock agent still emitted tokens (because the callback was wired), and
+    the fallback send() then duplicated them as a single final event.
     """
-    _, result = await _run_native_streaming(
+    adapter, result = await _run_native_streaming(
         monkeypatch, tmp_path, streaming_enabled=False
     )
 
-    # already_sent must not be True — without streaming the fallback send()
-    # in base._process_message_background is the only delivery path, so
-    # suppressing it would silently drop the response.
-    assert result.get("already_sent") is not True
+    # Tokens DID stream — the callback is wired regardless of streaming_enabled.
+    assert adapter.deltas == ["Hello", " ", "world", "!"], (
+        "Myah's stream_delta callback must fire regardless of streaming.enabled "
+        "because get_structured_callbacks wires it unconditionally; "
+        f"got deltas={adapter.deltas}"
+    )
+    # Therefore already_sent must be True so the fallback send() is skipped.
+    assert result.get("already_sent") is True, (
+        "Myah native streaming delivered tokens via SSE; already_sent must be "
+        "True to prevent base._process_message_background from sending the "
+        f"full response again as a duplicate; got {result}"
+    )
 
 
 @pytest.mark.asyncio
