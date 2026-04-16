@@ -7687,7 +7687,14 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
-        
+        # ── Myah: track whether structured-callback streaming delivered the response ──
+        # Set to True inside run_sync when the platform adapter provides its own
+        # stream_delta callback (Myah) AND streaming is enabled. When True, the
+        # fallback send() in base._process_message_background must be skipped to
+        # prevent duplicate message delivery.
+        _native_streaming_used = [False]
+        # ──────────────────────────────────────────────────────────────────────────────
+
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
         _hooks_ref = self.hooks
@@ -7934,6 +7941,12 @@ class GatewayRunner:
                 agent.status_callback = _structured_cbs.get("status")
                 if hasattr(agent, 'reasoning_callback'):
                     agent.reasoning_callback = _structured_cbs.get("reasoning")
+                # ── Myah: flag native SSE streaming so the outer _run_agent can
+                # set already_sent=True and skip the fallback send() in
+                # base._process_message_background, preventing duplicate delivery.
+                if _want_stream_deltas and _structured_cbs.get("stream_delta"):
+                    _native_streaming_used[0] = True
+                # ────────────────────────────────────────────────────
             else:
                 agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
                 agent.stream_delta_callback = _stream_delta_cb
@@ -8914,6 +8927,23 @@ class GatewayRunner:
                 )
             ):
                 response["already_sent"] = True
+
+        # ── Myah: native SSE streaming bypasses GatewayStreamConsumer ────────
+        # Platforms that expose get_structured_callbacks (currently Myah) wire
+        # their own stream_delta callback that pushes message.delta SSE events
+        # directly.  GatewayStreamConsumer never sees tokens, so its
+        # final_response_sent flag stays False and the guard above never fires.
+        # Upstream API server avoids duplication by returning an error from
+        # send() — Myah's send() succeeds, so we must set already_sent here
+        # to prevent base._process_message_background from re-sending the
+        # full response as another message.delta event.
+        if (
+            _native_streaming_used[0]
+            and isinstance(response, dict)
+            and not response.get("failed")
+        ):
+            response["already_sent"] = True
+        # ─────────────────────────────────────────────────────────────────────
         
         return response
 

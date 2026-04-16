@@ -141,3 +141,36 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+
+class TestSecretsToolset:
+    """Verify the secrets toolset is registered so platform filters expose it."""
+
+    def test_secrets_toolset_in_TOOLSETS(self):
+        """secrets must have a static toolset definition for platform resolution."""
+        assert "secrets" in TOOLSETS, (
+            "secrets toolset missing from TOOLSETS dict — "
+            "_get_platform_tools will never surface the secrets tool to agents"
+        )
+
+    def test_secrets_toolset_resolves_to_tool(self):
+        """resolve_toolset('secrets') must return the secrets tool name."""
+        tools = resolve_toolset("secrets")
+        assert tools == ["secrets"]
+
+    def test_secrets_toolset_has_description(self):
+        """Non-empty description so 'hermes tools' CLI can display it."""
+        ts = get_toolset("secrets")
+        assert ts is not None
+        assert ts.get("description"), "secrets toolset missing description"
+
+    def test_hermes_myah_includes_secrets(self):
+        """The hermes-myah composite must expand to include the secrets tool.
+
+        This is what _get_platform_tools relies on to surface secrets to the
+        agent when no explicit platform_toolsets config is set.
+        """
+        myah_tools = resolve_toolset("hermes-myah")
+        assert "secrets" in myah_tools, (
+            f"secrets tool missing from hermes-myah expansion: {myah_tools}"
+        )

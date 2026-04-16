@@ -167,7 +167,13 @@ TOOLSETS = {
         "tools": ["memory"],
         "includes": []
     },
-    
+
+    "secrets": {
+        "description": "Secure credential management — check, request, or inject API keys without exposing values to the model",
+        "tools": ["secrets"],
+        "includes": []
+    },
+
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
