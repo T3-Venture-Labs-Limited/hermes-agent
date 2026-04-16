@@ -52,6 +52,17 @@ try:
 except ImportError:
     _GUARD_AVAILABLE = False
 
+try:
+    from tools.skills_tool import (
+        _get_required_environment_variables,
+        _capture_required_environment_variables,
+        _is_env_var_persisted,
+    )
+    from agent.skill_utils import parse_frontmatter
+    _ENV_CAPTURE_AVAILABLE = True
+except ImportError:
+    _ENV_CAPTURE_AVAILABLE = False
+
 
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None."""
@@ -331,6 +342,26 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    # ── Check and capture missing environment variables ──────────────
+    _env_capture_result = None
+    if _ENV_CAPTURE_AVAILABLE:
+        try:
+            fm, _ = parse_frontmatter(content)
+            required = _get_required_environment_variables(fm)
+            if required:
+                missing = [
+                    entry for entry in required
+                    if not _is_env_var_persisted(entry['name'])
+                ]
+                if missing:
+                    _env_capture_result = _capture_required_environment_variables(
+                        name, missing,
+                    )
+        except Exception:
+            logger.warning(
+                'env capture failed for skill %s', name, exc_info=True,
+            )
+
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
@@ -343,6 +374,20 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+    if _env_capture_result is not None:
+        # 'missing_names' is returned by _capture_required_environment_variables
+        # (skills_tool.py) — list of var names not provided during the capture flow.
+        _still_missing = _env_capture_result.get('missing_names', [])
+        if _still_missing:
+            result['setup_needed'] = True
+            result['missing_env_vars'] = _still_missing
+            result['hint'] = (
+                f"Missing environment variables: {', '.join(_still_missing)}. "
+                f"Call skill_view('{name}') to retry setup, or use "
+                f"secrets(action='request', key='<name>') to provide them."
+            )
+        else:
+            result['setup_complete'] = True
     return result
 
 

@@ -694,6 +694,136 @@ async def handle_append_session_message(request: web.Request) -> web.Response:
         return web.json_response({'error': str(e)}, status=500)
 
 
+# ── Environment variable (secret) management ─────────────────────────────────
+
+_DENIED_ENV_VARS = frozenset({
+    'PATH', 'HOME', 'SHELL', 'USER', 'LOGNAME',
+    'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP',
+    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH',
+    'HERMES_HOME', 'HERMES_PROFILE',
+    'NODE_PATH', 'NODE_OPTIONS',
+})
+
+# ── Myah: internal env var prefixes hidden from settings UI ───────────────
+# Infrastructure vars set by the platform — not user-configurable secrets.
+_INTERNAL_PREFIXES = ('MYAH_', 'API_SERVER_', 'HONCHO_', 'HERMES_', 'SENTRY_')
+# ──────────────────────────────────────────────────────────────────────────
+
+
+async def handle_list_env(request: web.Request) -> web.Response:
+    """List all known env vars with redacted values and metadata.
+
+    Returns vars defined in OPTIONAL_ENV_VARS plus any user-added secrets
+    found in .env that are not internal infrastructure vars.
+    Values are always redacted (first 4 + last 4 chars).
+    """
+    from hermes_cli.config import OPTIONAL_ENV_VARS, load_env
+
+    env_on_disk = load_env()
+    result = {}
+
+    def _redact(value: str) -> str | None:
+        if not value:
+            return None
+        return value[:4] + '...' + value[-4:] if len(value) >= 12 else '***'
+
+    # Known vars with rich metadata from OPTIONAL_ENV_VARS
+    for var_name, info in OPTIONAL_ENV_VARS.items():
+        value = env_on_disk.get(var_name)
+        result[var_name] = {
+            'is_set': bool(value),
+            'redacted_value': _redact(value),
+            'description': info.get('description', ''),
+            'url': info.get('url'),
+            'category': info.get('category', ''),
+            'is_password': info.get('password', False),
+            'tools': info.get('tools', []),
+        }
+
+    # ── Myah: include user-added secrets not in OPTIONAL_ENV_VARS ─────────
+    # Custom secrets the user added via the settings UI or secrets tool.
+    # Exclude system vars, denied vars, and internal infrastructure vars.
+    for var_name, value in env_on_disk.items():
+        if var_name in result:
+            continue
+        if var_name.upper() in _DENIED_ENV_VARS:
+            continue
+        if any(var_name.startswith(p) for p in _INTERNAL_PREFIXES):
+            continue
+        result[var_name] = {
+            'is_set': bool(value),
+            'redacted_value': _redact(value),
+            'description': 'User-configured secret',
+            'url': None,
+            'category': 'custom',
+            'is_password': True,
+            'tools': [],
+        }
+    # ──────────────────────────────────────────────────────────────────────
+
+    return web.json_response(result)
+
+
+async def handle_set_env(request: web.Request) -> web.Response:
+    """Set an environment variable in the agent's .env file.
+
+    Body: {"key": "VAR_NAME", "value": "secret-value"}
+    The value is written atomically and picked up immediately by os.environ.
+    """
+    from hermes_cli.config import save_env_value
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({'error': 'Invalid JSON'}, status=400)
+
+    key = body.get('key', '').strip()
+    value = body.get('value', '')
+
+    if not key:
+        return web.json_response({'error': 'key is required'}, status=400)
+    if key.upper() in _DENIED_ENV_VARS:
+        return web.json_response(
+            {'error': f'{key} is a protected system variable and cannot be set'},
+            status=422,
+        )
+    if not value:
+        return web.json_response({'error': 'value is required'}, status=400)
+    if len(value) > 4096:
+        return web.json_response({'error': 'value exceeds 4096 char limit'}, status=422)
+
+    try:
+        save_env_value(key, value)
+    except Exception as exc:
+        logger.exception('PUT /myah/api/config/env failed')
+        return web.json_response({'error': str(exc)}, status=500)
+
+    return web.json_response({'ok': True, 'key': key})
+
+
+async def handle_delete_env(request: web.Request) -> web.Response:
+    """Remove an environment variable from the agent's .env file.
+
+    URL: DELETE /myah/api/config/env/{key}
+    """
+    from hermes_cli.config import remove_env_value
+
+    key = request.match_info.get('key', '').strip()
+    if not key:
+        return web.json_response({'error': 'key is required'}, status=400)
+
+    try:
+        removed = remove_env_value(key)
+    except Exception as exc:
+        logger.exception('DELETE /myah/api/config/env failed')
+        return web.json_response({'error': str(exc)}, status=500)
+
+    if not removed:
+        return web.json_response({'error': f'{key} not found in .env'}, status=404)
+
+    return web.json_response({'ok': True, 'key': key})
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -793,4 +923,9 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_post('/myah/api/sessions/{id}/title', _a(handle_set_session_title))
     app.router.add_post('/myah/api/sessions/{id}/append', _a(handle_append_session_message))
 
-    logger.info('Myah management routes registered (%d endpoints)', 24)
+    # Env var (secrets) management
+    app.router.add_get('/myah/api/config/env', _a(handle_list_env))
+    app.router.add_put('/myah/api/config/env', _a(handle_set_env))
+    app.router.add_delete('/myah/api/config/env/{key}', _a(handle_delete_env))
+
+    logger.info('Myah management routes registered (%d endpoints)', 27)
