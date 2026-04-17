@@ -154,9 +154,8 @@ async def handle_put_model(request: web.Request) -> web.Response:
 
 async def handle_get_session_model(request: web.Request) -> web.Response:
     """GET /myah/api/sessions/{id}/model — Read current session override."""
-    session_key = (request._match_info or {}).get('id', '')  # noqa: SLF001
-    app = request._app  # noqa: SLF001 — use _app for test compatibility
-    adapter = app.get('myah_adapter')
+    session_key = request.match_info.get('id', '')
+    adapter = request.app.get('myah_adapter')
     if adapter is None or adapter.gateway_runner is None:
         return web.json_response({'error': 'Gateway runner not available'}, status=503)
 
@@ -178,7 +177,7 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
     Mirrors the --session (non-global) branch of the /model slash command
     in gateway/run.py:_handle_model_command.
     """
-    session_key = (request._match_info or {}).get('id', '')  # noqa: SLF001
+    session_key = request.match_info.get('id', '')
     if not session_key:
         return web.json_response({'error': 'session_key is required'}, status=400)
 
@@ -193,8 +192,7 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
 
     explicit_provider = (body.get('provider') or '').strip()
 
-    app = request._app  # noqa: SLF001 — use _app for test compatibility
-    adapter = app.get('myah_adapter')
+    adapter = request.app.get('myah_adapter')
     if adapter is None or adapter.gateway_runner is None:
         return web.json_response({'error': 'Gateway runner not available'}, status=503)
     runner = adapter.gateway_runner

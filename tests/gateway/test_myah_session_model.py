@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
 
 from gateway.platforms.myah_management import (
     handle_get_session_model,
@@ -66,11 +67,26 @@ def fake_switch_model(monkeypatch):
 
 
 async def _make_put_request(app, session_key: str, body: dict):
-    request = web.Request.__new__(web.Request)
-    request._app = app
-    request._match_info = {"id": session_key}
+    # Use make_mocked_request so `request.app` resolves properly via the
+    # aiohttp public API — not a manual `_app` assignment which doesn't match
+    # real requests in production.
+    request = make_mocked_request(
+        "PUT",
+        f"/myah/api/sessions/{session_key}/model",
+        match_info={"id": session_key},
+        app=app,
+    )
     request.json = AsyncMock(return_value=body)
     return request
+
+
+def _make_get_request(app, session_key: str):
+    return make_mocked_request(
+        "GET",
+        f"/myah/api/sessions/{session_key}/model",
+        match_info={"id": session_key},
+        app=app,
+    )
 
 
 @pytest.mark.asyncio
@@ -130,9 +146,7 @@ async def test_get_session_model_returns_current_override(app_with_runner, mock_
         "model": "anthropic/claude-opus-4.6",
         "provider": "anthropic",
     }
-    request = web.Request.__new__(web.Request)
-    request._app = app_with_runner
-    request._match_info = {"id": "agent:main:myah:dm:chat123"}
+    request = _make_get_request(app_with_runner, "agent:main:myah:dm:chat123")
     response = await handle_get_session_model(request)
     assert response.status == 200
     data = json.loads(response.body)
@@ -142,9 +156,7 @@ async def test_get_session_model_returns_current_override(app_with_runner, mock_
 
 @pytest.mark.asyncio
 async def test_get_session_model_no_override_returns_empty(app_with_runner, mock_runner):
-    request = web.Request.__new__(web.Request)
-    request._app = app_with_runner
-    request._match_info = {"id": "agent:main:myah:dm:unknown"}
+    request = _make_get_request(app_with_runner, "agent:main:myah:dm:unknown")
     response = await handle_get_session_model(request)
     assert response.status == 200
     data = json.loads(response.body)
