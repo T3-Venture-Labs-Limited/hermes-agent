@@ -34,8 +34,9 @@ def fake_aux_module():
     fake_mod = types.ModuleType('agent.auxiliary_client')
     fake_mod.async_call_llm = fake_llm
 
-    # Ensure parent package 'agent' is visible too
-    if 'agent' not in sys.modules:
+    # Track whether we created the 'agent' parent package entry
+    agent_existed = 'agent' in sys.modules
+    if not agent_existed:
         agent_pkg = types.ModuleType('agent')
         agent_pkg.__path__ = []
         sys.modules['agent'] = agent_pkg
@@ -44,6 +45,9 @@ def fake_aux_module():
     yield fake_mod
 
     sys.modules.pop('agent.auxiliary_client', None)
+    # Only remove the parent package if WE created it
+    if not agent_existed:
+        sys.modules.pop('agent', None)
 
 
 @pytest.mark.asyncio
