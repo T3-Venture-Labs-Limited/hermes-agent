@@ -11,6 +11,7 @@ Auth is checked by the caller (via _auth_middleware wrapper).
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -24,9 +25,28 @@ from aiohttp import web
 
 from hermes_constants import get_hermes_home
 
+# ── Myah: in-process config setter (fixes subprocess os.environ staleness) ──
+from hermes_cli.config import set_config_value
+# ──────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+# ── Myah: module-level runner reference for restart handler ──────────────
+_gateway_runner = None
+
+
+def set_gateway_runner(runner):
+    """Called by MyahAdapter._register_routes_on_app to expose runner to handlers."""
+    global _gateway_runner
+    _gateway_runner = runner
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Myah: SOUL size limits ──────────────────────────────────────────────
+SOUL_SOFT_WARN_CHARS = 8_192
+SOUL_HARD_CAP_CHARS = 32_768
+# ──────────────────────────────────────────────────────────────────────────
 
 
 def _hermes_home() -> Path:
@@ -75,11 +95,11 @@ async def handle_get_config(request: web.Request) -> web.Response:
 
 
 async def handle_patch_config(request: web.Request) -> web.Response:
-    """PATCH /myah/api/config — Update config keys via hermes config set.
+    """PATCH /myah/api/config — Update config keys via in-process set_config_value.
 
     Body: {"key1": "value1", "key2": "value2"}
-    Uses the official `hermes config set` CLI command, which handles type
-    coercion (bool, int, float), nested dotted keys, and .env synchronization.
+    Uses set_config_value() directly — the subprocess approach succeeded at
+    writing config.yaml but left the running gateway process's os.environ stale.
     """
     try:
         body = await request.json()
@@ -92,20 +112,13 @@ async def handle_patch_config(request: web.Request) -> web.Response:
     errors = []
     for key, value in body.items():
         try:
-            returncode, _, stderr = await _async_subprocess(
-                'hermes', 'config', 'set', str(key), str(value), timeout=10,
-            )
-            if returncode != 0:
-                errors.append({'key': key, 'error': stderr.strip()})
-        except asyncio.TimeoutError:
-            errors.append({'key': key, 'error': 'timeout'})
+            set_config_value(str(key), str(value))
         except Exception as e:
             errors.append({'key': key, 'error': str(e)})
 
     if errors:
         return web.json_response({'ok': False, 'errors': errors}, status=207)
 
-    # Re-read to return the updated config
     config_path = _hermes_home() / 'config.yaml'
     cfg = yaml.safe_load(config_path.read_text()) or {}
     return web.json_response({'ok': True, 'config': cfg})
@@ -258,6 +271,19 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
         'base_url': getattr(result, 'base_url', '') or '',
         'api_mode': getattr(result, 'api_mode', '') or '',
     }
+    # ── Myah: full agent teardown before eviction (fixes memory-provider leak) ──
+    cache_entry = (runner._agent_cache or {}).get(session_key)
+    if cache_entry is not None:
+        old_agent = cache_entry[0] if isinstance(cache_entry, tuple) else cache_entry
+        try:
+            old_agent.shutdown_memory_provider()
+        except Exception as e:
+            logger.warning('shutdown_memory_provider failed for %s: %s', session_key, e)
+        try:
+            old_agent.close()
+        except Exception as e:
+            logger.warning('agent.close() failed for %s: %s', session_key, e)
+    # ─────────────────────────────────────────────────────────────────────
     try:
         runner._evict_cached_agent(session_key)
     except Exception:
@@ -277,37 +303,86 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
 # ── SOUL.md endpoints ─────────────────────────────────────────────────────────
 
 
+def _soul_etag(body: str) -> str:
+    """Compute sha256-based ETag for SOUL content."""
+    digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
+    return f'"sha256-{digest}"'
+
+
 async def handle_get_soul(request: web.Request) -> web.Response:
-    """GET /myah/api/config/soul — Read SOUL.md content."""
+    """GET /myah/api/config/soul — Read SOUL.md with ETag."""
     soul_path = _hermes_home() / 'SOUL.md'
     if not soul_path.exists():
-        return web.json_response({'content': ''})
-    return web.json_response({'content': soul_path.read_text()})
+        return web.Response(status=404, text='SOUL.md not found')
+    body = soul_path.read_text(encoding='utf-8')
+    etag = _soul_etag(body)
+    response = web.Response(
+        text=body,
+        content_type='text/markdown',
+        headers={'ETag': etag},
+    )
+    response.headers['X-Soul-Soft-Warn-Chars'] = str(SOUL_SOFT_WARN_CHARS)
+    response.headers['X-Soul-Hard-Cap-Chars'] = str(SOUL_HARD_CAP_CHARS)
+    return response
 
 
 async def handle_put_soul(request: web.Request) -> web.Response:
-    """PUT /myah/api/config/soul — Update SOUL.md content.
+    """PUT /myah/api/config/soul — Write SOUL.md with If-Match concurrency control.
 
-    SOUL.md changes take effect on next message because prompt_builder.py
-    re-reads SOUL.md on every prompt assembly. No restart or cache
-    invalidation needed.
+    428 if If-Match missing, 412 if stale (returns current body),
+    413 if over 32768-char hard cap, 200 with warning at 8192 chars.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({'error': 'Invalid JSON'}, status=400)
+    if_match = request.headers.get('If-Match')
+    if not if_match:
+        return web.json_response(
+            {'error': 'If-Match header required for SOUL writes'},
+            status=428,
+        )
 
-    content = body.get('content', '')
-    if not content.strip():
-        return web.json_response({'error': 'SOUL content cannot be empty'}, status=422)
+    new_body = await request.text()
+
+    if len(new_body) > SOUL_HARD_CAP_CHARS:
+        return web.json_response(
+            {
+                'error': (
+                    f'SOUL content exceeds {SOUL_HARD_CAP_CHARS} character limit '
+                    f'(got {len(new_body)}). SOUL is injected into every turn; '
+                    f'keep it focused.'
+                ),
+                'limit': SOUL_HARD_CAP_CHARS,
+                'got': len(new_body),
+            },
+            status=413,
+        )
 
     soul_path = _hermes_home() / 'SOUL.md'
-    try:
-        soul_path.write_text(content)
-    except Exception as e:
-        return web.json_response({'error': str(e)}, status=500)
+    current_body = soul_path.read_text(encoding='utf-8') if soul_path.exists() else ''
+    current_etag = _soul_etag(current_body)
 
-    return web.json_response({'content': content})
+    if if_match != current_etag:
+        response = web.json_response(
+            {
+                'error': 'precondition failed — SOUL was modified since you read it',
+                'current_body': current_body,
+            },
+            status=412,
+        )
+        response.headers['ETag'] = current_etag
+        return response
+
+    soul_path.write_text(new_body, encoding='utf-8')
+    new_etag = _soul_etag(new_body)
+
+    response_body: Dict[str, Any] = {'ok': True}
+    if len(new_body) > SOUL_SOFT_WARN_CHARS:
+        response_body['warning'] = (
+            f'SOUL is {len(new_body)} chars; recommended soft limit is '
+            f'{SOUL_SOFT_WARN_CHARS}. This adds to every turn.'
+        )
+    return web.json_response(
+        response_body,
+        headers={'ETag': new_etag},
+    )
 
 
 # ── Toolset endpoints ─────────────────────────────────────────────────────────
@@ -657,7 +732,7 @@ async def handle_list_mcp(request: web.Request) -> web.Response:
 
 
 async def handle_add_mcp(request: web.Request) -> web.Response:
-    """POST /myah/api/mcp — Add an MCP server via hermes mcp add."""
+    """POST /myah/api/mcp — Add an MCP server and register it in-process."""
     try:
         body = await request.json()
     except Exception:
@@ -670,17 +745,11 @@ async def handle_add_mcp(request: web.Request) -> web.Response:
 
     url = body.get('url')
     command = body.get('command')
+    args = body.get('args', [])
+    env = body.get('env') or {}
 
     if not url and not command:
         return web.json_response({'error': 'Either url or command is required'}, status=422)
-
-    cmd = ['hermes', 'mcp', 'add', name]
-    if url:
-        cmd += ['--url', url]
-    elif command:
-        cmd += ['--command', command]
-        for arg in body.get('args', []):
-            cmd += ['--args', str(arg)]
 
     # Handle API key injection into .env
     api_key = body.get('api_key')
@@ -688,39 +757,89 @@ async def handle_add_mcp(request: web.Request) -> web.Response:
         env_path = _hermes_home() / '.env'
         env_key = f'MCP_{name.upper()}_API_KEY'
         existing = env_path.read_text() if env_path.exists() else ''
-        lines = [l for l in existing.splitlines() if not l.startswith(f'{env_key}=')]
+        lines = [line for line in existing.splitlines() if not line.startswith(f'{env_key}=')]
         lines.append(f'{env_key}={api_key}')
         env_path.write_text('\n'.join(lines) + '\n')
 
-    returncode, _, stderr = await _async_subprocess(*cmd, timeout=30)
-    if returncode != 0:
-        return web.json_response(
-            {'error': f'hermes mcp add failed: {stderr.strip()}'}, status=500
-        )
+    # Build server config dict and write to config.yaml
+    server_cfg: Dict[str, Any] = {}
+    if url:
+        server_cfg['url'] = url
+    elif command:
+        server_cfg['command'] = command
+        server_cfg['args'] = args
+        if env:
+            server_cfg['env'] = env
+
+    config_path = _hermes_home() / 'config.yaml'
+    cfg = yaml.safe_load(config_path.read_text()) or {} if config_path.exists() else {}
+    if 'mcp_servers' not in cfg or cfg['mcp_servers'] is None:
+        cfg['mcp_servers'] = {}
+    cfg['mcp_servers'][name] = server_cfg
+    config_path.write_text(yaml.safe_dump(cfg, default_flow_style=False))
+
+    # ── Myah: in-process MCP registry refresh + agent cache eviction ─────
+    try:
+        from tools.mcp_tool import register_mcp_servers
+        register_mcp_servers({name: server_cfg})
+    except Exception as e:
+        logger.warning('[myah] register_mcp_servers failed for %s: %s', name, e)
+
+    runner = _gateway_runner
+    if runner is not None:
+        cache = getattr(runner, '_agent_cache', {}) or {}
+        for session_key in list(cache.keys()):
+            try:
+                runner._evict_cached_agent(session_key)
+            except Exception as e:
+                logger.warning('[myah] evict failed for %s: %s', session_key, e)
+    # ─────────────────────────────────────────────────────────────────────
 
     return web.json_response({
         'name': name,
         'url': url,
         'command': command,
-        'args': body.get('args', []),
+        'args': args,
         'status': 'unknown',
-    }, status=201)
+    }, status=200)
 
 
 async def handle_remove_mcp(request: web.Request) -> web.Response:
-    """DELETE /myah/api/mcp/{name} — Remove an MCP server via hermes mcp remove."""
+    """DELETE /myah/api/mcp/{name} — Remove an MCP server and disconnect in-process."""
     name = request.match_info['name']
     err = _safe_name(name)
     if err:
         return err
 
-    returncode, _, stderr = await _async_subprocess(
-        'hermes', 'mcp', 'remove', name, timeout=30,
-    )
-    if returncode != 0:
-        return web.json_response(
-            {'error': f'hermes mcp remove failed: {stderr.strip()}'}, status=500
-        )
+    config_path = _hermes_home() / 'config.yaml'
+    if config_path.exists():
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+    else:
+        cfg = {}
+    servers = cfg.get('mcp_servers') or {}
+    if name not in servers:
+        return web.json_response({'error': f'MCP server {name!r} not found'}, status=404)
+
+    del servers[name]
+    cfg['mcp_servers'] = servers
+    config_path.write_text(yaml.safe_dump(cfg, default_flow_style=False))
+
+    # ── Myah: per-server in-process disconnect ────────────────────────────
+    try:
+        from tools.mcp_tool import disconnect_mcp_server
+        disconnect_mcp_server(name)
+    except Exception as e:
+        logger.warning('[myah] disconnect_mcp_server failed for %s: %s', name, e)
+
+    runner = _gateway_runner
+    if runner is not None:
+        cache = getattr(runner, '_agent_cache', {}) or {}
+        for session_key in list(cache.keys()):
+            try:
+                runner._evict_cached_agent(session_key)
+            except Exception as e:
+                logger.warning('[myah] evict failed for %s: %s', session_key, e)
+    # ─────────────────────────────────────────────────────────────────────
 
     return web.json_response({'ok': True})
 
@@ -953,6 +1072,220 @@ async def handle_delete_env(request: web.Request) -> web.Response:
     return web.json_response({'ok': True, 'key': key})
 
 
+# ── Gateway restart endpoint ─────────────────────────────────────────────────
+
+
+async def handle_gateway_restart(request: web.Request) -> web.Response:
+    """POST /myah/api/gateway/restart — restart gateway via supervisorctl.
+
+    Refuses with 409 if any session has an in-flight turn.
+    """
+    runner = _gateway_runner
+    if runner is not None:
+        running = getattr(runner, '_running_agents', {}) or {}
+        if running:
+            return web.json_response(
+                {
+                    'error': 'busy',
+                    'busy_sessions': list(running.keys()),
+                    'message': 'A turn is currently running. Wait for it to finish and retry.',
+                },
+                status=409,
+            )
+
+    subprocess.run(['supervisorctl', 'restart', 'hermes'], check=True)
+    return web.json_response(
+        {'status': 'restarting', 'estimated_ready_ms': 3000},
+        status=202,
+    )
+
+
+# ── Config schema endpoint ────────────────────────────────────────────────────
+
+
+async def handle_get_schema(request: web.Request) -> web.Response:
+    """GET /myah/api/config/schema — return a filtered view of DEFAULT_CONFIG."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    def describe(value):
+        if isinstance(value, dict):
+            return {k: describe(v) for k, v in value.items()}
+        if isinstance(value, bool):
+            return {'type': 'boolean', 'default': value}
+        if isinstance(value, int):
+            return {'type': 'integer', 'default': value}
+        if isinstance(value, float):
+            return {'type': 'number', 'default': value}
+        if isinstance(value, list):
+            return {'type': 'array', 'default': value}
+        return {'type': 'string', 'default': value or ''}
+
+    schema = {
+        k: describe(v)
+        for k, v in DEFAULT_CONFIG.items()
+        if not k.startswith('_')
+    }
+    return web.json_response(schema)
+
+
+# ── Config reset endpoint ─────────────────────────────────────────────────────
+
+# ── Myah: reset section taxonomy ─────────────────────────────────────────
+_RESET_SECTION_KEYS: Dict[str, List[str]] = {
+    'model': ['model'],
+    'aux_vision': [
+        'auxiliary.vision.provider', 'auxiliary.vision.model',
+        'auxiliary.vision.base_url', 'auxiliary.vision.api_key',
+        'auxiliary.vision.timeout',
+    ],
+    'aux_web_extract': [
+        'auxiliary.web_extract.provider', 'auxiliary.web_extract.model',
+        'auxiliary.web_extract.base_url', 'auxiliary.web_extract.api_key',
+        'auxiliary.web_extract.timeout',
+    ],
+    'aux_compression': [
+        'auxiliary.compression.provider', 'auxiliary.compression.model',
+        'auxiliary.compression.base_url', 'auxiliary.compression.api_key',
+        'auxiliary.compression.timeout',
+    ],
+    'aux_session_search': [
+        'auxiliary.session_search.provider', 'auxiliary.session_search.model',
+        'auxiliary.session_search.base_url', 'auxiliary.session_search.api_key',
+        'auxiliary.session_search.timeout',
+    ],
+    'aux_skills_hub': [
+        'auxiliary.skills_hub.provider', 'auxiliary.skills_hub.model',
+        'auxiliary.skills_hub.base_url', 'auxiliary.skills_hub.api_key',
+        'auxiliary.skills_hub.timeout',
+    ],
+    'aux_approval': [
+        'auxiliary.approval.provider', 'auxiliary.approval.model',
+        'auxiliary.approval.base_url', 'auxiliary.approval.api_key',
+        'auxiliary.approval.timeout',
+    ],
+    'aux_mcp': [
+        'auxiliary.mcp.provider', 'auxiliary.mcp.model',
+        'auxiliary.mcp.base_url', 'auxiliary.mcp.api_key',
+        'auxiliary.mcp.timeout',
+    ],
+    'aux_flush_memories': [
+        'auxiliary.flush_memories.provider', 'auxiliary.flush_memories.model',
+        'auxiliary.flush_memories.base_url', 'auxiliary.flush_memories.api_key',
+        'auxiliary.flush_memories.timeout',
+    ],
+    'aux_title_generation': [
+        'auxiliary.title_generation.provider', 'auxiliary.title_generation.model',
+        'auxiliary.title_generation.base_url', 'auxiliary.title_generation.api_key',
+        'auxiliary.title_generation.timeout',
+    ],
+    'aux_follow_up_generation': [
+        'auxiliary.follow_up_generation.provider',
+        'auxiliary.follow_up_generation.model',
+        'auxiliary.follow_up_generation.base_url',
+        'auxiliary.follow_up_generation.api_key',
+        'auxiliary.follow_up_generation.timeout',
+    ],
+    'behavior': [
+        'agent.reasoning_effort', 'approvals.mode', 'display.personality',
+    ],
+    'toolsets': [
+        'disabled_toolsets',
+    ],
+    'advanced': [
+        'terminal.backend', 'timezone',
+    ],
+}
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _read_default_value(dotted_key: str):
+    """Read a value from DEFAULT_CONFIG using a dotted key path."""
+    from hermes_cli.config import DEFAULT_CONFIG
+    node = DEFAULT_CONFIG
+    for part in dotted_key.split('.'):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+async def handle_reset_section(request: web.Request) -> web.Response:
+    """POST /myah/api/config/reset/{section} — revert a section to image defaults."""
+    section = request.match_info.get('section', '')
+
+    if section == 'soul':
+        src = Path('/opt/myah/defaults/SOUL.md')
+        dst = _hermes_home() / 'SOUL.md'
+        if not src.exists():
+            return web.json_response(
+                {'error': 'image defaults not present (are you in a dev container?)'},
+                status=503,
+            )
+        dst.write_text(src.read_text(encoding='utf-8'), encoding='utf-8')
+        return web.json_response({'ok': True, 'section': 'soul'})
+
+    if section == 'mcp_servers':
+        config_path = _hermes_home() / 'config.yaml'
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+        previous_names = list((cfg.get('mcp_servers') or {}).keys())
+
+        try:
+            set_config_value('mcp_servers', '{}')
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+
+        try:
+            from tools.mcp_tool import disconnect_mcp_server
+            for name in previous_names:
+                try:
+                    disconnect_mcp_server(name)
+                except Exception as e:
+                    logger.warning('reset mcp_servers: disconnect %s failed: %s', name, e)
+        except Exception as e:
+            logger.warning('mcp_servers reset: registry refresh failed: %s', e)
+        return web.json_response({'ok': True, 'section': 'mcp_servers', 'removed': previous_names})
+
+    if section not in _RESET_SECTION_KEYS:
+        return web.json_response({'error': f'unknown section: {section}'}, status=400)
+
+    keys = _RESET_SECTION_KEYS[section]
+    errors = []
+    for key in keys:
+        default_val = _read_default_value(key)
+        if default_val is None:
+            logger.warning('reset: key %s not found in DEFAULT_CONFIG', key)
+            continue
+        try:
+            if isinstance(default_val, (dict, list)):
+                str_val = str(default_val)
+            else:
+                str_val = str(default_val)
+            set_config_value(key, str_val)
+        except Exception as e:
+            errors.append({'key': key, 'error': str(e)})
+
+    if errors:
+        return web.json_response({'ok': False, 'errors': errors}, status=207)
+    return web.json_response({'ok': True, 'section': section})
+
+
+# ── Last-reseed endpoint ──────────────────────────────────────────────────────
+
+
+async def handle_get_last_reseed(request: web.Request) -> web.Response:
+    """GET /myah/api/config/last-reseed — when did entrypoint last seed each file."""
+    marker = _hermes_home() / '.myah_last_reseed'
+    if not marker.exists():
+        return web.json_response({})
+
+    result = {}
+    for line in marker.read_text().splitlines():
+        if '=' in line:
+            k, _, v = line.partition('=')
+            result[k.strip()] = v.strip()
+    return web.json_response(result)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -1023,6 +1356,11 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_put('/myah/api/config/model', _a(handle_put_model))
     app.router.add_get('/myah/api/config/soul', _a(handle_get_soul))
     app.router.add_put('/myah/api/config/soul', _a(handle_put_soul))
+    # ── Myah: schema, reset, last-reseed ─────────────────────────────────
+    app.router.add_get('/myah/api/config/schema', _a(handle_get_schema))
+    app.router.add_post('/myah/api/config/reset/{section}', _a(handle_reset_section))
+    app.router.add_get('/myah/api/config/last-reseed', _a(handle_get_last_reseed))
+    # ─────────────────────────────────────────────────────────────────────
 
     # Toolsets
     app.router.add_get('/myah/api/toolsets', _a(handle_list_toolsets))
@@ -1045,6 +1383,10 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_get('/myah/api/mcp', _a(handle_list_mcp))
     app.router.add_post('/myah/api/mcp', _a(handle_add_mcp))
     app.router.add_delete('/myah/api/mcp/{name}', _a(handle_remove_mcp))
+
+    # ── Myah: gateway restart ─────────────────────────────────────────────
+    app.router.add_post('/myah/api/gateway/restart', _a(handle_gateway_restart))
+    # ─────────────────────────────────────────────────────────────────────
 
     # Sessions
     app.router.add_get('/myah/api/sessions', _a(handle_list_sessions))
