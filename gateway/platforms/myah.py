@@ -688,7 +688,7 @@ class MyahAdapter(BasePlatformAdapter):
             extra_body['response_format'] = body['response_format']
 
         # ── Myah: aux router import for /myah/v1/aux/{task} ──────────────
-        from agent.auxiliary_client import async_call_llm
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
         # ──────────────────────────────────────────────────────────────────
         try:
             response = await async_call_llm(
@@ -709,11 +709,19 @@ class MyahAdapter(BasePlatformAdapter):
                 'total_tokens': getattr(response.usage, 'total_tokens', 0),
             }
 
+        # Use extract_content_or_reasoning so reasoning-model responses
+        # (DeepSeek-R1, gemini-2.5-flash with thinking, etc.) that put
+        # output in `message.reasoning` instead of `message.content` still
+        # surface a non-null content string. See e2e-output/report.md
+        # ISSUE-002 — chat titles + follow-up chips fell back to empty
+        # because the raw .content was None for these models.
+        content = extract_content_or_reasoning(response)
+
         return web.json_response({
             'choices': [{
                 'message': {
                     'role': 'assistant',
-                    'content': response.choices[0].message.content,
+                    'content': content,
                 },
                 'finish_reason': getattr(response.choices[0], 'finish_reason', 'stop'),
             }],

@@ -139,6 +139,11 @@ async def handle_patch_config(request: web.Request) -> web.Response:
     Body: {"key1": "value1", "key2": "value2"}
     Uses set_config_value() directly — the subprocess approach succeeded at
     writing config.yaml but left the running gateway process's os.environ stale.
+
+    Composite values (dict / list) are merged into the user config directly
+    instead of being stringified via ``set_config_value`` — Python's ``str()``
+    renders dicts in repr notation (single-quoted) which YAML cannot parse on
+    the next read. See e2e-output/report.md ISSUE-004.
     """
     try:
         body = await request.json()
@@ -149,11 +154,27 @@ async def handle_patch_config(request: web.Request) -> web.Response:
         return web.json_response({'error': 'Body must be a JSON object'}, status=400)
 
     errors = []
+    composite_writes: Dict[str, Any] = {}
+
     for key, value in body.items():
+        if isinstance(value, (dict, list)):
+            # Defer composite values to a single YAML merge below.
+            composite_writes[str(key)] = value
+            continue
         try:
             set_config_value(str(key), str(value))
         except Exception as e:
             errors.append({'key': key, 'error': str(e)})
+
+    if composite_writes:
+        config_path = _hermes_home() / 'config.yaml'
+        try:
+            cfg = yaml.safe_load(config_path.read_text()) or {} if config_path.exists() else {}
+            # Deep-merge dict writes; replace list writes wholesale.
+            cfg = _deep_merge_defaults(cfg, composite_writes)
+            config_path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
+        except Exception as e:
+            errors.append({'key': list(composite_writes.keys()), 'error': str(e)})
 
     if errors:
         return web.json_response({'ok': False, 'errors': errors}, status=207)
@@ -1289,19 +1310,36 @@ async def handle_reset_section(request: web.Request) -> web.Response:
 
     keys = _RESET_SECTION_KEYS[section]
     errors = []
+    composite_resets: Dict[str, Any] = {}
     for key in keys:
         default_val = _read_default_value(key)
         if default_val is None:
             logger.warning('reset: key %s not found in DEFAULT_CONFIG', key)
             continue
+        if isinstance(default_val, (dict, list)):
+            # Avoid str(dict) Python-repr corruption — apply via YAML merge below.
+            composite_resets[key] = default_val
+            continue
         try:
-            if isinstance(default_val, (dict, list)):
-                str_val = str(default_val)
-            else:
-                str_val = str(default_val)
-            set_config_value(key, str_val)
+            set_config_value(key, str(default_val))
         except Exception as e:
             errors.append({'key': key, 'error': str(e)})
+
+    if composite_resets:
+        try:
+            config_path = _hermes_home() / 'config.yaml'
+            cfg = yaml.safe_load(config_path.read_text()) or {} if config_path.exists() else {}
+            for dotted_key, val in composite_resets.items():
+                parts = dotted_key.split('.')
+                node = cfg
+                for part in parts[:-1]:
+                    if not isinstance(node.get(part), dict):
+                        node[part] = {}
+                    node = node[part]
+                node[parts[-1]] = val
+            config_path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
+        except Exception as e:
+            errors.append({'key': list(composite_resets.keys()), 'error': str(e)})
 
     if errors:
         return web.json_response({'ok': False, 'errors': errors}, status=207)
@@ -1312,16 +1350,31 @@ async def handle_reset_section(request: web.Request) -> web.Response:
 
 
 async def handle_get_last_reseed(request: web.Request) -> web.Response:
-    """GET /myah/api/config/last-reseed — when did entrypoint last seed each file."""
+    """GET /myah/api/config/last-reseed — when did entrypoint last seed each file.
+
+    The breadcrumb file written by ``agent/scripts/seed_config_files.sh`` lists
+    files as a space-separated string (``files=config soul``). The platform
+    expects a proper JSON array so the toast can render
+    ``files.join(' and ')`` without crashing on a string.
+    See e2e-output/report.md ISSUE-009.
+    """
     marker = _hermes_home() / '.myah_last_reseed'
     if not marker.exists():
         return web.json_response({})
 
-    result = {}
+    result: Dict[str, Any] = {}
     for line in marker.read_text().splitlines():
         if '=' in line:
             k, _, v = line.partition('=')
-            result[k.strip()] = v.strip()
+            key = k.strip()
+            value = v.strip()
+            if key == 'files':
+                # Normalise to a JSON array regardless of how the breadcrumb
+                # encoded it (space-separated string today, possibly JSON
+                # tomorrow).
+                result[key] = [part for part in value.split() if part]
+            else:
+                result[key] = value
     return web.json_response(result)
 
 

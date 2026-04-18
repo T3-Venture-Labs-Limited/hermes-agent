@@ -524,3 +524,58 @@ async def test_get_last_reseed_returns_empty_when_no_marker(home):
     import json
     body = json.loads(resp.body)
     assert body == {}
+
+
+@pytest.mark.asyncio
+async def test_get_last_reseed_normalises_files_to_array(home):
+    """files= should be emitted as a JSON array, not a space-joined string.
+
+    See e2e-output/report.md ISSUE-009.
+    """
+    marker = home / '.myah_last_reseed'
+    marker.write_text(
+        'timestamp=2026-04-18T08:23:26Z\n'
+        'files=config soul\n'
+        'config_version=1.0.1\n'
+        'soul_version=1.0.0\n'
+    )
+
+    request = make_mocked_request('GET', '/myah/api/config/last-reseed')
+    from gateway.platforms.myah_management import handle_get_last_reseed
+    resp = await handle_get_last_reseed(request)
+    assert resp.status == 200
+    import json
+    body = json.loads(resp.body)
+    assert body['files'] == ['config', 'soul']
+    assert body['config_version'] == '1.0.1'
+
+
+@pytest.mark.asyncio
+async def test_patch_config_writes_dict_value_as_yaml_not_python_repr(home):
+    """PATCH with a dict value must serialise as YAML, never str(dict).
+
+    Before the ISSUE-004 fix, ``set_config_value(key, str(dict))`` wrote a
+    Python repr string into config.yaml — the next read returned the
+    ``auxiliary`` key as a literal string (single-quoted) which broke the
+    frontend ``config.auxiliary?.[task].provider`` lookups.
+    """
+    import yaml
+
+    request = make_mocked_request('PATCH', '/myah/api/config')
+    from unittest.mock import AsyncMock
+    request.json = AsyncMock(return_value={
+        'auxiliary': {'title_generation': {'model': 'google/gemini-2.0-flash'}},
+    })
+
+    from gateway.platforms.myah_management import handle_patch_config
+    resp = await handle_patch_config(request)
+    assert resp.status == 200
+
+    cfg = yaml.safe_load((home / 'config.yaml').read_text()) or {}
+    aux = cfg.get('auxiliary')
+    assert isinstance(aux, dict), (
+        f'auxiliary should be a dict after PATCH, got {type(aux).__name__}'
+    )
+    # Deep-merge preserved the prior keys alongside the new one.
+    assert aux.get('vision', {}).get('provider') == 'auto'
+    assert aux['title_generation']['model'] == 'google/gemini-2.0-flash'

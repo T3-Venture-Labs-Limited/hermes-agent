@@ -33,6 +33,12 @@ def fake_aux_module():
     fake_llm = AsyncMock()
     fake_mod = types.ModuleType('agent.auxiliary_client')
     fake_mod.async_call_llm = fake_llm
+    # The aux endpoint now falls back through extract_content_or_reasoning
+    # so it can surface reasoning-model responses whose .content is None.
+    # In tests, pass .content through untouched.
+    fake_mod.extract_content_or_reasoning = lambda response: (
+        response.choices[0].message.content
+    )
 
     # Track whether we created the 'agent' parent package entry
     agent_existed = 'agent' in sys.modules
