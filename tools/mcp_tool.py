@@ -2271,3 +2271,30 @@ def _stop_mcp_loop():
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned.  Force-kill them.
         _kill_orphaned_mcp_children()
+
+
+# ── Myah: single-server disconnect helper ────────────────────────────────
+# register_mcp_servers() is add-only idempotent; shutdown_mcp_servers()
+# is global teardown. This helper fills the gap for per-server removal.
+def disconnect_mcp_server(name: str) -> bool:
+    """Shutdown and remove a single MCP server by name.
+
+    Returns True if the server was present and removed, False if not found.
+    Shutdown exceptions are logged and swallowed.
+    """
+    with _lock:
+        server = _servers.get(name)
+
+    if server is None:
+        return False
+
+    try:
+        _run_on_mcp_loop(server.shutdown(), timeout=15)
+    except Exception as exc:
+        logger.warning("Error shutting down MCP server '%s': %s", name, exc)
+
+    with _lock:
+        _servers.pop(name, None)
+
+    return True
+# ─────────────────────────────────────────────────────────────────────────
