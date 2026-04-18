@@ -954,6 +954,10 @@ class MyahAdapter(BasePlatformAdapter):
         # toolsets, sessions) with the same bearer token auth.
         from gateway.platforms.myah_management import register_management_routes
         register_management_routes(app, auth_key=self._auth_key)
+        # ── Myah: make runner visible to /myah/api/gateway/restart handler ──
+        from gateway.platforms.myah_management import set_gateway_runner
+        set_gateway_runner(self.gateway_runner)
+        # ─────────────────────────────────────────────────────────────────
 
         self._routes_registered = True
         logger.info("[%s] Routes registered on shared aiohttp app (pre-setup hook)", self.name)
