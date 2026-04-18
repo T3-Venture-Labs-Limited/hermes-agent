@@ -115,6 +115,33 @@ class TestConfigEndpoints:
             response = await handle_get_config(request)
             assert response.status == 404
 
+    @pytest.mark.asyncio
+    async def test_get_config_merges_defaults_for_missing_keys(self, tmp_path):
+        """Older config.yaml files that predate the current DEFAULT_CONFIG
+        should still produce a complete schema payload — missing keys are
+        filled from DEFAULT_CONFIG so the frontend can render every aux task.
+        """
+        partial = {
+            '_config_version': 12,
+            'model': 'anthropic/claude-sonnet-4-20250514',
+            'auxiliary': {
+                'vision': {'provider': 'openai', 'model': 'gpt-4o-mini'},
+            },
+        }
+        (tmp_path / 'config.yaml').write_text(yaml.dump(partial))
+        with patch('gateway.platforms.myah_management._hermes_home', return_value=tmp_path):
+            request = MagicMock()
+            response = await handle_get_config(request)
+        data = json.loads(response.body)
+        # Disk values win
+        assert data['model'] == 'anthropic/claude-sonnet-4-20250514'
+        assert data['auxiliary']['vision']['provider'] == 'openai'
+        # Missing aux keys are filled from DEFAULT_CONFIG
+        assert 'title_generation' in data['auxiliary']
+        assert 'follow_up_generation' in data['auxiliary']
+        # Private keys from disk are preserved
+        assert data.get('_config_version') == 12
+
 
 # ── SOUL.md endpoints ───────────────────────────────────────────────────────
 

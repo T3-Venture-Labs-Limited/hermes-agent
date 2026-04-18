@@ -81,17 +81,56 @@ def _safe_name(name: str) -> Optional[web.Response]:
 # ── Config endpoints ──────────────────────────────────────────────────────────
 
 
+def _deep_merge_defaults(defaults: dict, overrides: dict) -> dict:
+    """Recursively merge overrides over defaults.
+
+    Keys present in overrides win; nested dicts are merged key-by-key. Lists
+    and scalars from overrides replace defaults entirely.
+    """
+    result = dict(defaults)
+    for key, override_val in overrides.items():
+        default_val = result.get(key)
+        if isinstance(default_val, dict) and isinstance(override_val, dict):
+            result[key] = _deep_merge_defaults(default_val, override_val)
+        else:
+            result[key] = override_val
+    return result
+
+
 async def handle_get_config(request: web.Request) -> web.Response:
-    """GET /myah/api/config — Read config.yaml as JSON."""
+    """GET /myah/api/config — Read config.yaml merged over DEFAULT_CONFIG.
+
+    Older containers may have a config.yaml whose schema predates the current
+    ``DEFAULT_CONFIG`` (e.g. missing newly-added auxiliary task keys). Rather
+    than relying on ``migrate_config()`` running at gateway startup, we merge
+    the on-disk values on top of the current DEFAULT_CONFIG every time we
+    serve this endpoint so the frontend always gets a complete schema shape.
+    """
     config_path = _hermes_home() / 'config.yaml'
     if not config_path.exists():
         return web.json_response({'error': 'config.yaml not found'}, status=404)
     try:
         cfg = yaml.safe_load(config_path.read_text()) or {}
-        return web.json_response(cfg)
     except Exception as e:
         logger.error('Failed to read config.yaml: %s', e)
         return web.json_response({'error': str(e)}, status=500)
+
+    try:
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        # Strip private keys (``_config_version`` etc.) from the defaults view —
+        # the on-disk ``_config_version`` wins, but the DEFAULT_CONFIG private
+        # keys have no user-facing meaning.
+        public_defaults = {k: v for k, v in DEFAULT_CONFIG.items() if not k.startswith('_')}
+        merged = _deep_merge_defaults(public_defaults, cfg)
+        # Preserve any private keys that were on disk (e.g. _config_version)
+        for k, v in cfg.items():
+            if k.startswith('_'):
+                merged[k] = v
+        return web.json_response(merged)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.error('Failed to merge DEFAULT_CONFIG with config.yaml: %s', e)
+        return web.json_response(cfg)
 
 
 async def handle_patch_config(request: web.Request) -> web.Response:
