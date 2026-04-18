@@ -32,6 +32,8 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+
+
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.config import Platform, PlatformConfig
 
@@ -759,6 +761,83 @@ class MyahAdapter(BasePlatformAdapter):
 
         return web.json_response({'ok': True, 'stored_as': var_name})
 
+    # ── Myah: HTTP wrapper for auxiliary_client.call_llm ──────────────────
+    _AUX_ALLOWED_TASKS = frozenset({
+        'title_generation',
+        'follow_up_generation',
+    })
+
+    async def _handle_aux_endpoint(self, request: 'web.Request') -> 'web.Response':
+        """POST /myah/v1/aux/{task} — forward to auxiliary_client.call_llm."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task = request.match_info.get('task', '')
+        if task not in self._AUX_ALLOWED_TASKS:
+            return web.json_response(
+                {'error': f'unknown aux task: {task}'},
+                status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({'error': 'invalid JSON'}, status=400)
+
+        messages = body.get('messages')
+        if not isinstance(messages, list) or not messages:
+            return web.json_response(
+                {'error': 'messages field is required and must be a non-empty list'},
+                status=400,
+            )
+
+        extra_body = {}
+        if 'response_format' in body:
+            extra_body['response_format'] = body['response_format']
+
+        # ── Myah: aux router import for /myah/v1/aux/{task} ──────────────
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+        # ──────────────────────────────────────────────────────────────────
+        try:
+            response = await async_call_llm(
+                task=task,
+                messages=messages,
+                temperature=body.get('temperature'),
+                max_tokens=body.get('max_tokens'),
+                extra_body=extra_body or None,
+            )
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=502)
+
+        usage_dict = {}
+        if hasattr(response, 'usage') and response.usage is not None:
+            usage_dict = {
+                'prompt_tokens': getattr(response.usage, 'prompt_tokens', 0),
+                'completion_tokens': getattr(response.usage, 'completion_tokens', 0),
+                'total_tokens': getattr(response.usage, 'total_tokens', 0),
+            }
+
+        # Use extract_content_or_reasoning so reasoning-model responses
+        # (DeepSeek-R1, gemini-2.5-flash with thinking, etc.) that put
+        # output in `message.reasoning` instead of `message.content` still
+        # surface a non-null content string. See e2e-output/report.md
+        # ISSUE-002 — chat titles + follow-up chips fell back to empty
+        # because the raw .content was None for these models.
+        content = extract_content_or_reasoning(response)
+
+        return web.json_response({
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': content,
+                },
+                'finish_reason': getattr(response.choices[0], 'finish_reason', 'stop'),
+            }],
+            'usage': usage_dict,
+        })
+    # ─────────────────────────────────────────────────────────────────────
+
     async def send_exec_approval(
         self,
         chat_id: str,
@@ -1064,11 +1143,18 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_post("/myah/v1/confirm/{stream_id}", self._handle_confirm_endpoint)
         app.router.add_post("/myah/v1/secret/{stream_id}", self._handle_secret_endpoint)
         app.router.add_get("/myah/v1/media", self._handle_media_get)  # Myah: media endpoint
+        # ── Myah: aux router HTTP wrapper ────────────────────────────────
+        app.router.add_post('/myah/v1/aux/{task}', self._handle_aux_endpoint)
+        # ─────────────────────────────────────────────────────────────────
 
         # Register management API routes (config, skills, plugins, MCP,
         # toolsets, sessions) with the same bearer token auth.
         from gateway.platforms.myah_management import register_management_routes
         register_management_routes(app, auth_key=self._auth_key)
+        # ── Myah: make runner visible to /myah/api/gateway/restart handler ──
+        from gateway.platforms.myah_management import set_gateway_runner
+        set_gateway_runner(self.gateway_runner)
+        # ─────────────────────────────────────────────────────────────────
 
         self._routes_registered = True
         logger.info("[%s] Routes registered on shared aiohttp app (pre-setup hook)", self.name)

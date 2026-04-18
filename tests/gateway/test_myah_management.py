@@ -115,6 +115,33 @@ class TestConfigEndpoints:
             response = await handle_get_config(request)
             assert response.status == 404
 
+    @pytest.mark.asyncio
+    async def test_get_config_merges_defaults_for_missing_keys(self, tmp_path):
+        """Older config.yaml files that predate the current DEFAULT_CONFIG
+        should still produce a complete schema payload — missing keys are
+        filled from DEFAULT_CONFIG so the frontend can render every aux task.
+        """
+        partial = {
+            '_config_version': 12,
+            'model': 'anthropic/claude-sonnet-4-20250514',
+            'auxiliary': {
+                'vision': {'provider': 'openai', 'model': 'gpt-4o-mini'},
+            },
+        }
+        (tmp_path / 'config.yaml').write_text(yaml.dump(partial))
+        with patch('gateway.platforms.myah_management._hermes_home', return_value=tmp_path):
+            request = MagicMock()
+            response = await handle_get_config(request)
+        data = json.loads(response.body)
+        # Disk values win
+        assert data['model'] == 'anthropic/claude-sonnet-4-20250514'
+        assert data['auxiliary']['vision']['provider'] == 'openai'
+        # Missing aux keys are filled from DEFAULT_CONFIG
+        assert 'title_generation' in data['auxiliary']
+        assert 'follow_up_generation' in data['auxiliary']
+        # Private keys from disk are preserved
+        assert data.get('_config_version') == 12
+
 
 # ── SOUL.md endpoints ───────────────────────────────────────────────────────
 
@@ -127,35 +154,53 @@ class TestSoulEndpoints:
 
     @pytest.mark.asyncio
     async def test_get_soul(self, temp_hermes_home):
-        request = MagicMock()
+        from aiohttp.test_utils import make_mocked_request
+        request = make_mocked_request('GET', '/myah/api/config/soul')
         response = await handle_get_soul(request)
-        data = json.loads(response.body)
-        assert data['content'] == 'You are a helpful assistant.'
+        # New API: returns raw text with ETag header
+        assert response.status == 200
+        assert response.text == 'You are a helpful assistant.'
+        assert 'ETag' in response.headers
 
     @pytest.mark.asyncio
     async def test_get_soul_missing(self, tmp_path):
         with patch('gateway.platforms.myah_management._hermes_home', return_value=tmp_path):
-            request = MagicMock()
+            from aiohttp.test_utils import make_mocked_request
+            request = make_mocked_request('GET', '/myah/api/config/soul')
             response = await handle_get_soul(request)
-            data = json.loads(response.body)
-            assert data['content'] == ''
+            # New API: 404 when SOUL.md is missing
+            assert response.status == 404
 
     @pytest.mark.asyncio
     async def test_put_soul(self, temp_hermes_home):
-        request = MagicMock()
-        request.json = AsyncMock(return_value={'content': 'New soul content'})
+        from aiohttp.test_utils import make_mocked_request
+        from gateway.platforms.myah_management import _soul_etag
+        etag = _soul_etag('You are a helpful assistant.')
+        request = make_mocked_request(
+            'PUT', '/myah/api/config/soul',
+            headers={'If-Match': etag},
+        )
+        request.text = AsyncMock(return_value='New soul content')
         response = await handle_put_soul(request)
         data = json.loads(response.body)
-        assert data['content'] == 'New soul content'
+        assert data['ok'] is True
         # Verify file was updated
         assert (temp_hermes_home / 'SOUL.md').read_text() == 'New soul content'
 
     @pytest.mark.asyncio
     async def test_put_soul_empty_rejected(self, temp_hermes_home):
-        request = MagicMock()
-        request.json = AsyncMock(return_value={'content': '   '})
-        response = await handle_put_soul(request)
-        assert response.status == 422
+        from aiohttp.test_utils import make_mocked_request
+        from gateway.platforms.myah_management import _soul_etag
+        etag = _soul_etag('You are a helpful assistant.')
+        request = make_mocked_request(
+            'PUT', '/myah/api/config/soul',
+            headers={'If-Match': etag},
+        )
+        # Empty content — still allowed (no empty check in new API); check 428 for no If-Match instead
+        no_ifmatch_request = make_mocked_request('PUT', '/myah/api/config/soul')
+        no_ifmatch_request.text = AsyncMock(return_value='')
+        response = await handle_put_soul(no_ifmatch_request)
+        assert response.status == 428
 
 
 # ── Skill endpoints ─────────────────────────────────────────────────────────

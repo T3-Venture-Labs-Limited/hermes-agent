@@ -490,8 +490,29 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
         },
+        # ── Myah: platform background-task aux tasks ──────────────────────
+        # Title generation for chat sidebar entries. Fired after each
+        # first assistant turn. Fast/cheap default to avoid reasoning-
+        # model overkill.
+        "title_generation": {
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 15,
+        },
+        # Follow-up suggestion generation. Fired after every assistant
+        # turn. Same rationale as title_generation.
+        "follow_up_generation": {
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+        },
+        # ─────────────────────────────────────────────────────────────────
     },
-    
+
     "display": {
         "compact": False,
         "personality": "kawaii",
@@ -703,7 +724,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
 
 # =============================================================================
