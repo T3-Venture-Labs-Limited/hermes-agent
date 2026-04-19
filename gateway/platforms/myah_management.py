@@ -1420,6 +1420,360 @@ def _schedule_restart() -> None:
         _do_restart()
 
 
+# ── Myah: provider gateway session state ────────────────────────────────────
+import threading as _threading
+import uuid as _uuid_mod
+import aiohttp as _aiohttp
+
+_provider_sessions: dict = {}
+_provider_sessions_lock = _threading.Lock()
+
+def _make_provider_session(provider_id: str, flow: str) -> tuple:
+    """Create and register a new provider OAuth session."""
+    import time
+    sid = _uuid_mod.uuid4().hex[:12]
+    sess = {
+        "session_id": sid,
+        "provider": provider_id,
+        "flow": flow,
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+    }
+    with _provider_sessions_lock:
+        _provider_sessions[sid] = sess
+    return sid, sess
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Myah: provider gateway endpoints ────────────────────────────────────────
+
+async def _build_catalog() -> dict:
+    """Build the full provider catalog from upstream registries + MYAH_OVERRIDES."""
+    from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_MODELS
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
+    from hermes_cli.myah_overrides import MYAH_OVERRIDES
+
+    out = {}
+
+    # Pass 1: entries from upstream CANONICAL_PROVIDERS
+    for entry in CANONICAL_PROVIDERS:
+        slug = entry.slug
+        cfg = PROVIDER_REGISTRY.get(slug)
+        # HERMES_OVERLAYS is keyed on models.dev slugs which may differ
+        # from CANONICAL_PROVIDERS slugs. Normalise before lookup.
+        overlay = HERMES_OVERLAYS.get(normalize_provider(slug)) or HERMES_OVERLAYS.get(slug)
+
+        catalog_entry = {
+            "id": slug,
+            "display_name": entry.label,
+            "description": entry.tui_desc,
+            "auth_type": cfg.auth_type if cfg else "api_key",
+            "env_var": (cfg.api_key_env_vars[0]
+                        if cfg and cfg.api_key_env_vars else None),
+            "inference_base_url": cfg.inference_base_url if cfg else "",
+            "curated_models": list(_PROVIDER_MODELS.get(slug, [])),
+            "v1_visible": False,
+            "write_type": "env_var",
+        }
+
+        override = MYAH_OVERRIDES.get(slug, {})
+        catalog_entry.update(override)
+        out[slug] = catalog_entry
+
+    # Pass 2: synthetic entries from MYAH_OVERRIDES not in CANONICAL_PROVIDERS
+    for slug, override in MYAH_OVERRIDES.items():
+        if slug in out:
+            continue
+        out[slug] = {"id": slug, "curated_models": [], "v1_visible": False, **override}
+
+    return out
+
+
+async def handle_list_providers(request: web.Request) -> web.Response:
+    """Return the provider catalog. Supports ?visible=v1 filter.
+
+    # ── Myah: provider gateway endpoints ──
+    """
+    visibility = request.query.get("visible", "all")
+    out = await _build_catalog()
+    if visibility == "v1":
+        out = {k: v for k, v in out.items() if v.get("v1_visible")}
+    return web.json_response(out)
+
+
+async def handle_provider_models(request: web.Request) -> web.Response:
+    """Return live model list for one provider. [{"id": ..., "name": ...}]"""
+    import asyncio as _asyncio
+    from hermes_cli.models import provider_model_ids
+
+    provider_id = request.match_info["provider_id"]
+    catalog = await _build_catalog()
+    if provider_id not in catalog:
+        return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
+
+    try:
+        ids = await _asyncio.get_event_loop().run_in_executor(
+            None, provider_model_ids, provider_id
+        )
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response([{"id": m, "name": m} for m in ids])
+
+
+async def _validate_api_key(catalog_entry: dict, api_key: str) -> bool:
+    """Validate the API key by hitting the provider's validation URL."""
+    validation = catalog_entry.get("validation") or {}
+    url = validation.get("url")
+    if not url:
+        return True  # optimistic accept when no validation URL configured
+    headers: dict = {}
+    params = None
+    method = validation.get("method", "GET")
+    auth = validation.get("auth", "bearer")
+    if auth == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif auth == "x-api-key":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif auth == "query":
+        params = {"key": api_key}
+    try:
+        timeout = _aiohttp.ClientTimeout(total=10)
+        async with _aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                method, url, headers=headers, params=params
+            ) as r:
+                return r.status < 400
+    except Exception:
+        return False
+
+
+async def handle_connect_credential(request: web.Request) -> web.Response:
+    """Add or replace a credential. Routes on catalog write_type."""
+    from hermes_cli.config import save_env_value, load_config, save_config
+    from agent.credential_pool import load_pool, PooledCredential, AUTH_TYPE_API_KEY
+
+    provider_id = request.match_info["provider_id"]
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    api_key = (data.get("api_key") or "").strip()
+    label = (data.get("label") or "primary").strip()
+
+    if not api_key:
+        return web.json_response({"error": "api_key required"}, status=400)
+
+    catalog = await _build_catalog()
+    entry = catalog.get(provider_id)
+    if not entry:
+        return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
+
+    valid = await _validate_api_key(entry, api_key)
+    if not valid:
+        return web.json_response(
+            {"error": f"validation failed for {provider_id}"}, status=400
+        )
+
+    write_type = entry.get("write_type", "env_var")
+    key_last_four = api_key[-4:] if len(api_key) >= 4 else "****"
+    entry_id = f"myah-{_uuid_mod.uuid4().hex[:12]}"
+
+    if write_type in ("env_var", "custom_provider"):
+        env_var = entry.get("env_var")
+        if env_var:
+            save_env_value(env_var, api_key)
+
+        if write_type == "custom_provider":
+            cp = entry.get("custom_provider", {})
+            cfg = load_config()
+            providers_block = cfg.setdefault("providers", {})
+            providers_block[cp["slug"]] = {
+                "base_url": cp["base_url"],
+                "key_env": env_var,
+                "api_mode": cp.get("api_mode", "openai_chat"),
+            }
+            save_config(cfg)
+
+        pool = load_pool(provider_id)
+        cred = PooledCredential(
+            provider=provider_id,
+            id=entry_id,
+            label=label,
+            auth_type=AUTH_TYPE_API_KEY,
+            priority=0,
+            source="myah:api",
+            access_token=api_key,
+        )
+        pool.add_entry(cred)
+    else:
+        return web.json_response(
+            {"error": f"write_type {write_type!r} not supported here; use the OAuth endpoints"},
+            status=400,
+        )
+
+    return web.json_response({
+        "entry_id": entry_id,
+        "key_last_four": key_last_four,
+        "is_valid": True,
+    })
+
+
+async def handle_delete_credential(request: web.Request) -> web.Response:
+    """Remove one credential from the pool by entry_id."""
+    from agent.credential_pool import load_pool
+
+    provider_id = request.match_info["provider_id"]
+    entry_id = request.match_info["entry_id"]
+
+    pool = load_pool(provider_id)
+    # Find by id field (entry_id is stored in pool entry's id)
+    removed = False
+    for idx, cred in enumerate(pool.entries(), start=1):
+        if cred.id == entry_id:
+            pool.remove_index(idx)
+            removed = True
+            break
+
+    if not removed:
+        return web.json_response({"error": "entry not found"}, status=404)
+
+    # If pool now empty, clear the env var
+    pool2 = load_pool(provider_id)
+    if not pool2.entries():
+        catalog = await _build_catalog()
+        env_var = (catalog.get(provider_id) or {}).get("env_var")
+        if env_var:
+            from hermes_cli.config import remove_env_value
+            remove_env_value(env_var)
+
+    return web.json_response({"ok": True})
+
+
+async def handle_delete_all_credentials(request: web.Request) -> web.Response:
+    """Remove ALL credentials for a provider."""
+    from hermes_cli.auth import clear_provider_auth
+    from hermes_cli.config import remove_env_value
+
+    provider_id = request.match_info["provider_id"]
+
+    # Clear auth.json and credential pool
+    try:
+        clear_provider_auth(provider_id)
+    except Exception:
+        pass
+
+    # Clear env var
+    catalog = await _build_catalog()
+    env_var = (catalog.get(provider_id) or {}).get("env_var")
+    if env_var:
+        remove_env_value(env_var)
+
+    return web.json_response({"ok": True})
+
+
+async def handle_oauth_start(request: web.Request) -> web.Response:
+    """Begin an OAuth flow for a provider."""
+    import asyncio as _asyncio
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    provider_id = request.match_info["provider_id"]
+    cfg = PROVIDER_REGISTRY.get(provider_id)
+    if not cfg:
+        return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
+
+    auth_type = cfg.auth_type
+    try:
+        if auth_type == "oauth_device_code":
+            from hermes_cli.web_server import _start_device_code_flow
+            session = await _start_device_code_flow(provider_id)
+            return web.json_response({
+                "flow": "device_code",
+                "session_id": session["session_id"],
+                "user_code": session.get("user_code"),
+                "verification_url": session.get("verification_url"),
+                "interval": session.get("interval"),
+                "expires_in": session.get("expires_in"),
+            })
+        if auth_type == "pkce":
+            from hermes_cli.web_server import _start_anthropic_pkce
+            session = await _asyncio.get_event_loop().run_in_executor(
+                None, _start_anthropic_pkce
+            )
+            return web.json_response({
+                "flow": "pkce",
+                "session_id": session["session_id"],
+                "auth_url": session.get("auth_url"),
+                "expires_in": session.get("expires_in"),
+            })
+        return web.json_response(
+            {"error": f"oauth not supported for auth_type={auth_type!r}"}, status=400
+        )
+    except Exception as exc:
+        logger.exception("oauth/start %s failed", provider_id)
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def handle_oauth_poll(request: web.Request) -> web.Response:
+    """Poll a pending OAuth session."""
+    from hermes_cli.web_server import _oauth_sessions, _oauth_sessions_lock
+
+    provider_id = request.match_info["provider_id"]
+    session_id = request.match_info["session_id"]
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+    if not sess:
+        return web.json_response({"error": "session not found or expired"}, status=404)
+    if sess["provider"] != provider_id:
+        return web.json_response({"error": "provider mismatch for session"}, status=400)
+    return web.json_response({
+        "session_id": session_id,
+        "status": sess["status"],
+        "error_message": sess.get("error_message"),
+    })
+
+
+async def handle_oauth_submit(request: web.Request) -> web.Response:
+    """PKCE code submission (for anthropic when promoted to V1)."""
+    import asyncio as _asyncio
+    from hermes_cli.web_server import _submit_anthropic_pkce
+
+    provider_id = request.match_info["provider_id"]
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    session_id = data.get("session_id")
+    code = data.get("code")
+    if not session_id or not code:
+        return web.json_response({"error": "session_id and code required"}, status=400)
+
+    try:
+        result = await _asyncio.get_event_loop().run_in_executor(
+            None, _submit_anthropic_pkce, session_id, code
+        )
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def handle_oauth_cancel(request: web.Request) -> web.Response:
+    """Cancel a pending OAuth session."""
+    from hermes_cli.web_server import _oauth_sessions, _oauth_sessions_lock
+
+    session_id = request.match_info["session_id"]
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.pop(session_id, None)
+    if sess is None:
+        return web.json_response({"ok": False, "message": "session not found"})
+    return web.json_response({"ok": True, "session_id": session_id})
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _auth_middleware(handler, auth_key: str):
     """Wrap a handler with bearer token auth checking."""
     async def wrapped(request: web.Request) -> web.Response:
@@ -1496,4 +1850,16 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_put('/myah/api/config/env', _a(handle_set_env))
     app.router.add_delete('/myah/api/config/env/{key}', _a(handle_delete_env))
 
-    logger.info('Myah management routes registered (%d endpoints)', 29)
+    # ── Myah: provider gateway endpoints ──────────────────────────────────
+    app.router.add_get('/myah/api/providers', _a(handle_list_providers))
+    app.router.add_get('/myah/api/providers/{provider_id}/models', _a(handle_provider_models))
+    app.router.add_post('/myah/api/providers/{provider_id}/credential', _a(handle_connect_credential))
+    app.router.add_delete('/myah/api/providers/{provider_id}/credential/{entry_id}', _a(handle_delete_credential))
+    app.router.add_delete('/myah/api/providers/{provider_id}', _a(handle_delete_all_credentials))
+    app.router.add_post('/myah/api/providers/oauth/{provider_id}/start', _a(handle_oauth_start))
+    app.router.add_get('/myah/api/providers/oauth/{provider_id}/poll/{session_id}', _a(handle_oauth_poll))
+    app.router.add_post('/myah/api/providers/oauth/{provider_id}/submit', _a(handle_oauth_submit))
+    app.router.add_delete('/myah/api/providers/oauth/sessions/{session_id}', _a(handle_oauth_cancel))
+    # ──────────────────────────────────────────────────────────────────────
+
+    logger.info('Myah management routes registered (%d endpoints)', 38)
