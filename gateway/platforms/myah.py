@@ -401,7 +401,7 @@ class MyahAdapter(BasePlatformAdapter):
                         _myah_msg_type = MessageType.DOCUMENT
                 _myah_media_urls.append(_cached)
                 _myah_media_types.append(_mime)
-        # ── End Myah: media attachments ingestion ─────────────────────────
+        # ────────────────────────────────────────────────────────────────────
 
         # Build the message event
         msg_type = MessageType.COMMAND if message.startswith('/') else _myah_msg_type  # Myah: upgraded by attachments
