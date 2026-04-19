@@ -205,6 +205,72 @@ async def test_message_body_model_override_sets_session_override(fake_switch_mod
 
 
 @pytest.mark.asyncio
+async def test_message_body_provider_pins_explicit_provider(monkeypatch):
+    """POST /myah/v1/message with both 'model' and 'provider' must pin the
+    provider (skip switch_model's auto-detect).
+
+    Regression for the home/new-chat first-message bug where OAuth-only
+    providers like openai-codex fell back to OpenRouter because the
+    platform never persisted the session override in time and Hermes saw
+    only {model:'gpt-5.4-mini'} with no provider context.
+    """
+    from gateway.platforms.myah import MyahAdapter
+    from gateway.config import PlatformConfig
+
+    # Capture switch_model kwargs so we can assert explicit_provider flows through
+    captured_kwargs = {}
+
+    def _capture(**kwargs):
+        captured_kwargs.update(kwargs)
+        result = MagicMock()
+        result.success = True
+        result.new_model = kwargs.get('raw_input', '') or 'gpt-5.4-mini'
+        result.target_provider = kwargs.get('explicit_provider') or 'openrouter'
+        result.provider_label = result.target_provider
+        result.api_key = 'sk-test'
+        result.base_url = 'https://example.test'
+        result.api_mode = ''
+        result.error_message = ''
+        return result
+
+    from hermes_cli import model_switch
+    monkeypatch.setattr(model_switch, 'switch_model', _capture)
+
+    adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
+    mock_runner = MagicMock()
+    mock_runner._session_model_overrides = {}
+    mock_runner._evict_cached_agent = MagicMock()
+    adapter.gateway_runner = mock_runner
+    adapter.handle_message = AsyncMock()
+    adapter._push_event_sync = MagicMock()
+
+    request = MagicMock()
+    request.headers = {}
+    request.json = AsyncMock(return_value={
+        'message': 'hello',
+        'session_id': 'chat123',
+        'user_id': 'user1',
+        'model': 'gpt-5.4-mini',
+        'provider': 'openai-codex',
+    })
+    request.path = '/myah/v1/message'
+
+    import asyncio
+    adapter._loop = asyncio.get_running_loop()
+
+    await adapter._handle_message_endpoint(request)
+
+    assert captured_kwargs.get('explicit_provider') == 'openai-codex', (
+        f'provider not forwarded to switch_model: {captured_kwargs}'
+    )
+    # And the resolved override should carry the pinned provider
+    assert any(
+        ov.get('provider') == 'openai-codex'
+        for ov in mock_runner._session_model_overrides.values()
+    ), f'override did not pin provider: {mock_runner._session_model_overrides}'
+
+
+@pytest.mark.asyncio
 async def test_run_completed_emits_model_and_provider(monkeypatch):
     """run.completed event includes model + provider read from cached agent."""
     from gateway.platforms.myah import MyahAdapter

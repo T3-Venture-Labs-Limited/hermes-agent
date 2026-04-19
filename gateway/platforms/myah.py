@@ -233,6 +233,12 @@ class MyahAdapter(BasePlatformAdapter):
         # PUT /myah/api/sessions/{id}/model, useful for
         # "regenerate with different model" flows.
         _override_model = (body.get("model") or "").strip()
+        # Optional 'provider' tag from the platform — when present it pins
+        # the target provider so switch_model skips auto-detect. Needed for
+        # OAuth-only providers (openai-codex, anthropic-claude-code) where
+        # the env-var heuristic PROVIDER_REGISTRY uses would otherwise fall
+        # back to OpenRouter on the very first message of a new chat.
+        _override_provider = (body.get("provider") or "").strip()
         # ────────────────────────────────────────────────────────────
 
         # Create the SSE stream
@@ -293,7 +299,7 @@ class MyahAdapter(BasePlatformAdapter):
                         current_base_url=_current_base_url,
                         current_api_key="",
                         is_global=False,
-                        explicit_provider="",
+                        explicit_provider=_override_provider,  # Myah: pin provider when platform supplies it
                         user_providers=_cfg.get("providers"),
                         custom_providers=_cfg.get("custom_providers"),
                     ),
