@@ -252,8 +252,9 @@ async def test_get_schema_returns_aux_tasks(home):
     aux = body.get('auxiliary', {})
     assert 'title_generation' in aux
     assert 'follow_up_generation' in aux
-    assert aux['title_generation']['provider']['default'] == 'openrouter'
-    assert aux['title_generation']['model']['default'] == 'google/gemini-2.5-flash'
+    # Adopted upstream auto-provider policy: no hard pin to openrouter/gemini
+    assert aux['title_generation']['provider']['default'] == 'auto'
+    assert aux['title_generation']['model']['default'] == ''
 
 
 @pytest.mark.asyncio
@@ -317,7 +318,8 @@ async def test_reset_aux_title_generation_restores_defaults(home, monkeypatch):
     keys_reset = {k for k, _ in called}
     assert 'auxiliary.title_generation.provider' in keys_reset
     model_val = next(v for k, v in called if k == 'auxiliary.title_generation.model')
-    assert model_val == 'google/gemini-2.5-flash'
+    # Adopted upstream auto-provider policy: default model is '' (inherits main provider)
+    assert model_val == ''
 
 
 # ── Task 8: MCP registry refresh ──────────────────────────────────────────
