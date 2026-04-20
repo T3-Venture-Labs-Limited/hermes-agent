@@ -1676,16 +1676,22 @@ async def handle_delete_all_credentials(request: web.Request) -> web.Response:
 
 
 async def handle_oauth_start(request: web.Request) -> web.Response:
-    """Begin an OAuth flow for a provider."""
+    """Begin an OAuth flow for a provider.
+
+    Reads the effective auth_type from the merged catalog (MYAH_OVERRIDES
+    on top of PROVIDER_REGISTRY) so that providers like openai-codex,
+    which are oauth_external in upstream but routed through the device-code
+    UI in Myah, dispatch correctly.
+    """
     import asyncio as _asyncio
-    from hermes_cli.auth import PROVIDER_REGISTRY
 
     provider_id = request.match_info["provider_id"]
-    cfg = PROVIDER_REGISTRY.get(provider_id)
-    if not cfg:
+    catalog = await _build_catalog()
+    entry = catalog.get(provider_id)
+    if not entry:
         return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
 
-    auth_type = cfg.auth_type
+    auth_type = entry.get("auth_type", "api_key")
     try:
         if auth_type == "oauth_device_code":
             from hermes_cli.web_server import _start_device_code_flow

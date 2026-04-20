@@ -10,12 +10,19 @@ import pytest
 
 
 def _make_request(method="GET", path="/", match_info=None, json_body=None, query=None):
-    """Build a mocked aiohttp Request for testing handlers."""
+    """Build a mocked aiohttp Request for testing handlers.
+
+    Uses make_mocked_request's native match_info kwarg instead of monkey-
+    patching the Request class — class-level patching leaks to every other
+    test (including test_myah_session_model.py) running in the same
+    interpreter / xdist worker.
+    """
     from aiohttp.test_utils import make_mocked_request
     headers = {"Authorization": "Bearer test-token"}
-    req = make_mocked_request(method, path, headers=headers)
+    kwargs = {"headers": headers}
     if match_info is not None:
-        type(req).match_info = property(lambda self, mi=match_info: mi)
+        kwargs["match_info"] = match_info
+    req = make_mocked_request(method, path, **kwargs)
     if query:
         req._rel_url = req._rel_url.with_query(query)
     if json_body is not None:
@@ -27,17 +34,26 @@ def _make_request(method="GET", path="/", match_info=None, json_body=None, query
 
 @pytest.mark.asyncio
 async def test_catalog_includes_all_v1_providers():
-    """GET /myah/api/providers?visible=v1 returns exactly the 7 V1 providers."""
+    """GET /myah/api/providers?visible=v1 returns every MYAH_OVERRIDES entry
+    with v1_visible=True. The tier-1 seven must be present; tier-2 entries
+    (zai, kimi, minimax, etc.) round out the catalog."""
     from gateway.platforms.myah_management import handle_list_providers
+    from hermes_cli.myah_overrides import MYAH_OVERRIDES
 
     req = _make_request(query={"visible": "v1"})
     response = await handle_list_providers(req)
     assert response.status == 200
     body = json.loads(response.body)
-    assert set(body.keys()) == {
-        "openrouter", "openai", "openai-codex", "anthropic",
-        "gemini", "xai", "deepseek",
-    }
+
+    # Tier-1: the seven providers users see first
+    tier_one = {"openrouter", "openai", "openai-codex", "anthropic",
+                "gemini", "xai", "deepseek"}
+    assert tier_one.issubset(set(body.keys()))
+
+    # All v1_visible entries in MYAH_OVERRIDES must surface in the catalog
+    expected = {slug for slug, override in MYAH_OVERRIDES.items()
+                if override.get("v1_visible")}
+    assert set(body.keys()) == expected
 
 
 @pytest.mark.asyncio
@@ -53,15 +69,24 @@ async def test_catalog_openai_has_custom_provider_block():
 
 
 @pytest.mark.asyncio
-async def test_catalog_all_includes_hidden_entries():
-    """GET /myah/api/providers?visible=all includes non-v1 entries."""
+async def test_catalog_all_returns_complete_catalog():
+    """GET /myah/api/providers?visible=all returns every MYAH_OVERRIDES
+    entry plus any unclaimed CANONICAL_PROVIDERS slugs. With every
+    override flagged v1_visible=True, the v1 filter and the all filter
+    return the same set today — the test guarantees the all-view is a
+    superset of the v1-view regardless of future gating."""
     from gateway.platforms.myah_management import handle_list_providers
 
-    req = _make_request(query={"visible": "all"})
-    response = await handle_list_providers(req)
-    body = json.loads(response.body)
-    hidden = [v for v in body.values() if not v.get("v1_visible")]
-    assert hidden, "expected at least one hidden entry from CANONICAL_PROVIDERS"
+    req_all = _make_request(query={"visible": "all"})
+    all_resp = await handle_list_providers(req_all)
+    all_body = json.loads(all_resp.body)
+
+    req_v1 = _make_request(query={"visible": "v1"})
+    v1_resp = await handle_list_providers(req_v1)
+    v1_body = json.loads(v1_resp.body)
+
+    assert set(v1_body.keys()).issubset(set(all_body.keys()))
+    assert all_body, "catalog must never be empty"
 
 
 @pytest.mark.asyncio
