@@ -29,6 +29,26 @@ from hermes_constants import get_hermes_home
 from hermes_cli.config import set_config_value
 # ──────────────────────────────────────────────────────────────────────────
 
+# ── Myah: defensive probe of hermes_cli.web_server ────────────────────────
+# web_server.py depends on fastapi/uvicorn (optional [web] extra). When those
+# packages are absent, web_server.py:57 raises SystemExit — which would kill
+# the ENTIRE gateway process if any OAuth handler below performed its import
+# lazily inside the request path. Probe once at module load, catch both
+# SystemExit (legacy upstream contract) and ImportError (future-proof), and
+# let each OAuth handler short-circuit with a clean 503 if unavailable.
+try:
+    import hermes_cli.web_server  # noqa: F401 — import probe only
+    _WEB_SERVER_AVAILABLE = True
+    _WEB_SERVER_UNAVAILABLE_REASON = ''
+except (ImportError, SystemExit) as _web_server_import_err:
+    _WEB_SERVER_AVAILABLE = False
+    _WEB_SERVER_UNAVAILABLE_REASON = (
+        f'hermes_cli.web_server unavailable: {_web_server_import_err}. '
+        'OAuth flows require the [web] extra (fastapi + uvicorn). '
+        'Rebuild the agent image with `pip install -e .[web,...]`.'
+    )
+# ──────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
@@ -1692,6 +1712,11 @@ async def handle_oauth_start(request: web.Request) -> web.Response:
         return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
 
     auth_type = entry.get("auth_type", "api_key")
+    if not _WEB_SERVER_AVAILABLE and auth_type in ("oauth_device_code", "pkce"):
+        logger.error("oauth/start rejected: %s", _WEB_SERVER_UNAVAILABLE_REASON)
+        return web.json_response(
+            {"error": _WEB_SERVER_UNAVAILABLE_REASON}, status=503
+        )
     try:
         if auth_type == "oauth_device_code":
             from hermes_cli.web_server import _start_device_code_flow
@@ -1725,6 +1750,10 @@ async def handle_oauth_start(request: web.Request) -> web.Response:
 
 async def handle_oauth_poll(request: web.Request) -> web.Response:
     """Poll a pending OAuth session."""
+    if not _WEB_SERVER_AVAILABLE:
+        return web.json_response(
+            {"error": _WEB_SERVER_UNAVAILABLE_REASON}, status=503
+        )
     from hermes_cli.web_server import _oauth_sessions, _oauth_sessions_lock
 
     provider_id = request.match_info["provider_id"]
@@ -1744,6 +1773,10 @@ async def handle_oauth_poll(request: web.Request) -> web.Response:
 
 async def handle_oauth_submit(request: web.Request) -> web.Response:
     """PKCE code submission (for anthropic when promoted to V1)."""
+    if not _WEB_SERVER_AVAILABLE:
+        return web.json_response(
+            {"error": _WEB_SERVER_UNAVAILABLE_REASON}, status=503
+        )
     import asyncio as _asyncio
     from hermes_cli.web_server import _submit_anthropic_pkce
 
@@ -1768,6 +1801,10 @@ async def handle_oauth_submit(request: web.Request) -> web.Response:
 
 async def handle_oauth_cancel(request: web.Request) -> web.Response:
     """Cancel a pending OAuth session."""
+    if not _WEB_SERVER_AVAILABLE:
+        return web.json_response(
+            {"error": _WEB_SERVER_UNAVAILABLE_REASON}, status=503
+        )
     from hermes_cli.web_server import _oauth_sessions, _oauth_sessions_lock
 
     session_id = request.match_info["session_id"]
