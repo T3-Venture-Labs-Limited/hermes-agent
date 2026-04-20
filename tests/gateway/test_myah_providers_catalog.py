@@ -185,3 +185,129 @@ async def test_oauth_cancel_unknown_session_returns_ok_false():
     response = await handle_oauth_cancel(req)
     body = json.loads(response.body)
     assert body["ok"] is False
+
+
+# ── Myah: catalog contract tests ───────────────────────────────────────────
+# These guard the "add a provider = one MYAH_OVERRIDES entry" promise.
+# Every v1_visible entry must carry the fields the platform and Hermes rely
+# on so that untested providers behave identically to tested ones
+# (zai, opencode-zen) without per-provider code changes downstream.
+
+
+_VALID_WRITE_TYPES = frozenset({
+    "env_var",
+    "custom_provider",
+    "oauth_device_code",
+    "oauth_codex",
+    "oauth_external",     # coming-soon tile
+    "external_process",   # coming-soon tile
+})
+
+# Providers whose write flow is a tile-only placeholder. They appear in the
+# picker but have no working auth flow yet, so we don't require validation /
+# env_var on them.
+_COMING_SOON_WRITE_TYPES = frozenset({"oauth_external", "external_process"})
+
+
+def _v1_visible_entries():
+    from hermes_cli.myah_overrides import MYAH_OVERRIDES
+    return {slug: entry for slug, entry in MYAH_OVERRIDES.items()
+            if entry.get("v1_visible")}
+
+
+def test_every_v1_visible_entry_has_default_model():
+    """Default model drives _resolve_user_model in the platform and the
+    initial model pin on first chat. Missing it = blank model selector."""
+    missing = [slug for slug, entry in _v1_visible_entries().items()
+               if not entry.get("default_model")]
+    assert not missing, (
+        f"MYAH_OVERRIDES entries missing 'default_model': {missing}. "
+        "Every V1 provider must declare a sensible default so the first "
+        "chat after connect doesn't hit a blank model."
+    )
+
+
+def test_every_v1_visible_entry_has_valid_write_type():
+    """write_type drives handle_connect_credential routing. An invalid or
+    missing value means the connect flow can't persist the credential."""
+    invalid = {slug: entry.get("write_type")
+               for slug, entry in _v1_visible_entries().items()
+               if entry.get("write_type") not in _VALID_WRITE_TYPES}
+    assert not invalid, (
+        f"MYAH_OVERRIDES entries with invalid 'write_type': {invalid}. "
+        f"Must be one of {sorted(_VALID_WRITE_TYPES)}."
+    )
+
+
+def test_api_key_providers_declare_env_var_or_custom_provider():
+    """For write_type=env_var, handle_connect_credential needs entry.env_var
+    to save_env_value(). For write_type=custom_provider, it needs the
+    custom_provider block. Coming-soon tiles are exempt."""
+    broken = []
+    for slug, entry in _v1_visible_entries().items():
+        wt = entry.get("write_type")
+        if wt in _COMING_SOON_WRITE_TYPES:
+            continue
+        if wt == "env_var" and not entry.get("env_var"):
+            # env_var may be inherited from PROVIDER_REGISTRY.api_key_env_vars
+            # in hermes_cli.auth — we only fail if BOTH override and canonical
+            # lack it, because _build_catalog at myah_management.py:1472-1474
+            # falls back to api_key_env_vars[0] when override.env_var is absent.
+            from hermes_cli.auth import PROVIDER_REGISTRY
+            canonical = PROVIDER_REGISTRY.get(slug)
+            has_canonical = bool(
+                canonical and getattr(canonical, "api_key_env_vars", ())
+            )
+            if not has_canonical:
+                broken.append(f"{slug} (env_var missing and no canonical)")
+        elif wt == "custom_provider" and not entry.get("custom_provider"):
+            broken.append(f"{slug} (custom_provider block missing)")
+    assert not broken, (
+        "MYAH_OVERRIDES entries can't persist credentials: "
+        f"{broken}. Fix by adding env_var/custom_provider block, or mark "
+        "as oauth_external/external_process if the flow isn't wired yet."
+    )
+
+
+def test_api_key_providers_with_validation_have_required_fields():
+    """If an entry declares validation, the shape must match what
+    _validate_api_key expects: url + method + auth."""
+    bad = []
+    for slug, entry in _v1_visible_entries().items():
+        validation = entry.get("validation")
+        if not validation:
+            continue
+        missing = [k for k in ("url", "method", "auth") if k not in validation]
+        if missing:
+            bad.append(f"{slug} missing {missing}")
+        if validation.get("auth") not in (None, "bearer", "x-api-key", "query"):
+            bad.append(f"{slug} has unknown auth style {validation.get('auth')!r}")
+    assert not bad, (
+        f"MYAH_OVERRIDES validation blocks malformed: {bad}. "
+        "_validate_api_key reads url/method/auth — mismatched shape means "
+        "the connect flow silently accepts every key."
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_exposes_env_var_for_every_api_key_provider():
+    """End-to-end: the merged catalog (CANONICAL + HERMES_OVERLAYS +
+    MYAH_OVERRIDES) must expose env_var on every v1_visible entry whose
+    write_type is env_var, because handle_connect_credential reads it from
+    the merged entry — not from MYAH_OVERRIDES directly."""
+    from gateway.platforms.myah_management import handle_list_providers
+
+    req = _make_request(query={"visible": "v1"})
+    response = await handle_list_providers(req)
+    body = json.loads(response.body)
+
+    missing = []
+    for slug, entry in body.items():
+        wt = entry.get("write_type")
+        if wt == "env_var" and not entry.get("env_var"):
+            missing.append(slug)
+    assert not missing, (
+        f"Merged catalog entries missing env_var: {missing}. "
+        "Platform can't inject credentials for these providers — chat "
+        "will fail with 'API key missing' on first message."
+    )
