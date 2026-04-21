@@ -1017,6 +1017,77 @@ class MyahAdapter(BasePlatformAdapter):
             "text": str(args[0]) if args else "unknown",
         }
 
+    # ── Myah: slash command discovery endpoint ───────────────────────────
+    async def _handle_list_commands(self, request: "web.Request") -> "web.Response":
+        """GET /myah/api/commands — return all chat-available slash commands.
+
+        Returns JSON ``{"commands": [...]}`` with command objects from three
+        sources: builtins (COMMAND_REGISTRY), skills (get_skill_commands),
+        and plugins (get_plugin_commands).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        items: list[dict] = []
+
+        # --- 1. Builtins from COMMAND_REGISTRY ---
+        try:
+            from hermes_cli.commands import (
+                COMMAND_REGISTRY,
+                ACTIVE_SESSION_BYPASS_COMMANDS,
+            )
+            for cmd in COMMAND_REGISTRY:
+                if cmd.cli_only:
+                    continue
+                items.append({
+                    "name": cmd.name,
+                    "category": cmd.category or "misc",
+                    "description": cmd.description,
+                    "aliases": list(cmd.aliases or []),
+                    "args": cmd.args_hint or "",
+                    "bypass": cmd.name in ACTIVE_SESSION_BYPASS_COMMANDS,
+                    "source": "builtin",
+                })
+        except Exception:
+            logger.exception("[myah] failed to collect builtin commands")
+
+        # --- 2. Skills ---
+        try:
+            from agent.skill_commands import get_skill_commands
+            for _cmd_key, info in get_skill_commands().items():
+                items.append({
+                    "name": info.get("name", _cmd_key.lstrip("/")),
+                    "category": "skill",
+                    "description": info.get("description", ""),
+                    "aliases": [],
+                    "args": "",
+                    "bypass": False,
+                    "source": "skill",
+                    "skill_path": info.get("skill_dir", ""),
+                })
+        except Exception:
+            logger.exception("[myah] failed to collect skill commands")
+
+        # --- 3. Plugins ---
+        try:
+            from hermes_cli.plugins import get_plugin_commands
+            for cmd_name, cmd_info in get_plugin_commands().items():
+                items.append({
+                    "name": cmd_name,
+                    "category": "plugin",
+                    "description": cmd_info.get("description", ""),
+                    "aliases": [],
+                    "args": "",
+                    "bypass": False,
+                    "source": "plugin",
+                })
+        except Exception:
+            logger.exception("[myah] failed to collect plugin commands")
+
+        return web.json_response({"commands": items})
+    # ────────────────────────────────────────────────────────────────────
+
     # ── Orphaned stream sweeper ─────────────────────────────────────────
 
     async def _sweep_orphaned_streams(self) -> None:
@@ -1151,6 +1222,9 @@ class MyahAdapter(BasePlatformAdapter):
         app.router.add_get("/myah/v1/media", self._handle_media_get)  # Myah: media endpoint
         # ── Myah: aux router HTTP wrapper ────────────────────────────────
         app.router.add_post('/myah/v1/aux/{task}', self._handle_aux_endpoint)
+        # ─────────────────────────────────────────────────────────────────
+        # ── Myah: slash command discovery route ──────────────────────────
+        app.router.add_get('/myah/api/commands', self._handle_list_commands)
         # ─────────────────────────────────────────────────────────────────
 
         # Register management API routes (config, skills, plugins, MCP,
