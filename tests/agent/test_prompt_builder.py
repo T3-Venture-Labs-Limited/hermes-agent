@@ -771,6 +771,15 @@ class TestPromptBuilderConstants:
         assert "cron" in PLATFORM_HINTS
         assert "cli" in PLATFORM_HINTS
 
+    def test_myah_platform_hint_present(self):
+        assert "myah" in PLATFORM_HINTS
+
+    def test_myah_platform_hint_contains_file_mention_guidance(self):
+        hint = PLATFORM_HINTS["myah"]
+        assert "Files panel" in hint
+        assert "clickable badge" in hint
+        assert "file path" in hint
+
 
 # =========================================================================
 # Environment hints

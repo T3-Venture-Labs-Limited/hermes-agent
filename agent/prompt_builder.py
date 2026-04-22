@@ -389,7 +389,11 @@ PLATFORM_HINTS = {
         "User is interacting via the Myah web platform. "
         "Full markdown rendering is supported including code blocks, tables, "
         "images (via URL), and links. The user can see tool call progress "
-        "and reasoning in real time."
+        "and reasoning in real time. "
+        "When you create or modify files, mention the file path naturally in your response "
+        "so it renders as a clickable badge inline (e.g., 'I saved this to "
+        "`/data/.hermes/cache/documents/report.md`'). "
+        "Generated files also appear in the Files panel for this conversation."
     ),
     # ────────────────────────────────────────────────────────
 }
