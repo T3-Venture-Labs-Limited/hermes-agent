@@ -1466,7 +1466,7 @@ def _make_provider_session(provider_id: str, flow: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Myah: per-model capability passthrough ───────────────────────────────────
+# ── Myah: per-model capability passthrough ─────────────────────────────────────
 
 def _build_model_entry(provider: str, model_id: str) -> dict:
     """Return a catalog entry dict for a single model, enriched with capabilities if available.
