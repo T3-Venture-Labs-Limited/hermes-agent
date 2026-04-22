@@ -911,6 +911,34 @@ def _read_main_provider() -> str:
             provider = model_cfg.get("provider", "")
             if isinstance(provider, str) and provider.strip():
                 return provider.strip().lower()
+        # ── Myah: infer provider from string-form model: ─────────────────────
+        # Myah's PATCH /api/v1/agent/config path writes model: as a bare string
+        # (e.g. "anthropic/claude-haiku-4-5-20251001") via set_config_value().
+        # The dict-form branch above is a no-op for such configs, leaving
+        # _resolve_auto Step 1 unable to determine the provider and falling
+        # through to the hardcoded OpenRouter fallback regardless of what model
+        # the user picked.  Mirror _read_main_model's string-form handling
+        # (auxiliary_client.py:889-890) and delegate to detect_provider_for_model
+        # — the same helper the interactive `hermes model` flow uses when writing
+        # dict-form config.  Lazy import avoids circular-import risk at boot.
+        elif isinstance(model_cfg, str) and model_cfg.strip():
+            model_str = model_cfg.strip()
+            # Fast path: vendor-prefixed slug like "anthropic/claude-haiku-..."
+            # where the prefix is a known provider id in _PROVIDER_MODELS.
+            if "/" in model_str:
+                from hermes_cli.models import _PROVIDER_MODELS
+                prefix = model_str.split("/", 1)[0].lower()
+                if prefix in _PROVIDER_MODELS:
+                    return prefix
+            # Fallback: catalog-based inference via the same helper the
+            # interactive `hermes model` flow uses to write dict-form config.
+            from hermes_cli.models import detect_provider_for_model
+            result = detect_provider_for_model(model_str, current_provider="")
+            if result is not None:
+                provider_id, _resolved_model = result
+                if isinstance(provider_id, str) and provider_id.strip():
+                    return provider_id.strip().lower()
+        # ─────────────────────────────────────────────────────────────────────
     except Exception:
         pass
     return ""

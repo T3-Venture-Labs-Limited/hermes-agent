@@ -1542,12 +1542,24 @@ async def handle_provider_models(request: web.Request) -> web.Response:
     return web.json_response([{"id": m, "name": m} for m in ids])
 
 
-async def _validate_api_key(catalog_entry: dict, api_key: str) -> bool:
-    """Validate the API key by hitting the provider's validation URL."""
+# ── Myah: credential validation with transient-failure handling ───────────────
+# Native Hermes CLI accepts keys optimistically (no validation URL hit). This
+# function adds early-feedback validation for the Myah onboarding UI, but must
+# not treat network transients as auth failures — that turns a DNS flake or a
+# rate-limit into a false "invalid key" rejection. Only explicit 401/403
+# responses (provider-side auth denial) should block a credential save.
+async def _validate_api_key(catalog_entry: dict, api_key: str) -> tuple[bool, str]:
+    """Validate the API key against the provider's validation URL.
+
+    Returns (accepted, reason) where accepted=True means the key should be
+    persisted. Only HTTP 401/403 (explicit auth denial) returns (False, ...).
+    Timeouts, 429, 5xx, and network errors return (True, 'optimistic accept ...')
+    so that transient infra issues do not permanently block valid credentials.
+    """
     validation = catalog_entry.get("validation") or {}
     url = validation.get("url")
     if not url:
-        return True  # optimistic accept when no validation URL configured
+        return True, "no validation URL configured"
     headers: dict = {}
     params = None
     method = validation.get("method", "GET")
@@ -1565,9 +1577,24 @@ async def _validate_api_key(catalog_entry: dict, api_key: str) -> bool:
             async with session.request(
                 method, url, headers=headers, params=params
             ) as r:
-                return r.status < 400
-    except Exception:
-        return False
+                if r.status in (401, 403):
+                    return False, f"auth denied by provider (HTTP {r.status})"
+                if r.status < 400:
+                    return True, "validated"
+                # 429 / 5xx / other — cannot confirm auth; accept optimistically
+                logger.warning(
+                    f"[myah] validation endpoint returned {r.status} for {url}; optimistic accept"
+                )
+                return True, f"optimistic accept (validation HTTP {r.status})"
+    except asyncio.TimeoutError:
+        logger.warning(f"[myah] validation endpoint timed out for {url}; optimistic accept")
+        return True, "optimistic accept (validation timeout)"
+    except Exception as exc:
+        logger.warning(
+            f"[myah] validation endpoint error for {url}: {exc}; optimistic accept"
+        )
+        return True, f"optimistic accept (validation error: {exc})"
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 async def handle_connect_credential(request: web.Request) -> web.Response:
@@ -1592,11 +1619,13 @@ async def handle_connect_credential(request: web.Request) -> web.Response:
     if not entry:
         return web.json_response({"error": f"unknown provider: {provider_id}"}, status=404)
 
-    valid = await _validate_api_key(entry, api_key)
-    if not valid:
+    accepted, reason = await _validate_api_key(entry, api_key)
+    if not accepted:
         return web.json_response(
-            {"error": f"validation failed for {provider_id}"}, status=400
+            {"error": f"validation failed for {provider_id}: {reason}"}, status=400
         )
+    if "optimistic" in reason:
+        logger.info(f"[myah] credential connect {provider_id}: {reason}")
 
     write_type = entry.get("write_type", "env_var")
     key_last_four = api_key[-4:] if len(api_key) >= 4 else "****"

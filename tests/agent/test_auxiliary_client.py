@@ -978,3 +978,204 @@ class TestAnthropicCompatImageConversion:
         }]
         result = _convert_openai_images_to_anthropic(messages)
         assert result[0]["content"][0]["source"]["media_type"] == "image/jpeg"
+
+
+# ── Task 1: Failing regression tests for _read_main_provider string-form ────
+# These tests pin the missing string-form branch in _read_main_provider.
+# Tests 1, 2 (and only those) should fail against the unpatched code because
+# the function returns "" for any string-form model: value.
+# Tests 3-7 should already pass (dict-form + edge cases work today).
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestReadMainProvider:
+    """Unit tests for _read_main_provider() covering string-form inference."""
+
+    def test_read_main_provider_infers_from_string_model_anthropic(self):
+        """String-form model: with anthropic slug must return 'anthropic'."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "anthropic/claude-haiku-4-5-20251001"}):
+            result = _read_main_provider()
+        assert result == "anthropic"
+
+    def test_read_main_provider_infers_from_string_model_openrouter(self):
+        """String-form model: with openrouter-only slug must return 'openrouter'."""
+        from agent.auxiliary_client import _read_main_provider
+        # google/gemini-3-flash-preview is only in the openrouter catalog
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "google/gemini-3-flash-preview"}):
+            result = _read_main_provider()
+        assert result == "openrouter"
+
+    def test_read_main_provider_dict_form_unchanged(self):
+        """Dict-form model: with explicit provider must return that provider unchanged."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"provider": "zai", "default": "glm-4.5-flash"}}):
+            result = _read_main_provider()
+        assert result == "zai"
+
+    def test_read_main_provider_dict_form_auto_provider_passes_through(self):
+        """Dict-form model: with provider='auto', function returns 'auto'.
+
+        _resolve_auto at :1292 already filters out 'auto' with the guard
+        `main_provider not in ("auto", "")` — so the string 'auto' reaching
+        _resolve_auto is harmless. This test pins the existing pass-through
+        behavior so it is not accidentally broken during the fix.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"provider": "auto", "default": "openrouter/x"}}):
+            result = _read_main_provider()
+        assert result == "auto"
+
+    def test_read_main_provider_unknown_model_returns_empty(self):
+        """String-form model: with unrecognised id must return '' (no crash)."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "gibberish/nonexistent-model-xyz"}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_empty_string_returns_empty(self):
+        """Empty string model: must short-circuit and return ''."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", return_value={"model": ""}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_missing_model_key_returns_empty(self):
+        """No model key in config must return ''."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", return_value={}):
+            result = _read_main_provider()
+        assert result == ""
+
+
+# ── Task 3: Edge-case tests ───────────────────────────────────────────────────
+# Additional corner-case coverage for _read_main_provider after the fix lands.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReadMainProviderEdgeCases:
+    """Edge-case and regression tests for _read_main_provider()."""
+
+    def test_read_main_provider_vendor_prefix_uses_detect_as_ground_truth(self):
+        """Vendor-prefixed slug uses detect_provider_for_model as ground truth.
+
+        Test is intentionally resilient to upstream catalog changes: it calls
+        detect_provider_for_model itself to get the expected value rather than
+        hard-coding it, so the test keeps passing even if catalog entries shift.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        from hermes_cli.models import detect_provider_for_model
+        model = "google/gemini-3-flash-preview"
+        expected_result = detect_provider_for_model(model, "")
+        # The fast path hits: 'google' is NOT a known provider key, so falls
+        # through to detect_provider_for_model which returns ('openrouter', ...).
+        with patch("hermes_cli.config.load_config", return_value={"model": model}):
+            result = _read_main_provider()
+        if expected_result is not None:
+            assert result == expected_result[0].strip().lower()
+        else:
+            assert result == ""
+
+    def test_read_main_provider_dict_with_no_provider_key_returns_empty(self):
+        """Dict-form model: with no provider key returns '' (intentionally unchanged).
+
+        A dict {default: "..."} with no explicit 'provider' key is not extended
+        by this fix — that's a separate bug surface. This test documents the
+        intentional scope limit so future refactors are aware.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"default": "anthropic/claude-haiku-4-5-20251001"}}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_swallows_load_config_exception(self):
+        """load_config raising must not propagate — returns '' safely."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("disk error")):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_known_prefix_matches_provider(self):
+        """'anthropic/...' string form takes the fast-path and returns 'anthropic'."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "anthropic/claude-sonnet-4-6"}):
+            result = _read_main_provider()
+        assert result == "anthropic"
+
+    def test_read_main_provider_unknown_prefix_falls_through_to_detect(self):
+        """Unknown vendor prefix falls through to detect_provider_for_model."""
+        from agent.auxiliary_client import _read_main_provider
+        # 'totally-unknown-provider/some-model' — prefix not in _PROVIDER_MODELS,
+        # detect_provider_for_model also can't match it → returns ''.
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "totally-unknown-provider/some-model"}):
+            result = _read_main_provider()
+        assert result == ""
+
+
+# ── Appendix Task F: Honcho-aux-isolation invariant tests ────────────────────
+# Regression fence: aux calls must NEVER interact with Honcho memory.
+# Current code is clean (verified 2026-04-22 via grep); these tests ensure
+# future refactors can't silently re-couple the aux path to user memory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHonchoAuxIsolation:
+    """Invariant: aux LLM calls must never read from or write to Honcho memory."""
+
+    def test_auxiliary_client_has_no_honcho_dependencies(self):
+        """auxiliary_client.py must not import or reference Honcho or MemoryManager.
+
+        Rationale: aux tasks (title, follow-ups, compression, vision,
+        session_search) use a separate, Honcho-free LLM client. Only the
+        main agent loop is authorised to touch Honcho. This test fails
+        immediately if someone accidentally re-introduces aux→Honcho coupling
+        via an import, direct reference, or inline usage.
+        """
+        import agent.auxiliary_client
+        import inspect
+
+        source = inspect.getsource(agent.auxiliary_client)
+        forbidden = [
+            "honcho", "HonchoClient", "memory_manager",
+            "MemoryManager", "peer_card",
+        ]
+        found = [term for term in forbidden if term.lower() in source.lower()]
+        assert not found, (
+            "auxiliary_client.py must not reference Honcho or memory_manager. "
+            f"Found: {found}. Aux calls must never interact with user memory. "
+            "Only the main agent loop may access Honcho."
+        )
+
+    def test_myah_gateway_aux_endpoint_has_no_honcho_dependencies(self):
+        """The _handle_aux_endpoint body in myah.py must not reference Honcho.
+
+        The Myah HTTP /myah/v1/aux/{task} endpoint delegates to
+        auxiliary_client.call_llm — it must not inject any Honcho context.
+        Other parts of myah.py that set up Honcho for the main agent are fine.
+        """
+        import re
+        import gateway.platforms.myah
+        import inspect
+
+        source = inspect.getsource(gateway.platforms.myah)
+        # Locate _handle_aux_endpoint function body up to the next top-level
+        # definition or end of source.
+        m = re.search(
+            r"def\s+_handle_aux_endpoint.*?(?=\n(?:async\s+)?def\s|\nclass\s|\Z)",
+            source,
+            re.DOTALL,
+        )
+        assert m, "Could not locate _handle_aux_endpoint body in gateway.platforms.myah"
+        aux_body = m.group(0)
+
+        forbidden = ["honcho", "memory_manager", "peer_card"]
+        found = [term for term in forbidden if term.lower() in aux_body.lower()]
+        assert not found, (
+            f"_handle_aux_endpoint body must not reference Honcho. Found: {found}. "
+            "The aux HTTP endpoint must be a pure LLM call with no memory context."
+        )
