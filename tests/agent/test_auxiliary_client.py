@@ -978,3 +978,75 @@ class TestAnthropicCompatImageConversion:
         }]
         result = _convert_openai_images_to_anthropic(messages)
         assert result[0]["content"][0]["source"]["media_type"] == "image/jpeg"
+
+
+# ── Task 1: Failing regression tests for _read_main_provider string-form ────
+# These tests pin the missing string-form branch in _read_main_provider.
+# Tests 1, 2 (and only those) should fail against the unpatched code because
+# the function returns "" for any string-form model: value.
+# Tests 3-7 should already pass (dict-form + edge cases work today).
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestReadMainProvider:
+    """Unit tests for _read_main_provider() covering string-form inference."""
+
+    def test_read_main_provider_infers_from_string_model_anthropic(self):
+        """String-form model: with anthropic slug must return 'anthropic'."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "anthropic/claude-haiku-4-5-20251001"}):
+            result = _read_main_provider()
+        assert result == "anthropic"
+
+    def test_read_main_provider_infers_from_string_model_openrouter(self):
+        """String-form model: with openrouter-only slug must return 'openrouter'."""
+        from agent.auxiliary_client import _read_main_provider
+        # google/gemini-3-flash-preview is only in the openrouter catalog
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "google/gemini-3-flash-preview"}):
+            result = _read_main_provider()
+        assert result == "openrouter"
+
+    def test_read_main_provider_dict_form_unchanged(self):
+        """Dict-form model: with explicit provider must return that provider unchanged."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"provider": "zai", "default": "glm-4.5-flash"}}):
+            result = _read_main_provider()
+        assert result == "zai"
+
+    def test_read_main_provider_dict_form_auto_provider_passes_through(self):
+        """Dict-form model: with provider='auto', function returns 'auto'.
+
+        _resolve_auto at :1292 already filters out 'auto' with the guard
+        `main_provider not in ("auto", "")` — so the string 'auto' reaching
+        _resolve_auto is harmless. This test pins the existing pass-through
+        behavior so it is not accidentally broken during the fix.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"provider": "auto", "default": "openrouter/x"}}):
+            result = _read_main_provider()
+        assert result == "auto"
+
+    def test_read_main_provider_unknown_model_returns_empty(self):
+        """String-form model: with unrecognised id must return '' (no crash)."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "gibberish/nonexistent-model-xyz"}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_empty_string_returns_empty(self):
+        """Empty string model: must short-circuit and return ''."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", return_value={"model": ""}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_missing_model_key_returns_empty(self):
+        """No model key in config must return ''."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", return_value={}):
+            result = _read_main_provider()
+        assert result == ""
