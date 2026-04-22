@@ -1116,3 +1116,66 @@ class TestReadMainProviderEdgeCases:
                    return_value={"model": "totally-unknown-provider/some-model"}):
             result = _read_main_provider()
         assert result == ""
+
+
+# ── Appendix Task F: Honcho-aux-isolation invariant tests ────────────────────
+# Regression fence: aux calls must NEVER interact with Honcho memory.
+# Current code is clean (verified 2026-04-22 via grep); these tests ensure
+# future refactors can't silently re-couple the aux path to user memory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHonchoAuxIsolation:
+    """Invariant: aux LLM calls must never read from or write to Honcho memory."""
+
+    def test_auxiliary_client_has_no_honcho_dependencies(self):
+        """auxiliary_client.py must not import or reference Honcho or MemoryManager.
+
+        Rationale: aux tasks (title, follow-ups, compression, vision,
+        session_search) use a separate, Honcho-free LLM client. Only the
+        main agent loop is authorised to touch Honcho. This test fails
+        immediately if someone accidentally re-introduces aux→Honcho coupling
+        via an import, direct reference, or inline usage.
+        """
+        import agent.auxiliary_client
+        import inspect
+
+        source = inspect.getsource(agent.auxiliary_client)
+        forbidden = [
+            "honcho", "HonchoClient", "memory_manager",
+            "MemoryManager", "peer_card",
+        ]
+        found = [term for term in forbidden if term.lower() in source.lower()]
+        assert not found, (
+            "auxiliary_client.py must not reference Honcho or memory_manager. "
+            f"Found: {found}. Aux calls must never interact with user memory. "
+            "Only the main agent loop may access Honcho."
+        )
+
+    def test_myah_gateway_aux_endpoint_has_no_honcho_dependencies(self):
+        """The _handle_aux_endpoint body in myah.py must not reference Honcho.
+
+        The Myah HTTP /myah/v1/aux/{task} endpoint delegates to
+        auxiliary_client.call_llm — it must not inject any Honcho context.
+        Other parts of myah.py that set up Honcho for the main agent are fine.
+        """
+        import re
+        import gateway.platforms.myah
+        import inspect
+
+        source = inspect.getsource(gateway.platforms.myah)
+        # Locate _handle_aux_endpoint function body up to the next top-level
+        # definition or end of source.
+        m = re.search(
+            r"def\s+_handle_aux_endpoint.*?(?=\n(?:async\s+)?def\s|\nclass\s|\Z)",
+            source,
+            re.DOTALL,
+        )
+        assert m, "Could not locate _handle_aux_endpoint body in gateway.platforms.myah"
+        aux_body = m.group(0)
+
+        forbidden = ["honcho", "memory_manager", "peer_card"]
+        found = [term for term in forbidden if term.lower() in aux_body.lower()]
+        assert not found, (
+            f"_handle_aux_endpoint body must not reference Honcho. Found: {found}. "
+            "The aux HTTP endpoint must be a pure LLM call with no memory context."
+        )
