@@ -1466,6 +1466,36 @@ def _make_provider_session(provider_id: str, flow: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── Myah: per-model capability passthrough ───────────────────────────────────
+
+def _build_model_entry(provider: str, model_id: str) -> dict:
+    """Return a catalog entry dict for a single model, enriched with capabilities if available.
+
+    Capabilities are omitted (key absent) when the lookup returns None or raises — the
+    catalog must never fail entirely because one model capability lookup failed.
+    """
+    from agent.models_dev import get_model_capabilities
+
+    entry: dict = {'id': model_id, 'name': model_id}
+    try:
+        caps = get_model_capabilities(provider, model_id)
+        if caps is not None:
+            entry['capabilities'] = {
+                'supports_tools': caps.supports_tools,
+                'supports_vision': caps.supports_vision,
+                'supports_reasoning': caps.supports_reasoning,
+                'context_window': caps.context_window,
+                'max_output_tokens': caps.max_output_tokens,
+                'model_family': caps.model_family,
+            }
+    except Exception as exc:
+        logger.warning(f'Failed to fetch capabilities for {provider}/{model_id}: {exc}')
+
+    return entry
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # ── Myah: provider gateway endpoints ────────────────────────────────────────
 
 async def _build_catalog() -> dict:
@@ -1493,7 +1523,7 @@ async def _build_catalog() -> dict:
             "env_var": (cfg.api_key_env_vars[0]
                         if cfg and cfg.api_key_env_vars else None),
             "inference_base_url": cfg.inference_base_url if cfg else "",
-            "curated_models": list(_PROVIDER_MODELS.get(slug, [])),
+            "curated_models": [_build_model_entry(slug, m) for m in _PROVIDER_MODELS.get(slug, [])],
             "v1_visible": False,
             "write_type": "env_var",
         }
