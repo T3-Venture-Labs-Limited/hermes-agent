@@ -135,7 +135,7 @@ async def test_connect_credential_validation_failure_returns_400():
     )
     with patch(
         "gateway.platforms.myah_management._validate_api_key",
-        AsyncMock(return_value=False),
+        AsyncMock(return_value=(False, "auth denied by provider (HTTP 401)")),
     ):
         response = await handle_connect_credential(req)
     assert response.status == 400
@@ -311,3 +311,188 @@ async def test_catalog_exposes_env_var_for_every_api_key_provider():
         "Platform can't inject credentials for these providers — chat "
         "will fail with 'API key missing' on first message."
     )
+
+
+# ── Appendix Task E: _validate_api_key transient-failure tests ───────────────
+# Pins the transient-failure handling added in the Myah marker block above.
+# Only 401/403 should reject; all other conditions accept optimistically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CATALOG_ENTRY_WITH_VALIDATION = {
+    "validation": {
+        "url": "https://api.example.com/validate",
+        "method": "GET",
+        "auth": "bearer",
+    }
+}
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_accepts_2xx():
+    """200 response accepts the key."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "test-key")
+    assert accepted is True
+    assert "validated" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_rejects_401():
+    """HTTP 401 rejects the key as a genuine auth failure."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_resp = MagicMock()
+    mock_resp.status = 401
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "bad-key")
+    assert accepted is False
+    assert "auth denied" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_rejects_403():
+    """HTTP 403 rejects the key as a genuine auth failure."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_resp = MagicMock()
+    mock_resp.status = 403
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "bad-key")
+    assert accepted is False
+    assert "auth denied" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_optimistic_on_429():
+    """HTTP 429 (rate-limit) accepts optimistically — not an auth failure."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_resp = MagicMock()
+    mock_resp.status = 429
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "valid-key")
+    assert accepted is True
+    assert "optimistic" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_optimistic_on_500():
+    """HTTP 500 (server error) accepts optimistically."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_resp = MagicMock()
+    mock_resp.status = 500
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "valid-key")
+    assert accepted is True
+    assert "optimistic" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_optimistic_on_timeout():
+    """asyncio.TimeoutError accepts optimistically."""
+    import asyncio
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_session = MagicMock()
+    mock_session.request.side_effect = asyncio.TimeoutError()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "valid-key")
+    assert accepted is True
+    assert "timeout" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_optimistic_on_network_error():
+    """Generic network exception accepts optimistically."""
+    from gateway.platforms.myah_management import _validate_api_key
+    mock_session = MagicMock()
+    mock_session.request.side_effect = Exception("DNS resolution failed")
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    with patch("gateway.platforms.myah_management._aiohttp.ClientSession",
+               return_value=mock_session):
+        accepted, reason = await _validate_api_key(_CATALOG_ENTRY_WITH_VALIDATION, "valid-key")
+    assert accepted is True
+    assert "optimistic" in reason
+    assert "error" in reason
+
+
+@pytest.mark.asyncio
+async def test_connect_credential_returns_400_on_auth_denied():
+    """Full handler: mock validation returning auth denied yields 400 with reason."""
+    from gateway.platforms.myah_management import handle_connect_credential
+    req = _make_request(
+        method="POST",
+        json_body={"api_key": "invalid-key"},
+        match_info={"provider_id": "openrouter"},
+    )
+    with patch(
+        "gateway.platforms.myah_management._validate_api_key",
+        AsyncMock(return_value=(False, "auth denied by provider (HTTP 401)")),
+    ):
+        response = await handle_connect_credential(req)
+    assert response.status == 400
+    body = json.loads(response.body)
+    assert "auth denied" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_connect_credential_succeeds_on_optimistic_accept(tmp_path, monkeypatch):
+    """Full handler: optimistic accept still persists the credential."""
+    from gateway.platforms.myah_management import handle_connect_credential
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    req = _make_request(
+        method="POST",
+        json_body={"api_key": "valid-key"},
+        match_info={"provider_id": "openrouter"},
+    )
+    with patch(
+        "gateway.platforms.myah_management._validate_api_key",
+        AsyncMock(return_value=(True, "optimistic accept (validation timeout)")),
+    ), patch(
+        "hermes_cli.config.save_env_value",
+    ) as mock_save, patch(
+        "agent.credential_pool.load_pool",
+        return_value=MagicMock(entries=[], save=MagicMock()),
+    ):
+        response = await handle_connect_credential(req)
+    # Should not return 400 — key was persisted despite optimistic accept
+    assert response.status != 400
