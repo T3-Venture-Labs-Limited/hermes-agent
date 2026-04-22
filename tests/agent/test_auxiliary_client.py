@@ -1050,3 +1050,69 @@ class TestReadMainProvider:
         with patch("hermes_cli.config.load_config", return_value={}):
             result = _read_main_provider()
         assert result == ""
+
+
+# ── Task 3: Edge-case tests ───────────────────────────────────────────────────
+# Additional corner-case coverage for _read_main_provider after the fix lands.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReadMainProviderEdgeCases:
+    """Edge-case and regression tests for _read_main_provider()."""
+
+    def test_read_main_provider_vendor_prefix_uses_detect_as_ground_truth(self):
+        """Vendor-prefixed slug uses detect_provider_for_model as ground truth.
+
+        Test is intentionally resilient to upstream catalog changes: it calls
+        detect_provider_for_model itself to get the expected value rather than
+        hard-coding it, so the test keeps passing even if catalog entries shift.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        from hermes_cli.models import detect_provider_for_model
+        model = "google/gemini-3-flash-preview"
+        expected_result = detect_provider_for_model(model, "")
+        # The fast path hits: 'google' is NOT a known provider key, so falls
+        # through to detect_provider_for_model which returns ('openrouter', ...).
+        with patch("hermes_cli.config.load_config", return_value={"model": model}):
+            result = _read_main_provider()
+        if expected_result is not None:
+            assert result == expected_result[0].strip().lower()
+        else:
+            assert result == ""
+
+    def test_read_main_provider_dict_with_no_provider_key_returns_empty(self):
+        """Dict-form model: with no provider key returns '' (intentionally unchanged).
+
+        A dict {default: "..."} with no explicit 'provider' key is not extended
+        by this fix — that's a separate bug surface. This test documents the
+        intentional scope limit so future refactors are aware.
+        """
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": {"default": "anthropic/claude-haiku-4-5-20251001"}}):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_swallows_load_config_exception(self):
+        """load_config raising must not propagate — returns '' safely."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("disk error")):
+            result = _read_main_provider()
+        assert result == ""
+
+    def test_read_main_provider_known_prefix_matches_provider(self):
+        """'anthropic/...' string form takes the fast-path and returns 'anthropic'."""
+        from agent.auxiliary_client import _read_main_provider
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "anthropic/claude-sonnet-4-6"}):
+            result = _read_main_provider()
+        assert result == "anthropic"
+
+    def test_read_main_provider_unknown_prefix_falls_through_to_detect(self):
+        """Unknown vendor prefix falls through to detect_provider_for_model."""
+        from agent.auxiliary_client import _read_main_provider
+        # 'totally-unknown-provider/some-model' — prefix not in _PROVIDER_MODELS,
+        # detect_provider_for_model also can't match it → returns ''.
+        with patch("hermes_cli.config.load_config",
+                   return_value={"model": "totally-unknown-provider/some-model"}):
+            result = _read_main_provider()
+        assert result == ""
