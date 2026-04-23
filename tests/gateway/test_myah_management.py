@@ -310,3 +310,165 @@ class TestMcpEndpoints:
             names = {s['name'] for s in data}
             assert 'test-server' in names
             assert 'local-tool' in names
+
+
+# ── _build_catalog capability metadata ──────────────────────────────────────
+
+class TestBuildCatalogCapabilities:
+    """Tests for the curated_models shape change: list[str] → list[dict]."""
+
+    def _make_mock_entry(self, slug='test-provider', label='Test', tui_desc='Desc'):
+        entry = MagicMock()
+        entry.slug = slug
+        entry.label = label
+        entry.tui_desc = tui_desc
+        return entry
+
+    def _patch_catalog_deps(self, slug='test-provider', models=None, caps_return=None, caps_raise=None):
+        """Return a context-manager stack that mocks all _build_catalog dependencies."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+
+        mock_entry = self._make_mock_entry(slug=slug)
+        mock_cfg = MagicMock()
+        mock_cfg.auth_type = 'api_key'
+        mock_cfg.api_key_env_vars = ['TEST_KEY']
+        mock_cfg.inference_base_url = 'https://test.example.com'
+
+        model_list = models if models is not None else ['test/model-a']
+
+        stack.enter_context(patch(
+            'gateway.platforms.myah_management._build_catalog.__globals__',
+            side_effect=None  # placeholder — we patch the deferred imports instead
+        )) if False else None  # unused — we patch the imported names directly
+
+        # Patch deferred imports inside _build_catalog
+        stack.enter_context(patch('hermes_cli.models.CANONICAL_PROVIDERS', [mock_entry]))
+        stack.enter_context(patch('hermes_cli.models._PROVIDER_MODELS', {slug: model_list}))
+        stack.enter_context(patch('hermes_cli.auth.PROVIDER_REGISTRY', {slug: mock_cfg}))
+        stack.enter_context(patch('hermes_cli.providers.HERMES_OVERLAYS', {}))
+        stack.enter_context(patch('hermes_cli.providers.normalize_provider', side_effect=lambda x: x))
+        stack.enter_context(patch('hermes_cli.myah_overrides.MYAH_OVERRIDES', {}))
+
+        if caps_raise is not None:
+            mock_caps = MagicMock(side_effect=caps_raise)
+        elif caps_return is not None:
+            mock_caps = MagicMock(return_value=caps_return)
+        else:
+            mock_caps = MagicMock(return_value=None)
+
+        stack.enter_context(patch('agent.models_dev.get_model_capabilities', mock_caps))
+
+        return stack, mock_caps
+
+    @pytest.mark.asyncio
+    async def test_build_catalog_models_are_structured_objects(self):
+        """curated_models entries must be dicts with id and name keys, not bare strings."""
+        from gateway.platforms.myah_management import _build_catalog
+
+        slug = 'openai'
+        model_ids = ['openai/gpt-4o', 'openai/gpt-3.5-turbo']
+        stack, _ = self._patch_catalog_deps(slug=slug, models=model_ids)
+
+        with stack:
+            catalog = await _build_catalog()
+
+        assert slug in catalog
+        curated = catalog[slug]['curated_models']
+        assert len(curated) == 2
+        for entry in curated:
+            assert isinstance(entry, dict), f"Expected dict, got {type(entry)}: {entry!r}"
+            assert 'id' in entry, f"Missing 'id' key in {entry!r}"
+            assert 'name' in entry, f"Missing 'name' key in {entry!r}"
+
+    @pytest.mark.asyncio
+    async def test_build_catalog_includes_capabilities_when_available(self):
+        """When get_model_capabilities returns data, capabilities dict must be present."""
+        from gateway.platforms.myah_management import _build_catalog
+        from agent.models_dev import ModelCapabilities
+
+        slug = 'anthropic'
+        model_id = 'anthropic/claude-opus-4.7'
+        caps = ModelCapabilities(
+            supports_vision=True,
+            supports_tools=True,
+            supports_reasoning=False,
+            context_window=1_000_000,
+            max_output_tokens=8192,
+            model_family='claude',
+        )
+        stack, _ = self._patch_catalog_deps(slug=slug, models=[model_id], caps_return=caps)
+
+        with stack:
+            catalog = await _build_catalog()
+
+        curated = catalog[slug]['curated_models']
+        assert len(curated) == 1
+        entry = curated[0]
+        assert entry['id'] == model_id
+        assert 'capabilities' in entry, "capabilities key must be present when lookup succeeds"
+        c = entry['capabilities']
+        assert c['supports_vision'] is True
+        assert c['supports_tools'] is True
+        assert c['supports_reasoning'] is False
+        assert c['context_window'] == 1_000_000
+        assert c['max_output_tokens'] == 8192
+        assert c['model_family'] == 'claude'
+        assert set(c.keys()) == {
+            'supports_tools', 'supports_vision', 'supports_reasoning',
+            'context_window', 'max_output_tokens', 'model_family',
+        }
+
+    @pytest.mark.asyncio
+    async def test_build_catalog_omits_capabilities_on_lookup_failure(self):
+        """When get_model_capabilities returns None, capabilities key must be absent."""
+        from gateway.platforms.myah_management import _build_catalog
+
+        slug = 'google'
+        model_id = 'google/gemini-2.5-pro'
+        # caps_return=None is the default in _patch_catalog_deps
+        stack, _ = self._patch_catalog_deps(slug=slug, models=[model_id], caps_return=None)
+
+        with stack:
+            catalog = await _build_catalog()
+
+        curated = catalog[slug]['curated_models']
+        assert len(curated) == 1
+        entry = curated[0]
+        assert entry['id'] == model_id
+        assert entry['name'] == model_id
+        assert 'capabilities' not in entry, (
+            f"'capabilities' key must be absent when lookup returns None, got: {entry!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_catalog_handles_get_model_capabilities_exception(self):
+        """Exception in get_model_capabilities must not crash the catalog build."""
+        import logging
+        from gateway.platforms.myah_management import _build_catalog
+
+        slug = 'mistral'
+        model_id = 'mistral/mistral-large'
+        stack, _ = self._patch_catalog_deps(
+            slug=slug,
+            models=[model_id],
+            caps_raise=RuntimeError('models.dev unreachable'),
+        )
+
+        with stack:
+            with patch('gateway.platforms.myah_management.logger') as mock_logger:
+                catalog = await _build_catalog()
+
+        # Catalog must still return successfully
+        assert slug in catalog
+        curated = catalog[slug]['curated_models']
+        assert len(curated) == 1
+        entry = curated[0]
+
+        # No entry should have capabilities when all lookups raised
+        assert 'capabilities' not in entry, (
+            f"'capabilities' must be absent after exception, got: {entry!r}"
+        )
+
+        # A warning must have been logged
+        mock_logger.warning.assert_called()

@@ -204,6 +204,81 @@ async def handle_patch_config(request: web.Request) -> web.Response:
     return web.json_response({'ok': True, 'config': cfg})
 
 
+async def handle_get_aux_resolved(request: web.Request) -> web.Response:
+    """GET /myah/api/config/aux-resolved — Report the effective resolved provider/model per aux task.
+
+    For each aux task in DEFAULT_CONFIG.auxiliary, run the same resolution chain
+    Hermes uses at aux call time (_resolve_task_provider_model + _resolve_auto)
+    and report back:
+        {task_name: {provider: str, model: str|None, source: str}}
+
+    source is one of:
+        - 'config'         : auxiliary.{task} explicitly sets provider (and usually model)
+        - 'config-base-url': auxiliary.{task}.base_url is set (forces 'custom' provider)
+        - 'auto-main'      : provider="auto" or unset, falls through to main model
+        - 'auto-chain'     : auto-detection chain (main not available)
+        - 'unresolved'     : resolver couldn't determine anything
+
+    This lets the frontend show users the *exact* model each task will use, instead
+    of the ambiguous 'auto' placeholder.
+    """
+    try:
+        from hermes_cli.config import DEFAULT_CONFIG, load_config
+        from agent.auxiliary_client import _resolve_task_provider_model
+
+        config = load_config() or {}
+        aux_tasks = list((DEFAULT_CONFIG.get('auxiliary') or {}).keys())
+
+        # Main model for 'auto-main' resolution (Step 1 of _resolve_auto)
+        main_model_cfg = config.get('model', '')
+        if isinstance(main_model_cfg, dict):
+            main_provider = str(main_model_cfg.get('provider', '') or '').strip()
+            main_model = str(main_model_cfg.get('name', '') or main_model_cfg.get('default', '') or '').strip()
+        else:
+            main_model = str(main_model_cfg or '').strip()
+            # Infer provider from the 'provider/model-id' string form if possible
+            main_provider = main_model.split('/')[0] if '/' in main_model else ''
+
+        out: dict = {}
+        for task in aux_tasks:
+            try:
+                provider, model, base_url, _api_key, _api_mode = _resolve_task_provider_model(task=task)
+            except Exception as exc:  # defensive — never fail the whole endpoint
+                logger.warning(f'aux-resolved: _resolve_task_provider_model({task!r}) raised {exc}')
+                out[task] = {'provider': '', 'model': None, 'source': 'unresolved'}
+                continue
+
+            if base_url:
+                source = 'config-base-url'
+                resolved_provider = provider  # "custom"
+                resolved_model = model
+            elif provider == 'auto' or provider == '':
+                # _resolve_auto Step 1: use main model if available
+                if main_provider and main_model:
+                    source = 'auto-main'
+                    resolved_provider = main_provider
+                    resolved_model = main_model
+                else:
+                    source = 'auto-chain'
+                    resolved_provider = provider or 'auto'
+                    resolved_model = model  # may be None
+            else:
+                source = 'config'
+                resolved_provider = provider
+                resolved_model = model
+
+            out[task] = {
+                'provider': resolved_provider,
+                'model': resolved_model,
+                'source': source,
+            }
+
+        return web.json_response(out)
+    except Exception as exc:
+        logger.error(f'handle_get_aux_resolved failed: {exc}')
+        return web.json_response({'error': str(exc)}, status=500)
+
+
 async def handle_get_model(request: web.Request) -> web.Response:
     """GET /myah/api/config/model — Read the current model from config."""
     config_path = _hermes_home() / 'config.yaml'
@@ -1466,6 +1541,36 @@ def _make_provider_session(provider_id: str, flow: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── Myah: per-model capability passthrough ─────────────────────────────────────
+
+def _build_model_entry(provider: str, model_id: str) -> dict:
+    """Return a catalog entry dict for a single model, enriched with capabilities if available.
+
+    Capabilities are omitted (key absent) when the lookup returns None or raises — the
+    catalog must never fail entirely because one model capability lookup failed.
+    """
+    from agent.models_dev import get_model_capabilities
+
+    entry: dict = {'id': model_id, 'name': model_id}
+    try:
+        caps = get_model_capabilities(provider, model_id)
+        if caps is not None:
+            entry['capabilities'] = {
+                'supports_tools': caps.supports_tools,
+                'supports_vision': caps.supports_vision,
+                'supports_reasoning': caps.supports_reasoning,
+                'context_window': caps.context_window,
+                'max_output_tokens': caps.max_output_tokens,
+                'model_family': caps.model_family,
+            }
+    except Exception as exc:
+        logger.warning(f'Failed to fetch capabilities for {provider}/{model_id}: {exc}')
+
+    return entry
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # ── Myah: provider gateway endpoints ────────────────────────────────────────
 
 async def _build_catalog() -> dict:
@@ -1493,7 +1598,7 @@ async def _build_catalog() -> dict:
             "env_var": (cfg.api_key_env_vars[0]
                         if cfg and cfg.api_key_env_vars else None),
             "inference_base_url": cfg.inference_base_url if cfg else "",
-            "curated_models": list(_PROVIDER_MODELS.get(slug, [])),
+            "curated_models": [_build_model_entry(slug, m) for m in _PROVIDER_MODELS.get(slug, [])],
             "v1_visible": False,
             "write_type": "env_var",
         }
@@ -1878,6 +1983,7 @@ def register_management_routes(app: web.Application, auth_key: str = "") -> None
     app.router.add_get('/myah/api/config/schema', _a(handle_get_schema))
     app.router.add_post('/myah/api/config/reset/{section}', _a(handle_reset_section))
     app.router.add_get('/myah/api/config/last-reseed', _a(handle_get_last_reseed))
+    app.router.add_get('/myah/api/config/aux-resolved', _a(handle_get_aux_resolved))
     # ─────────────────────────────────────────────────────────────────────
 
     # Toolsets
