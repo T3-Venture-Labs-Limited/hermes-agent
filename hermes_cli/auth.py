@@ -20,7 +20,9 @@ import logging
 import os
 import shutil
 import shlex
+import ssl
 import stat
+import sys
 import base64
 import hashlib
 import subprocess
@@ -71,6 +73,8 @@ DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
+STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
+STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -151,7 +155,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="gemini",
         name="Google AI Studio",
         auth_type="api_key",
-        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
         base_url_env_var="GEMINI_BASE_URL",
     ),
@@ -167,8 +171,11 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="kimi-coding",
         name="Kimi / Moonshot",
         auth_type="api_key",
+        # Legacy platform.moonshot.ai keys use this endpoint (OpenAI-compat).
+        # sk-kimi- (Kimi Code) keys are auto-redirected to api.kimi.com/coding
+        # by _resolve_kimi_base_url() below.
         inference_base_url="https://api.moonshot.ai/v1",
-        api_key_env_vars=("KIMI_API_KEY",),
+        api_key_env_vars=("KIMI_API_KEY", "KIMI_CODING_API_KEY"),
         base_url_env_var="KIMI_BASE_URL",
     ),
     "kimi-coding-cn": ProviderConfig(
@@ -177,6 +184,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="api_key",
         inference_base_url="https://api.moonshot.cn/v1",
         api_key_env_vars=("KIMI_CN_API_KEY",),
+    ),
+    "stepfun": ProviderConfig(
+        id="stepfun",
+        name="StepFun Step Plan",
+        auth_type="api_key",
+        inference_base_url=STEPFUN_STEP_PLAN_INTL_BASE_URL,
+        api_key_env_vars=("STEPFUN_API_KEY",),
+        base_url_env_var="STEPFUN_BASE_URL",
     ),
     "arcee": ProviderConfig(
         id="arcee",
@@ -200,6 +215,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="api_key",
         inference_base_url="https://api.anthropic.com",
         api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+        base_url_env_var="ANTHROPIC_BASE_URL",
     ),
     "alibaba": ProviderConfig(
         id="alibaba",
@@ -208,6 +224,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         api_key_env_vars=("DASHSCOPE_API_KEY",),
         base_url_env_var="DASHSCOPE_BASE_URL",
+    ),
+    "alibaba-coding-plan": ProviderConfig(
+        id="alibaba-coding-plan",
+        name="Alibaba Cloud (Coding Plan)",
+        auth_type="api_key",
+        inference_base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+        api_key_env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"),
+        base_url_env_var="ALIBABA_CODING_PLAN_BASE_URL",
     ),
     "minimax-cn": ProviderConfig(
         id="minimax-cn",
@@ -339,10 +363,16 @@ def get_anthropic_key() -> str:
 # =============================================================================
 
 # Kimi Code (kimi.com/code) issues keys prefixed "sk-kimi-" that only work
-# on api.kimi.com/coding/v1.  Legacy keys from platform.moonshot.ai work on
-# api.moonshot.ai/v1 (the default).  Auto-detect when user hasn't set
+# on api.kimi.com/coding.  Legacy keys from platform.moonshot.ai work on
+# api.moonshot.ai/v1 (the old default).  Auto-detect when user hasn't set
 # KIMI_BASE_URL explicitly.
-KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+#
+# Note: the base URL intentionally has NO /v1 suffix.  The /coding endpoint
+# speaks the Anthropic Messages protocol, and the anthropic SDK appends
+# "/v1/messages" internally — so "/coding" + SDK suffix → "/coding/v1/messages"
+# (the correct target). Using "/coding/v1" here would produce
+# "/coding/v1/v1/messages" (a 404).
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding"
 
 
 def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
@@ -353,6 +383,9 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     """
     if env_override:
         return env_override
+    # No key → nothing to infer from.  Return default without inspecting.
+    if not api_key:
+        return default_url
     if api_key.startswith("sk-kimi-"):
         return KIMI_CODE_BASE_URL
     return default_url
@@ -480,6 +513,14 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
     if env_override:
         return env_override
 
+    # No API key set → don't probe (would fire N×M HTTPS requests with an
+    # empty Bearer token, all returning 401).  This path is hit during
+    # auxiliary-client auto-detection when the user has no Z.AI credentials
+    # at all — the caller discards the result immediately, so the probe is
+    # pure latency for every AIAgent construction.
+    if not api_key:
+        return default_url
+
     # Check provider-state cache for a previously-detected endpoint.
     auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "zai") or {}
@@ -587,7 +628,25 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # =============================================================================
 
 def _auth_file_path() -> Path:
-    return get_hermes_home() / "auth.json"
+    path = get_hermes_home() / "auth.json"
+    # Seat belt: if pytest is running and HERMES_HOME resolves to the real
+    # user's auth store, refuse rather than silently corrupt it. This catches
+    # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
+    # hermetic conftest, or sandbox escapes via threads/subprocesses. In
+    # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+        if resolved == real_home_auth:
+            raise RuntimeError(
+                f"Refusing to touch real user auth store during test run: {path}. "
+                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+                "via scripts/run_tests.sh for hermetic CI-parity env."
+            )
+    return path
 
 
 def _auth_lock_path() -> Path:
@@ -896,10 +955,12 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
             del pool[target]
             cleared = True
 
-        if not cleared:
-            return False
         if auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
+            cleared = True
+
+        if not cleared:
+            return False
         _save_auth_store(auth_store)
     return True
 
@@ -971,8 +1032,11 @@ def resolve_provider(
         "x-ai": "xai", "x.ai": "xai", "grok": "xai",
         "kimi": "kimi-coding", "kimi-for-coding": "kimi-coding", "moonshot": "kimi-coding",
         "kimi-cn": "kimi-coding-cn", "moonshot-cn": "kimi-coding-cn",
+        "step": "stepfun", "stepfun-coding-plan": "stepfun",
         "arcee-ai": "arcee", "arceeai": "arcee",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+        "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
+        "alibaba_coding_plan": "alibaba-coding-plan",
         "claude": "anthropic", "claude-code": "anthropic",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
@@ -1483,12 +1547,21 @@ def refresh_codex_oauth_pure(
         try:
             err = response.json()
             if isinstance(err, dict):
-                err_code = err.get("error")
-                if isinstance(err_code, str) and err_code.strip():
-                    code = err_code.strip()
-                err_desc = err.get("error_description") or err.get("message")
-                if isinstance(err_desc, str) and err_desc.strip():
-                    message = f"Codex token refresh failed: {err_desc.strip()}"
+                err_obj = err.get("error")
+                # OpenAI shape: {"error": {"code": "...", "message": "...", "type": "..."}}
+                if isinstance(err_obj, dict):
+                    nested_code = err_obj.get("code") or err_obj.get("type")
+                    if isinstance(nested_code, str) and nested_code.strip():
+                        code = nested_code.strip()
+                    nested_msg = err_obj.get("message")
+                    if isinstance(nested_msg, str) and nested_msg.strip():
+                        message = f"Codex token refresh failed: {nested_msg.strip()}"
+                # OAuth spec shape: {"error": "code_str", "error_description": "..."}
+                elif isinstance(err_obj, str) and err_obj.strip():
+                    code = err_obj.strip()
+                    err_desc = err.get("error_description") or err.get("message")
+                    if isinstance(err_desc, str) and err_desc.strip():
+                        message = f"Codex token refresh failed: {err_desc.strip()}"
         except Exception:
             pass
         if code in {"invalid_grant", "invalid_token", "invalid_request"}:
@@ -1647,12 +1720,30 @@ def resolve_codex_runtime_credentials(
 # TLS verification helper
 # =============================================================================
 
+def _default_verify() -> bool | ssl.SSLContext:
+    """Platform-aware default SSL verify for httpx clients.
+
+    On macOS with Homebrew Python, the system OpenSSL cannot locate the
+    system trust store and valid public certs fail verification. When
+    certifi is importable we pin its bundle explicitly; elsewhere we
+    defer to httpx's built-in default (certifi via its own dependency).
+    Mirrors the weixin fix in 3a0ec1d93.
+    """
+    if sys.platform == "darwin":
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            pass
+    return True
+
+
 def _resolve_verify(
     *,
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     auth_state: Optional[Dict[str, Any]] = None,
-) -> bool | str:
+) -> bool | ssl.SSLContext:
     tls_state = auth_state.get("tls") if isinstance(auth_state, dict) else {}
     tls_state = tls_state if isinstance(tls_state, dict) else {}
 
@@ -1665,6 +1756,7 @@ def _resolve_verify(
         or tls_state.get("ca_bundle")
         or os.getenv("HERMES_CA_BUNDLE")
         or os.getenv("SSL_CERT_FILE")
+        or os.getenv("REQUESTS_CA_BUNDLE")
     )
 
     if effective_insecure:
@@ -1672,14 +1764,13 @@ def _resolve_verify(
     if effective_ca:
         ca_path = str(effective_ca)
         if not os.path.isfile(ca_path):
-            import logging
-            logging.getLogger("hermes.auth").warning(
+            logger.warning(
                 "CA bundle path does not exist: %s — falling back to default certificates",
                 ca_path,
             )
-            return True
-        return ca_path
-    return True
+            return _default_verify()
+        return ssl.create_default_context(cafile=ca_path)
+    return _default_verify()
 
 
 # =============================================================================
@@ -2721,6 +2812,17 @@ def _update_config_for_provider(
         # Clear stale base_url to prevent contamination when switching providers
         model_cfg.pop("base_url", None)
 
+    # Clear stale api_key/api_mode left over from a previous custom provider.
+    # When the user switches from e.g. a MiniMax custom endpoint
+    # (api_mode=anthropic_messages, api_key=mxp-...) to a built-in provider
+    # (e.g. OpenRouter), the stale api_key/api_mode would override the new
+    # provider's credentials and transport choice.  Built-in providers that
+    # need a specific api_mode (copilot, xai) set it at request-resolution
+    # time via `_copilot_runtime_api_mode` / `_detect_api_mode_for_url`, so
+    # removing the persisted value here is safe.
+    model_cfg.pop("api_key", None)
+    model_cfg.pop("api_mode", None)
+
     # When switching to a non-OpenRouter provider, ensure model.default is
     # valid for the new provider.  An OpenRouter-formatted name like
     # "anthropic/claude-opus-4.6" will fail on direct-API providers.
@@ -2733,6 +2835,46 @@ def _update_config_for_provider(
 
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     return config_path
+
+
+def _get_config_provider() -> Optional[str]:
+    """Return model.provider from config.yaml, normalized, if present."""
+    try:
+        config = read_raw_config()
+    except Exception:
+        return None
+    if not config:
+        return None
+    model = config.get("model")
+    if not isinstance(model, dict):
+        return None
+    provider = model.get("provider")
+    if not isinstance(provider, str):
+        return None
+    provider = provider.strip().lower()
+    return provider or None
+
+
+def _config_provider_matches(provider_id: Optional[str]) -> bool:
+    """Return True when config.yaml currently selects *provider_id*."""
+    if not provider_id:
+        return False
+    return _get_config_provider() == provider_id.strip().lower()
+
+
+def _logout_default_provider_from_config() -> Optional[str]:
+    """Fallback logout target when auth.json has no active provider.
+
+    `hermes logout` historically keyed off auth.json.active_provider only.
+    That left users stuck when auth state had already been cleared but
+    config.yaml still selected an OAuth provider such as openai-codex for the
+    agent model: there was no active auth provider to target, so logout printed
+    "No provider is currently logged in" and never reset model.provider.
+    """
+    provider = _get_config_provider()
+    if provider in {"nous", "openai-codex"}:
+        return provider
+    return None
 
 
 def _reset_config_provider() -> Path:
@@ -2955,52 +3097,61 @@ def login_command(args) -> None:
     raise SystemExit(0)
 
 
-def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
+def _login_openai_codex(
+    args,
+    pconfig: ProviderConfig,
+    *,
+    force_new_login: bool = False,
+) -> None:
     """OpenAI Codex login via device code flow. Tokens stored in ~/.hermes/auth.json."""
 
+    del args, pconfig  # kept for parity with other provider login helpers
+
     # Check for existing Hermes-owned credentials
-    try:
-        existing = resolve_codex_runtime_credentials()
-        # Verify the resolved token is actually usable (not expired).
-        # resolve_codex_runtime_credentials attempts refresh, so if we get
-        # here the token should be valid — but double-check before telling
-        # the user "Login successful!".
-        _resolved_key = existing.get("api_key", "")
-        if isinstance(_resolved_key, str) and _resolved_key and not _codex_access_token_is_expiring(_resolved_key, 60):
-            print("Existing Codex credentials found in Hermes auth store.")
-            try:
-                reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                reuse = "y"
-            if reuse in ("", "y", "yes"):
-                config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
-                print()
-                print("Login successful!")
-                print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-                return
-        else:
-            print("Existing Codex credentials are expired. Starting fresh login...")
-    except AuthError:
-        pass
+    if not force_new_login:
+        try:
+            existing = resolve_codex_runtime_credentials()
+            # Verify the resolved token is actually usable (not expired).
+            # resolve_codex_runtime_credentials attempts refresh, so if we get
+            # here the token should be valid — but double-check before telling
+            # the user "Login successful!".
+            _resolved_key = existing.get("api_key", "")
+            if isinstance(_resolved_key, str) and _resolved_key and not _codex_access_token_is_expiring(_resolved_key, 60):
+                print("Existing Codex credentials found in Hermes auth store.")
+                try:
+                    reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    reuse = "y"
+                if reuse in ("", "y", "yes"):
+                    config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
+                    print()
+                    print("Login successful!")
+                    print(f"  Config updated: {config_path} (model.provider=openai-codex)")
+                    return
+            else:
+                print("Existing Codex credentials are expired. Starting fresh login...")
+        except AuthError:
+            pass
 
     # Check for existing Codex CLI tokens we can import
-    cli_tokens = _import_codex_cli_tokens()
-    if cli_tokens:
-        print("Found existing Codex CLI credentials at ~/.codex/auth.json")
-        print("Hermes will create its own session to avoid conflicts with Codex CLI / VS Code.")
-        try:
-            do_import = input("Import these credentials? (a separate login is recommended) [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            do_import = "n"
-        if do_import in ("y", "yes"):
-            _save_codex_tokens(cli_tokens)
-            base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
-            config_path = _update_config_for_provider("openai-codex", base_url)
-            print()
-            print("Credentials imported. Note: if Codex CLI refreshes its token,")
-            print("Hermes will keep working independently with its own session.")
-            print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-            return
+    if not force_new_login:
+        cli_tokens = _import_codex_cli_tokens()
+        if cli_tokens:
+            print("Found existing Codex CLI credentials at ~/.codex/auth.json")
+            print("Hermes will create its own session to avoid conflicts with Codex CLI / VS Code.")
+            try:
+                do_import = input("Import these credentials? (a separate login is recommended) [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                do_import = "n"
+            if do_import in ("y", "yes"):
+                _save_codex_tokens(cli_tokens)
+                base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
+                config_path = _update_config_for_provider("openai-codex", base_url)
+                print()
+                print("Credentials imported. Note: if Codex CLI refreshes its token,")
+                print("Hermes will keep working independently with its own session.")
+                print(f"  Config updated: {config_path} (model.provider=openai-codex)")
+                return
 
     # Run a fresh device code flow — Hermes gets its own OAuth session
     print()
@@ -3353,7 +3504,7 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 )
 
             from hermes_cli.models import (
-                _PROVIDER_MODELS, get_pricing_for_provider, filter_nous_free_models,
+                _PROVIDER_MODELS, get_pricing_for_provider,
                 check_nous_free_tier, partition_nous_models_by_tier,
             )
             model_ids = _PROVIDER_MODELS.get("nous", [])
@@ -3362,7 +3513,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
             unavailable_models: list = []
             if model_ids:
                 pricing = get_pricing_for_provider("nous")
-                model_ids = filter_nous_free_models(model_ids, pricing)
                 free_tier = check_nous_free_tier()
                 if free_tier:
                     model_ids, unavailable_models = partition_nous_models_by_tier(
@@ -3434,15 +3584,16 @@ def logout_command(args) -> None:
         raise SystemExit(1)
 
     active = get_active_provider()
-    target = provider_id or active
+    target = provider_id or active or _logout_default_provider_from_config()
 
     if not target:
         print("No provider is currently logged in.")
         return
 
     provider_name = PROVIDER_REGISTRY[target].name if target in PROVIDER_REGISTRY else target
+    config_matches = _config_provider_matches(target)
 
-    if clear_provider_auth(target):
+    if clear_provider_auth(target) or config_matches:
         _reset_config_provider()
         print(f"Logged out of {provider_name}.")
         if os.getenv("OPENROUTER_API_KEY"):
