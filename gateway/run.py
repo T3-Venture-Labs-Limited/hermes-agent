@@ -29,7 +29,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, TypedDict
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
@@ -347,6 +347,21 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+
+
+# ── Myah: Public API session override type ──────────────────────────────────
+# Shape of GatewayRunner._session_model_overrides[key].  Mirrors the dict
+# constructed in _handle_model_command() (this file) and the Myah platform
+# adapters (gateway/platforms/myah*.py).  Exposed via get_session_override()
+# / set_session_override() so external integrations (Myah, future plugins)
+# do not need to reach into the private dict.
+class SessionOverride(TypedDict, total=False):
+    model: str
+    provider: str
+    api_key: str
+    base_url: str
+    api_mode: str
+# ────────────────────────────────────────────────────────────────────────────
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -8842,6 +8857,167 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    # ── Myah: Public API for platform integration ──────────────────────────
+    # Stable surface so external integrations (Myah platform adapters, future
+    # plugins) do not reach into private `_session_model_overrides`,
+    # `_agent_cache`, or `_running_agents` attributes.  Prevents production
+    # NameErrors when upstream Hermes refactors the underlying fields.
+    #
+    # All methods are non-blocking and safe to call from async or sync code.
+    # They rely on the same locks and dicts the private accessors do, so
+    # behavior is identical to the previous direct-attribute pattern.
+    def get_session_override(self, session_key: str) -> Optional[SessionOverride]:
+        """Return the active per-session model override, or None.
+
+        The returned dict has the same keys the override was written with
+        (model, provider, api_key, base_url, api_mode).  Callers must NOT
+        mutate it in place — use ``set_session_override`` to change.
+        """
+        overrides = getattr(self, "_session_model_overrides", None) or {}
+        return overrides.get(session_key)
+
+    def set_session_override(
+        self, session_key: str, override: SessionOverride
+    ) -> None:
+        """Replace the per-session override and evict the cached agent.
+
+        Eviction is unconditional: the next message for this session must
+        rebuild the AIAgent so the override fields (model/provider/api_key/
+        base_url/api_mode) take effect.  If a run is currently in flight for
+        this session, that run continues with the previous agent — the
+        override only applies to subsequent runs (matches the existing
+        ``_handle_model_command`` behaviour for the ``--session`` branch).
+        """
+        if getattr(self, "_session_model_overrides", None) is None:
+            self._session_model_overrides = {}
+        self._session_model_overrides[session_key] = dict(override)
+        # Eviction is best-effort — _evict_cached_agent already swallows
+        # cache-miss; we only catch unexpected lock errors so the override
+        # write is not undone by an eviction failure.
+        try:
+            self._evict_cached_agent(session_key)
+        except Exception:
+            logger.warning(
+                "[gateway] evict_session_agent failed for %s during set_session_override",
+                session_key,
+                exc_info=True,
+            )
+
+    def evict_session_agent(self, session_key: str) -> bool:
+        """Evict the cached AIAgent for ``session_key``.
+
+        Returns True if there was a cached entry (now removed), False if
+        nothing was cached.  Does NOT clear the session override — call
+        ``set_session_override`` or pop manually if the override should
+        also be reset.
+        """
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            return False
+        _lock = getattr(self, "_agent_cache_lock", None)
+        had_entry = False
+        if _lock:
+            with _lock:
+                had_entry = session_key in cache
+                cache.pop(session_key, None)
+        else:
+            had_entry = session_key in cache
+            cache.pop(session_key, None)
+        return had_entry
+
+    def is_session_running(self, session_key: str) -> bool:
+        """Return True if there is an in-flight run for ``session_key``.
+
+        Detects both fully-running agents and the ``_AGENT_PENDING_SENTINEL``
+        placeholder inserted at the start of a turn, matching the existing
+        ``session_key in self._running_agents`` guard pattern used elsewhere
+        in this file (e.g. ``_handle_status_command``).
+        """
+        running = getattr(self, "_running_agents", None) or {}
+        return session_key in running
+
+    def iter_running_session_keys(self) -> List[str]:
+        """Return a snapshot list of session_keys with in-flight runs.
+
+        Includes sessions in the pending-sentinel state.  Snapshot is
+        materialised eagerly so callers can iterate without contending on
+        the live dict.  Used by integrations that need to enumerate active
+        sessions (e.g. refusing a gateway restart while turns are running).
+        """
+        running = getattr(self, "_running_agents", None) or {}
+        return list(running.keys())
+
+    def iter_cached_session_keys(self) -> List[str]:
+        """Return a snapshot list of session_keys with cached agents.
+
+        Snapshot is taken under ``_agent_cache_lock`` so callers can safely
+        iterate without holding the lock.  Used by integrations that need
+        to evict the entire cache (e.g. MCP server reload, toolset change).
+        """
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            return []
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock:
+            with _lock:
+                return list(cache.keys())
+        return list(cache.keys())
+
+    def get_cached_agent(self, session_key: str) -> Optional[Any]:
+        """Return the cached AIAgent instance for ``session_key``, or None.
+
+        Intended for cleanup paths that need to call ``close()`` /
+        ``shutdown_memory_provider()`` on the agent before eviction.
+        Acquires ``_agent_cache_lock`` while reading.  Callers MUST NOT
+        retain the reference past their immediate cleanup call — the
+        next ``evict_session_agent`` / ``set_session_override`` will
+        invalidate it.
+        """
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            return None
+        _lock = getattr(self, "_agent_cache_lock", None)
+        entry = None
+        if _lock:
+            with _lock:
+                entry = cache.get(session_key)
+        else:
+            entry = cache.get(session_key)
+        if entry is None:
+            return None
+        return entry[0] if isinstance(entry, tuple) else entry
+
+    def get_cached_agent_attribution(
+        self, session_key: str
+    ) -> Optional[Dict[str, str]]:
+        """Return ``{"model", "provider"}`` from the cached AIAgent, or None.
+
+        Used by integrations that need per-message attribution ("answered by
+        X via Y") without holding a reference to the AIAgent instance.
+        Acquires ``_agent_cache_lock`` while reading so the lookup races
+        cleanly against eviction.
+        """
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            return None
+        _lock = getattr(self, "_agent_cache_lock", None)
+        entry = None
+        if _lock:
+            with _lock:
+                entry = cache.get(session_key)
+        else:
+            entry = cache.get(session_key)
+        if entry is None:
+            return None
+        agent = entry[0] if isinstance(entry, tuple) else entry
+        if agent is None:
+            return None
+        return {
+            "model": getattr(agent, "model", "") or "",
+            "provider": getattr(agent, "provider", "") or "",
+        }
+    # ────────────────────────────────────────────────────────────────────────
+
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
 
@@ -9931,35 +10107,38 @@ class GatewayRunner:
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
 
-            # ── Myah: Sentry AI monitoring ───────────────────────────
+            # ── Myah: AI monitoring via TelemetryHook ────────────────
             _sentry_tx = None
             _sentry_tool_spans: dict = {}
             if _structured_cbs:
                 try:
-                    import sentry_sdk as _sentry
+                    from agent.telemetry import get_telemetry_hook
+                    _telemetry = get_telemetry_hook()
                     _agent_model = getattr(agent, 'model', '') or ''
 
                     # Group all AI spans for this conversation under a shared ID
-                    # so multi-turn interactions appear together in Sentry's AI
-                    # monitoring dashboard.  session_id == the Myah chat_id.
-                    _sentry.ai.set_conversation_id(session_id)
+                    # so multi-turn interactions appear together in the
+                    # observability backend's AI monitoring dashboard.
+                    # session_id == the Myah chat_id.
+                    _telemetry.set_tag('ai.conversation_id', session_id)
 
-                    # Create a standalone gen_ai.invoke_agent transaction.
+                    # Create a standalone gen_ai.invoke_agent span.
                     # run_sync() runs in a thread executor — this is the correct
-                    # thread to create the transaction so that auto-instrumented
-                    # child spans (OpenAI, Anthropic, httpx) and tool spans all
-                    # attach to it rather than being orphaned.
-                    _sentry_tx = _sentry.start_transaction(
+                    # thread to create the span so that auto-instrumented child
+                    # spans (OpenAI, Anthropic, httpx) and tool spans all attach
+                    # to it rather than being orphaned.  We don't enter the
+                    # span here — the run_conversation block below uses it as a
+                    # context manager.
+                    _sentry_tx = _telemetry.start_span(
                         op='gen_ai.invoke_agent',
-                        name='invoke_agent Hermes',
-                        sampled=True,
+                        description='invoke_agent Hermes',
                     )
                     _sentry_tx.set_data('gen_ai.agent.name', 'Hermes')
                     _sentry_tx.set_data('gen_ai.request.model', _agent_model)
                     _sentry_tx.set_data('gen_ai.agent.session_id', session_id)
 
                     # Wrap the existing tool_progress callback to also open/close
-                    # gen_ai.execute_tool Sentry spans.  Uses tool name as the key
+                    # gen_ai.execute_tool spans.  Uses tool name as the key
                     # since the gateway's callback signature is
                     # (event_type, tool_name, preview, args, **kwargs).
                     _orig_tool_cb = agent.tool_progress_callback
@@ -9970,14 +10149,14 @@ class GatewayRunner:
                                 _orig_tool_cb(*args, **kwargs)
                             except Exception:
                                 pass
-                            # Additionally create/close Sentry tool spans
+                            # Additionally create/close tool spans
                             try:
                                 _ev = args[0] if args else ''
                                 _tname = args[1] if len(args) > 1 else 'unknown'
                                 if _ev == 'tool.started':
-                                    _tspan = _sentry.start_span(
+                                    _tspan = _telemetry.start_span(
                                         op='gen_ai.execute_tool',
-                                        name=f'execute_tool {_tname}',
+                                        description=f'execute_tool {_tname}',
                                     )
                                     _tspan.set_data('gen_ai.tool.name', _tname)
                                     _sentry_tool_spans[_tname] = _tspan
@@ -10303,18 +10482,23 @@ class GatewayRunner:
             # ────────────────────────────────────────────────────────
 
             # ── Myah: triple-path run_conversation call ──────────────
-            # Path 1: Sentry TX active — wrap run_conversation in a Sentry
-            #   transaction context manager.
+            # Path 1: Telemetry span active — wrap run_conversation in a
+            #   gen_ai.invoke_agent span context manager so child spans
+            #   (provider HTTP calls, tool spans) attach to the right parent.
             # Path 2: Secret CB only — plain run_conversation with cleanup.
             # Path 3: Neither — plain run_conversation (upstream default).
             if _sentry_tx is not None:
                 try:
-                    import sentry_sdk as _sentry
-                    _sentry_sdk = _sentry
-                    _sentry_sdk.ai.set_conversation_id(session_key)
-                    _sentry_tx = _sentry_sdk.start_transaction(
-                        op="gen_ai.invoke_agent",
-                        name=f"hermes.gateway.run ({source.platform.value})",
+                    from agent.telemetry import get_telemetry_hook
+                    _telemetry = get_telemetry_hook()
+                    _telemetry.set_tag('ai.conversation_id', session_key)
+                    # Re-open the run-scoped span with platform context so the
+                    # span name matches the run's source platform.  This also
+                    # replaces the bare span built earlier — entering it now
+                    # ensures provider auto-instrumentation attaches.
+                    _sentry_tx = _telemetry.start_span(
+                        op='gen_ai.invoke_agent',
+                        description=f'hermes.gateway.run ({source.platform.value})',
                     )
                     _sentry_tx.__enter__()
                     try:

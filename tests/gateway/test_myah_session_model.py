@@ -1,8 +1,8 @@
 """Tests for Myah session-scoped model override endpoint.
 
 Verifies:
-    - PUT /myah/api/sessions/{session_key}/model writes to
-      gateway_runner._session_model_overrides
+    - PUT /myah/api/sessions/{session_key}/model calls
+      gateway_runner.set_session_override(...)
     - GET returns the current override
     - Bad model id returns 400
     - Cross-session isolation (override on one session doesn't affect another)
@@ -23,10 +23,24 @@ from gateway.platforms.myah_management import (
 
 @pytest.fixture
 def mock_runner():
+    """A MagicMock runner that emulates the public API by routing
+    set_session_override(key, value) writes into a real dict, so tests
+    can both inspect the post-state and assert call patterns.
+    """
     runner = MagicMock()
-    runner._session_model_overrides = {}
-    runner._evict_cached_agent = MagicMock()
-    runner._agent_cache = {}
+    state = {}
+
+    def _set(key, override):
+        state[key] = dict(override)
+
+    def _get(key):
+        return state.get(key)
+
+    runner._public_state = state  # test-only handle for assertions
+    runner.set_session_override.side_effect = _set
+    runner.get_session_override.side_effect = _get
+    runner.get_cached_agent.return_value = None
+    runner.evict_session_agent.return_value = False
     return runner
 
 
@@ -101,8 +115,11 @@ async def test_put_session_model_happy_path(app_with_runner, fake_switch_model, 
     data = json.loads(response.body)
     assert data["model"] == "anthropic/claude-opus-4.6"
     assert data["provider"] == "anthropic"
-    assert mock_runner._session_model_overrides["agent:main:myah:dm:chat123"]["model"] == "anthropic/claude-opus-4.6"
-    mock_runner._evict_cached_agent.assert_called_once_with("agent:main:myah:dm:chat123")
+    assert mock_runner._public_state["agent:main:myah:dm:chat123"]["model"] == "anthropic/claude-opus-4.6"
+    mock_runner.set_session_override.assert_called_once()
+    args, _kwargs = mock_runner.set_session_override.call_args
+    assert args[0] == "agent:main:myah:dm:chat123"
+    assert args[1]["model"] == "anthropic/claude-opus-4.6"
 
 
 @pytest.mark.asyncio
@@ -114,8 +131,8 @@ async def test_put_session_model_bad_model(app_with_runner, fake_switch_model, m
     )
     response = await handle_put_session_model(request)
     assert response.status == 400
-    assert mock_runner._session_model_overrides == {}
-    mock_runner._evict_cached_agent.assert_not_called()
+    assert mock_runner._public_state == {}
+    mock_runner.set_session_override.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -127,7 +144,7 @@ async def test_put_session_model_missing_model_field(app_with_runner, fake_switc
     )
     response = await handle_put_session_model(request)
     assert response.status == 400
-    assert mock_runner._session_model_overrides == {}
+    assert mock_runner._public_state == {}
 
 
 @pytest.mark.asyncio
@@ -136,13 +153,13 @@ async def test_put_session_model_cross_session_isolation(app_with_runner, fake_s
     await handle_put_session_model(req_a)
     req_b = await _make_put_request(app_with_runner, "sk_B", {"model": "xiaomi/mimo-v2-pro"})
     await handle_put_session_model(req_b)
-    assert mock_runner._session_model_overrides["sk_A"]["model"] == "anthropic/claude-opus-4.6"
-    assert mock_runner._session_model_overrides["sk_B"]["model"] == "xiaomi/mimo-v2-pro"
+    assert mock_runner._public_state["sk_A"]["model"] == "anthropic/claude-opus-4.6"
+    assert mock_runner._public_state["sk_B"]["model"] == "xiaomi/mimo-v2-pro"
 
 
 @pytest.mark.asyncio
 async def test_get_session_model_returns_current_override(app_with_runner, mock_runner):
-    mock_runner._session_model_overrides["agent:main:myah:dm:chat123"] = {
+    mock_runner._public_state["agent:main:myah:dm:chat123"] = {
         "model": "anthropic/claude-opus-4.6",
         "provider": "anthropic",
     }
@@ -172,8 +189,9 @@ async def test_message_body_model_override_sets_session_override(fake_switch_mod
 
     adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
     mock_runner = MagicMock()
-    mock_runner._session_model_overrides = {}
-    mock_runner._evict_cached_agent = MagicMock()
+    state = {}
+    mock_runner.get_session_override.side_effect = lambda k: state.get(k)
+    mock_runner.set_session_override.side_effect = lambda k, v: state.update({k: dict(v)})
     adapter.gateway_runner = mock_runner
 
     # Stub handle_message so we don't dispatch for real
@@ -200,8 +218,8 @@ async def test_message_body_model_override_sets_session_override(fake_switch_mod
     # The override should have been applied before handle_message dispatch
     assert any(
         ov.get('model') == 'anthropic/claude-opus-4.6'
-        for ov in mock_runner._session_model_overrides.values()
-    ), f"override not set: {mock_runner._session_model_overrides}"
+        for ov in state.values()
+    ), f"override not set: {state}"
 
 
 @pytest.mark.asyncio
@@ -238,8 +256,9 @@ async def test_message_body_provider_pins_explicit_provider(monkeypatch):
 
     adapter = MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
     mock_runner = MagicMock()
-    mock_runner._session_model_overrides = {}
-    mock_runner._evict_cached_agent = MagicMock()
+    state = {}
+    mock_runner.get_session_override.side_effect = lambda k: state.get(k)
+    mock_runner.set_session_override.side_effect = lambda k, v: state.update({k: dict(v)})
     adapter.gateway_runner = mock_runner
     adapter.handle_message = AsyncMock()
     adapter._push_event_sync = MagicMock()
@@ -266,8 +285,8 @@ async def test_message_body_provider_pins_explicit_provider(monkeypatch):
     # And the resolved override should carry the pinned provider
     assert any(
         ov.get('provider') == 'openai-codex'
-        for ov in mock_runner._session_model_overrides.values()
-    ), f'override did not pin provider: {mock_runner._session_model_overrides}'
+        for ov in state.values()
+    ), f'override did not pin provider: {state}'
 
 
 @pytest.mark.asyncio
@@ -283,7 +302,7 @@ async def test_run_completed_emits_model_and_provider(monkeypatch):
     mock_agent.provider = 'anthropic'
 
     mock_runner = MagicMock()
-    mock_runner._session_model_overrides = {}
+    mock_runner.get_session_override.return_value = None
     adapter.gateway_runner = mock_runner
     adapter._message_handler = AsyncMock()
     adapter.handle_message = AsyncMock()
@@ -319,8 +338,12 @@ async def test_run_completed_emits_model_and_provider(monkeypatch):
     adapter._chat_id_streams['chat123'] = 'myah_test'
     adapter._stream_sessions['myah_test'] = _sk
 
-    # Seed agent cache under the correct session_key
-    mock_runner._agent_cache = {_sk: (mock_agent, 'sig_hash')}
+    # Seed cached-agent attribution under the correct session_key.  This
+    # used to be a direct _agent_cache write; the public API replaces it.
+    mock_runner.get_cached_agent_attribution.side_effect = (
+        lambda key: {'model': mock_agent.model, 'provider': mock_agent.provider}
+        if key == _sk else None
+    )
 
     await adapter._dispatch_message(event, 'myah_test', 'chat123', _sk)
 

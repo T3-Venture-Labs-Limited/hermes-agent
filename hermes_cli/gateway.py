@@ -2724,6 +2724,38 @@ _PLATFORMS = [
              "help": "OpenID to deliver cron results and notifications to."},
         ],
     },
+    # ── Myah: gateway wizard entry ───────────────────────────
+    {
+        "key": "myah",
+        "label": "Myah (Web UI)",
+        "emoji": "🌐",
+        "token_var": "MYAH_ADAPTER_AUTH_KEY",
+        "setup_instructions": [
+            "Myah is the Hermes web UI — a browser-based platform for chatting",
+            "with your agent. It pairs with the Myah platform backend",
+            "(see https://github.com/T3-Venture-Labs-Limited/myah).",
+            "",
+            "For OSS local use:",
+            "1. Generate a shared bearer secret:",
+            "   openssl rand -hex 32",
+            "2. Set it here as MYAH_ADAPTER_AUTH_KEY (Hermes adapter side).",
+            "3. Set the same value as MYAH_AGENT_BEARER_TOKEN in the Myah",
+            "   platform's .env (platform side). The two halves must match.",
+            "4. Set MYAH_ADAPTER_ENABLED=true to enable the adapter.",
+            "5. Start Hermes gateway: hermes gateway",
+            "6. Start the Myah platform backend + frontend (see Myah repo).",
+            "",
+            "Hosted Myah users do not need to run this — the platform manages",
+            "the agent container for you (https://app.myah.dev).",
+        ],
+        "vars": [
+            {"name": "MYAH_ADAPTER_ENABLED", "prompt": "Enable Myah adapter (true/false)", "password": False,
+             "help": "Set to 'true' to enable the Myah platform adapter."},
+            {"name": "MYAH_ADAPTER_AUTH_KEY", "prompt": "Shared bearer secret", "password": True,
+             "help": "Generate with: openssl rand -hex 32. Must match MYAH_AGENT_BEARER_TOKEN on the platform side."},
+        ],
+    },
+    # ────────────────────────────────────────────────────────
 ]
 
 

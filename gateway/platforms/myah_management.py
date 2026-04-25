@@ -314,10 +314,10 @@ async def handle_put_model(request: web.Request) -> web.Response:
 
 
 # ── Myah: Session-scoped model override (T3-932) ─────────────────────────────
-# Per-session model overrides via HTTP. Writes directly to the gateway
-# runner's _session_model_overrides dict — the same primitive that the
-# /model slash command uses in gateway/run.py:_handle_model_command.
-# Does NOT persist to config.yaml; override lives for the session lifetime.
+# Per-session model overrides via HTTP. Calls the gateway runner's public
+# set_session_override(...) API — the same primitive that the /model slash
+# command uses in gateway/run.py:_handle_model_command. Does NOT persist
+# to config.yaml; override lives for the session lifetime.
 
 
 async def handle_get_session_model(request: web.Request) -> web.Response:
@@ -327,8 +327,7 @@ async def handle_get_session_model(request: web.Request) -> web.Response:
     if adapter is None or adapter.gateway_runner is None:
         return web.json_response({'error': 'Gateway runner not available'}, status=503)
 
-    overrides = getattr(adapter.gateway_runner, '_session_model_overrides', {}) or {}
-    override = overrides.get(session_key, {})
+    override = adapter.gateway_runner.get_session_override(session_key) or {}
     return web.json_response({
         'model': override.get('model', ''),
         'provider': override.get('provider', ''),
@@ -340,7 +339,7 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
 
     Body: {"model": "<model-id>", "provider": "<optional-provider>"}
 
-    Writes to gateway_runner._session_model_overrides[session_key] and
+    Writes via gateway_runner.set_session_override(session_key, ...) which
     evicts the cached agent so the next turn rebuilds with the new model.
     Mirrors the --session (non-global) branch of the /model slash command
     in gateway/run.py:_handle_model_command.
@@ -383,7 +382,7 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
 
     # Layer current session override on top if present (so we preserve
     # unset fields when the user switches providers).
-    existing = (runner._session_model_overrides or {}).get(session_key, {})
+    existing = runner.get_session_override(session_key) or {}
     if existing:
         current_model = existing.get('model', current_model)
         current_provider = existing.get('provider', current_provider)
@@ -416,20 +415,11 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
         error_msg = getattr(result, 'error_message', '') or 'Model not recognized'
         return web.json_response({'error': error_msg}, status=400)
 
-    # Write the override and evict cached agent
-    if runner._session_model_overrides is None:
-        runner._session_model_overrides = {}
-    runner._session_model_overrides[session_key] = {
-        'model': result.new_model,
-        'provider': result.target_provider,
-        'api_key': getattr(result, 'api_key', '') or '',
-        'base_url': getattr(result, 'base_url', '') or '',
-        'api_mode': getattr(result, 'api_mode', '') or '',
-    }
-    # ── Myah: full agent teardown before eviction (fixes memory-provider leak) ──
-    cache_entry = (runner._agent_cache or {}).get(session_key)
-    if cache_entry is not None:
-        old_agent = cache_entry[0] if isinstance(cache_entry, tuple) else cache_entry
+    # ── Myah: full agent teardown before override + eviction (fixes memory-provider leak) ──
+    # Resolve the cached agent BEFORE set_session_override (which evicts) so
+    # we can call shutdown_memory_provider/close on the live instance.
+    old_agent = runner.get_cached_agent(session_key)
+    if old_agent is not None:
         try:
             old_agent.shutdown_memory_provider()
         except Exception as e:
@@ -439,10 +429,14 @@ async def handle_put_session_model(request: web.Request) -> web.Response:
         except Exception as e:
             logger.warning('agent.close() failed for %s: %s', session_key, e)
     # ─────────────────────────────────────────────────────────────────────
-    try:
-        runner._evict_cached_agent(session_key)
-    except Exception:
-        logger.warning('[myah] _evict_cached_agent failed for %s', session_key, exc_info=True)
+    # Write the override and evict cached agent (set_session_override evicts).
+    runner.set_session_override(session_key, {
+        'model': result.new_model,
+        'provider': result.target_provider,
+        'api_key': getattr(result, 'api_key', '') or '',
+        'base_url': getattr(result, 'base_url', '') or '',
+        'api_mode': getattr(result, 'api_mode', '') or '',
+    })
 
     return web.json_response({
         'model': result.new_model,
@@ -942,10 +936,9 @@ async def handle_add_mcp(request: web.Request) -> web.Response:
 
     runner = _gateway_runner
     if runner is not None:
-        cache = getattr(runner, '_agent_cache', {}) or {}
-        for session_key in list(cache.keys()):
+        for session_key in runner.iter_cached_session_keys():
             try:
-                runner._evict_cached_agent(session_key)
+                runner.evict_session_agent(session_key)
             except Exception as e:
                 logger.warning('[myah] evict failed for %s: %s', session_key, e)
     # ─────────────────────────────────────────────────────────────────────
@@ -988,10 +981,9 @@ async def handle_remove_mcp(request: web.Request) -> web.Response:
 
     runner = _gateway_runner
     if runner is not None:
-        cache = getattr(runner, '_agent_cache', {}) or {}
-        for session_key in list(cache.keys()):
+        for session_key in runner.iter_cached_session_keys():
             try:
-                runner._evict_cached_agent(session_key)
+                runner.evict_session_agent(session_key)
             except Exception as e:
                 logger.warning('[myah] evict failed for %s: %s', session_key, e)
     # ─────────────────────────────────────────────────────────────────────
@@ -1237,12 +1229,12 @@ async def handle_gateway_restart(request: web.Request) -> web.Response:
     """
     runner = _gateway_runner
     if runner is not None:
-        running = getattr(runner, '_running_agents', {}) or {}
-        if running:
+        busy_sessions = runner.iter_running_session_keys()
+        if busy_sessions:
             return web.json_response(
                 {
                     'error': 'busy',
-                    'busy_sessions': list(running.keys()),
+                    'busy_sessions': busy_sessions,
                     'message': 'A turn is currently running. Wait for it to finish and retry.',
                 },
                 status=409,

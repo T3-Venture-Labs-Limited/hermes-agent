@@ -195,10 +195,7 @@ async def test_restart_returns_409_when_runs_are_in_flight(home, monkeypatch):
     from gateway.platforms import myah_management as mgmt
 
     fake_runner = MagicMock()
-    fake_runner._running_agents = {
-        'session-A': MagicMock(name='resolved-agent'),
-        'session-B': object(),
-    }
+    fake_runner.iter_running_session_keys.return_value = ['session-A', 'session-B']
     monkeypatch.setattr(mgmt, '_gateway_runner', fake_runner, raising=False)
 
     request = make_mocked_request('POST', '/myah/api/gateway/restart')
@@ -216,7 +213,7 @@ async def test_restart_returns_202_when_idle(home, monkeypatch):
     from gateway.platforms import myah_management as mgmt
 
     fake_runner = MagicMock()
-    fake_runner._running_agents = {}
+    fake_runner.iter_running_session_keys.return_value = []
     monkeypatch.setattr(mgmt, '_gateway_runner', fake_runner, raising=False)
 
     calls = []
@@ -341,8 +338,11 @@ async def test_add_mcp_calls_register_mcp_servers(home, monkeypatch):
 
     evictions = []
     fake_runner = MagicMock()
-    fake_runner._agent_cache = {'sess-1': MagicMock(), 'sess-2': MagicMock()}
-    fake_runner._evict_cached_agent = lambda k: evictions.append(k)
+    # Public API surface: iter_cached_session_keys + evict_session_agent.
+    fake_runner.iter_cached_session_keys.return_value = ['sess-1', 'sess-2']
+    fake_runner.evict_session_agent.side_effect = (
+        lambda k: (evictions.append(k), True)[1]
+    )
 
     from gateway.platforms import myah_management as mgmt
     monkeypatch.setattr(mgmt, '_gateway_runner', fake_runner, raising=False)
@@ -447,10 +447,18 @@ async def test_put_session_model_calls_full_teardown(home, monkeypatch):
             teardown_calls.append('close')
 
     fake_runner = MagicMock()
-    # _agent_cache stores tuples (agent, metadata) per run.py
-    fake_runner._agent_cache = {'test-session': (FakeAgent(), {'created_ts': 0})}
-    fake_runner._evict_cached_agent = lambda k: teardown_calls.append(f'evict:{k}')
-    fake_runner._session_model_overrides = {}
+    # Production code now uses get_cached_agent + set_session_override (which
+    # internally evicts).  Mirror that contract in the fake.
+    fake_agent = FakeAgent()
+    fake_runner.get_cached_agent.return_value = fake_agent
+    overrides_state = {}
+
+    def _set_override(key, override):
+        overrides_state[key] = dict(override)
+        teardown_calls.append(f'evict:{key}')
+
+    fake_runner.set_session_override.side_effect = _set_override
+    fake_runner.get_session_override.side_effect = lambda k: overrides_state.get(k)
     monkeypatch.setattr(mgmt, '_gateway_runner', fake_runner, raising=False)
 
     # Stub switch_model

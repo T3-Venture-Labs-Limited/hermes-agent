@@ -226,9 +226,9 @@ class MyahAdapter(BasePlatformAdapter):
         chat_name = body.get("chat_name")
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
-        # If the client supplies a 'model' field, apply it to
-        # _session_model_overrides BEFORE dispatching the message so the
-        # gateway picks it up when constructing/resolving the agent.
+        # If the client supplies a 'model' field, apply it via
+        # runner.set_session_override(...) BEFORE dispatching the message
+        # so the gateway picks it up when constructing/resolving the agent.
         # This is the inline equivalent of calling
         # PUT /myah/api/sessions/{id}/model, useful for
         # "regenerate with different model" flows.
@@ -284,7 +284,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _current_provider = _mc.get("provider", "") or "openrouter"
                 _current_base_url = _mc.get("base_url", "") or ""
                 # Layer current session override on top if present
-                _existing_override = (runner._session_model_overrides or {}).get(session_key, {})
+                _existing_override = runner.get_session_override(session_key) or {}
                 if _existing_override:
                     _current_model = _existing_override.get('model', _current_model)
                     _current_provider = _existing_override.get('provider', _current_provider)
@@ -305,22 +305,14 @@ class MyahAdapter(BasePlatformAdapter):
                     ),
                 )
                 if getattr(_result, "success", False):
-                    if runner._session_model_overrides is None:
-                        runner._session_model_overrides = {}
-                    runner._session_model_overrides[session_key] = {
+                    # set_session_override evicts the cached agent atomically.
+                    runner.set_session_override(session_key, {
                         "model": _result.new_model,
                         "provider": _result.target_provider,
                         "api_key": getattr(_result, "api_key", "") or "",
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
-                    }
-                    try:
-                        runner._evict_cached_agent(session_key)
-                    except Exception:
-                        logger.warning(
-                            "[myah] _evict_cached_agent failed during one-shot override",
-                            exc_info=True,
-                        )
+                    })
                 else:
                     logger.warning(
                         "[myah] one-shot model override failed: %s",
@@ -516,13 +508,13 @@ class MyahAdapter(BasePlatformAdapter):
                 try:
                     runner = self.gateway_runner
                     if runner is not None:
-                        cached = (runner._agent_cache or {}).get(session_key)
-                        if cached and cached[0] is not None:
-                            _attribution_model = getattr(cached[0], "model", "") or ""
-                            _attribution_provider = getattr(cached[0], "provider", "") or ""
+                        attribution = runner.get_cached_agent_attribution(session_key)
+                        if attribution is not None:
+                            _attribution_model = attribution.get("model", "") or ""
+                            _attribution_provider = attribution.get("provider", "") or ""
                         # Fallback to session override if cache was evicted mid-flight
                         if not _attribution_model:
-                            _override = (runner._session_model_overrides or {}).get(session_key, {})
+                            _override = runner.get_session_override(session_key) or {}
                             _attribution_model = _override.get("model", "")
                             _attribution_provider = _override.get("provider", "")
                 except Exception:
