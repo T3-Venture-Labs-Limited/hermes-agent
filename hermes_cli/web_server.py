@@ -70,7 +70,15 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 # Generated fresh on every server start — dies when the process exits.
 # Injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
-_SESSION_TOKEN = secrets.token_urlsafe(32)
+# ── Myah: env-var-overridable session token for platform backend auth ──────
+# When `hermes web` runs inside a Myah per-user container, the platform
+# backend needs a stable, predictable token so it can authenticate against
+# /api/plugins/myah-admin/* without scraping the SPA HTML. Honor
+# HERMES_WEB_SESSION_TOKEN if present; otherwise fall back to the original
+# random token so standalone `hermes web` users keep their per-process
+# token semantics.
+# ────────────────────────────────────────────────────────────────────────────
+_SESSION_TOKEN = os.environ.get("HERMES_WEB_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # Simple rate limiter for the reveal endpoint

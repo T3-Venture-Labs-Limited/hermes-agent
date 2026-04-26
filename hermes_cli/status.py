@@ -320,6 +320,12 @@ def show_status(args):
         "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQBOT_HOME_CHANNEL"),
+        # ── Myah: status row ─────────────────────────────────
+        # Myah has no bot token / home channel — it pairs with the Myah platform
+        # backend via a shared bearer secret (MYAH_ADAPTER_AUTH_KEY on the
+        # adapter side, MYAH_AGENT_BEARER_TOKEN on the platform side).
+        "Myah": ("MYAH_ADAPTER_AUTH_KEY", None),
+        # ────────────────────────────────────────────────────
     }
     
     for name, (token_var, home_var) in platforms.items():

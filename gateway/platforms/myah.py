@@ -226,9 +226,9 @@ class MyahAdapter(BasePlatformAdapter):
         chat_name = body.get("chat_name")
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
-        # If the client supplies a 'model' field, apply it to
-        # _session_model_overrides BEFORE dispatching the message so the
-        # gateway picks it up when constructing/resolving the agent.
+        # If the client supplies a 'model' field, apply it via
+        # runner.set_session_override(...) BEFORE dispatching the message
+        # so the gateway picks it up when constructing/resolving the agent.
         # This is the inline equivalent of calling
         # PUT /myah/api/sessions/{id}/model, useful for
         # "regenerate with different model" flows.
@@ -284,7 +284,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _current_provider = _mc.get("provider", "") or "openrouter"
                 _current_base_url = _mc.get("base_url", "") or ""
                 # Layer current session override on top if present
-                _existing_override = (runner._session_model_overrides or {}).get(session_key, {})
+                _existing_override = runner.get_session_override(session_key) or {}
                 if _existing_override:
                     _current_model = _existing_override.get('model', _current_model)
                     _current_provider = _existing_override.get('provider', _current_provider)
@@ -305,22 +305,14 @@ class MyahAdapter(BasePlatformAdapter):
                     ),
                 )
                 if getattr(_result, "success", False):
-                    if runner._session_model_overrides is None:
-                        runner._session_model_overrides = {}
-                    runner._session_model_overrides[session_key] = {
+                    # set_session_override evicts the cached agent atomically.
+                    runner.set_session_override(session_key, {
                         "model": _result.new_model,
                         "provider": _result.target_provider,
                         "api_key": getattr(_result, "api_key", "") or "",
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
-                    }
-                    try:
-                        runner._evict_cached_agent(session_key)
-                    except Exception:
-                        logger.warning(
-                            "[myah] _evict_cached_agent failed during one-shot override",
-                            exc_info=True,
-                        )
+                    })
                 else:
                     logger.warning(
                         "[myah] one-shot model override failed: %s",
@@ -516,13 +508,13 @@ class MyahAdapter(BasePlatformAdapter):
                 try:
                     runner = self.gateway_runner
                     if runner is not None:
-                        cached = (runner._agent_cache or {}).get(session_key)
-                        if cached and cached[0] is not None:
-                            _attribution_model = getattr(cached[0], "model", "") or ""
-                            _attribution_provider = getattr(cached[0], "provider", "") or ""
+                        attribution = runner.get_cached_agent_attribution(session_key)
+                        if attribution is not None:
+                            _attribution_model = attribution.get("model", "") or ""
+                            _attribution_provider = attribution.get("provider", "") or ""
                         # Fallback to session override if cache was evicted mid-flight
                         if not _attribution_model:
-                            _override = (runner._session_model_overrides or {}).get(session_key, {})
+                            _override = runner.get_session_override(session_key) or {}
                             _attribution_model = _override.get("model", "")
                             _attribution_provider = _override.get("provider", "")
                 except Exception:
@@ -1017,77 +1009,6 @@ class MyahAdapter(BasePlatformAdapter):
             "text": str(args[0]) if args else "unknown",
         }
 
-    # ── Myah: slash command discovery endpoint ───────────────────────────
-    async def _handle_list_commands(self, request: "web.Request") -> "web.Response":
-        """GET /myah/api/commands — return all chat-available slash commands.
-
-        Returns JSON ``{"commands": [...]}`` with command objects from three
-        sources: builtins (COMMAND_REGISTRY), skills (get_skill_commands),
-        and plugins (get_plugin_commands).
-        """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        items: list[dict] = []
-
-        # --- 1. Builtins from COMMAND_REGISTRY ---
-        try:
-            from hermes_cli.commands import (
-                COMMAND_REGISTRY,
-                ACTIVE_SESSION_BYPASS_COMMANDS,
-            )
-            for cmd in COMMAND_REGISTRY:
-                if cmd.cli_only:
-                    continue
-                items.append({
-                    "name": cmd.name,
-                    "category": cmd.category or "misc",
-                    "description": cmd.description,
-                    "aliases": list(cmd.aliases or []),
-                    "args": cmd.args_hint or "",
-                    "bypass": cmd.name in ACTIVE_SESSION_BYPASS_COMMANDS,
-                    "source": "builtin",
-                })
-        except Exception:
-            logger.exception("[myah] failed to collect builtin commands")
-
-        # --- 2. Skills ---
-        try:
-            from agent.skill_commands import get_skill_commands
-            for _cmd_key, info in get_skill_commands().items():
-                items.append({
-                    "name": info.get("name", _cmd_key.lstrip("/")),
-                    "category": "skill",
-                    "description": info.get("description", ""),
-                    "aliases": [],
-                    "args": "",
-                    "bypass": False,
-                    "source": "skill",
-                    "skill_path": info.get("skill_dir", ""),
-                })
-        except Exception:
-            logger.exception("[myah] failed to collect skill commands")
-
-        # --- 3. Plugins ---
-        try:
-            from hermes_cli.plugins import get_plugin_commands
-            for cmd_name, cmd_info in get_plugin_commands().items():
-                items.append({
-                    "name": cmd_name,
-                    "category": "plugin",
-                    "description": cmd_info.get("description", ""),
-                    "aliases": [],
-                    "args": "",
-                    "bypass": False,
-                    "source": "plugin",
-                })
-        except Exception:
-            logger.exception("[myah] failed to collect plugin commands")
-
-        return web.json_response({"commands": items})
-    # ────────────────────────────────────────────────────────────────────
-
     # ── Orphaned stream sweeper ─────────────────────────────────────────
 
     async def _sweep_orphaned_streams(self) -> None:
@@ -1223,17 +1144,20 @@ class MyahAdapter(BasePlatformAdapter):
         # ── Myah: aux router HTTP wrapper ────────────────────────────────
         app.router.add_post('/myah/v1/aux/{task}', self._handle_aux_endpoint)
         # ─────────────────────────────────────────────────────────────────
-        # ── Myah: slash command discovery route ──────────────────────────
-        app.router.add_get('/myah/api/commands', self._handle_list_commands)
-        # ─────────────────────────────────────────────────────────────────
 
-        # Register management API routes (config, skills, plugins, MCP,
-        # toolsets, sessions) with the same bearer token auth.
-        from gateway.platforms.myah_management import register_management_routes
-        register_management_routes(app, auth_key=self._auth_key)
-        # ── Myah: make runner visible to /myah/api/gateway/restart handler ──
-        from gateway.platforms.myah_management import set_gateway_runner
-        set_gateway_runner(self.gateway_runner)
+        # ── Myah: runtime-control admin surface ──────────────────────────
+        # Mounts /myah/v1/admin/* — the small set of admin operations that
+        # MUST run in the gateway process because they touch GatewayRunner
+        # state (session model overrides, cache eviction, busy-check, MCP
+        # refresh). Everything else (file-system admin: SOUL, skills, plugins,
+        # MCP CRUD, providers, reset) lives in the myah-admin DASHBOARD plugin
+        # at agent/hermes/plugins/myah-admin/dashboard/plugin_api.py.
+        from gateway.platforms.myah_runtime_admin import register_runtime_admin_routes
+        register_runtime_admin_routes(
+            app,
+            runner=self.gateway_runner,
+            auth_key=self._auth_key,
+        )
         # ─────────────────────────────────────────────────────────────────
 
         self._routes_registered = True

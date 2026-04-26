@@ -492,28 +492,35 @@ if AIOHTTP_AVAILABLE:
 else:
     security_headers_middleware = None  # type: ignore[assignment]
 
-# ── Myah: Sentry distributed trace continuation ──────────────────
-try:
-    import sentry_sdk
-
-    if AIOHTTP_AVAILABLE:
-        @web.middleware
-        async def sentry_trace_middleware(request, handler):
-            """Continue a distributed trace from the Myah platform backend."""
-            sentry_trace = request.headers.get("sentry-trace")
-            baggage = request.headers.get("baggage")
-            if sentry_trace:
-                transaction = sentry_sdk.continue_trace(
-                    {"sentry-trace": sentry_trace, "baggage": baggage or ""},
-                    op="http.server",
-                    name=f"{request.method} {request.path}",
-                )
-                with sentry_sdk.start_transaction(transaction):
+# ── Myah: distributed trace continuation via TelemetryHook ──────────
+# Distributed-trace continuation uses ``sentry-trace`` / ``baggage``
+# headers, which are a Sentry-shaped wire format but not Sentry-specific
+# at the protocol level.  We forward the headers through ``start_span``'s
+# **kwargs so a SentryHook implementation can pass them to
+# ``sentry_sdk.continue_trace``; a different telemetry backend that
+# doesn't speak that wire format is free to ignore them.
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def sentry_trace_middleware(request, handler):
+        """Continue a distributed trace from the Myah platform backend."""
+        sentry_trace = request.headers.get("sentry-trace")
+        baggage = request.headers.get("baggage")
+        if sentry_trace:
+            from agent.telemetry import get_telemetry_hook
+            try:
+                with get_telemetry_hook().start_span(
+                    op='http.server',
+                    description=f'{request.method} {request.path}',
+                    sentry_trace=sentry_trace,
+                    baggage=baggage or '',
+                ):
                     return await handler(request)
-            return await handler(request)
-    else:
-        sentry_trace_middleware = None
-except ImportError:
+            except Exception:
+                # If the hook can't continue the trace for any reason,
+                # never block the request.
+                return await handler(request)
+        return await handler(request)
+else:
     sentry_trace_middleware = None
 # ────────────────────────────────────────────────────────────────────
 
@@ -2507,11 +2514,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_sessions[run_id] = _approval_session_key
                 # ────────────────────────────────────────────────────────
 
-                # ── Myah: Sentry AI monitoring ───────────────────────────
+                # ── Myah: AI monitoring via TelemetryHook ────────────────
                 try:
-                    import sentry_sdk
-                    sentry_sdk.ai.set_conversation_id(session_id or run_id)
-                except (ImportError, AttributeError):
+                    from agent.telemetry import get_telemetry_hook
+                    get_telemetry_hook().set_tag(
+                        'ai.conversation_id', session_id or run_id,
+                    )
+                except Exception:
                     pass
                 # ────────────────────────────────────────────────────────
 
