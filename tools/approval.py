@@ -293,9 +293,57 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
 
 def has_blocking_approval(session_key: str) -> bool:
-    """Check if a session has one or more blocking gateway approvals waiting."""
+    """Check if a session has one or more blocking approvals waiting.
+
+    Considers BOTH queues:
+    * ``_gateway_queues`` — legacy terminal command approvals.
+    * ``_action_queues``  — modern action confirmations (cron, plugin
+      install, …).  ``/approve`` and ``/deny`` should resolve either.
+    """
     with _lock:
-        return bool(_gateway_queues.get(session_key))
+        if _gateway_queues.get(session_key):
+            return True
+        # ── Myah: include action confirmations in the same-session check ──
+        return any(
+            entry.get("session_key") == session_key
+            for entry in _action_queues.values()
+        )
+        # ──────────────────────────────────────────────────────────────────
+
+
+# ── Myah: Bug A follow-on — resolve action confirmations by session_key ──
+def resolve_action_confirmation_by_session(
+    session_key: str, choice: str, resolve_all: bool = False,
+) -> int:
+    """Resolve the oldest pending action confirmation for ``session_key``,
+    or all of them when ``resolve_all`` is True.
+
+    Used by the gateway ``/approve`` / ``/deny`` handlers so chat-based
+    approvals work for both legacy command approvals AND modern action
+    confirmations (cron creation etc.) without forcing the user to know
+    which queue holds their pending entry.
+
+    Returns the number of confirmations resolved (0 means nothing pending
+    for this session).
+    """
+    with _lock:
+        # Find entries belonging to this session, ordered by insertion
+        # (Python 3.7+ dicts preserve insertion order — that is our FIFO).
+        matching = [
+            (cid, entry) for cid, entry in _action_queues.items()
+            if entry.get("session_key") == session_key
+        ]
+        if not matching:
+            return 0
+        targets = matching if resolve_all else matching[:1]
+        for cid, _ in targets:
+            _action_queues.pop(cid, None)
+
+    for _cid, entry in targets:
+        entry["result"].append(choice)
+        entry["event"].set()
+    return len(targets)
+# ──────────────────────────────────────────────────────────────────────────
 
 
 # ── Myah: generic action confirmation ────────────────────────
@@ -311,6 +359,9 @@ def request_action_confirmation(
     description: str,
     options: list[str] | None = None,
     timeout: float = 300.0,
+    # ── Myah: Bug A follow-on — accept metadata for richer approval cards ──
+    metadata: dict | None = None,
+    # ────────────────────────────────────────────────────────────────────────
 ) -> str:
     """Block until the user confirms or denies a proposed action.
 
@@ -329,6 +380,13 @@ def request_action_confirmation(
         Custom response options.  Defaults to ``["approve", "deny"]``.
     timeout : float
         Seconds to wait before auto-denying.
+    metadata : dict | None
+        Optional structured detail for the approval card (e.g. cron
+        ``schedule_display``, ``prompt_preview``).  Forwarded inside the
+        callback payload as ``metadata`` so adapters can render a
+        richer card without parsing the human-readable description.
+        Required by ``cronjob_tools.py:cron_create`` and any future tool
+        that wants to surface structured fields on the approval card.
 
     Returns
     -------
@@ -367,20 +425,25 @@ def request_action_confirmation(
             "options": options,
             "event": event,
             "result": result_holder,
+            # Myah: keep the metadata around in the queue too so future
+            # endpoints (e.g. a /pending-confirmations list) can replay it.
+            "metadata": metadata or {},
         }
 
     # Notify the gateway adapter so it can emit an SSE event to the frontend.
     try:
-        callback(
-            session_key,
-            {
-                "type": "tool.confirmation_required",
-                "confirmation_id": confirmation_id,
-                "action_type": action_type,
-                "description": description,
-                "options": options,
-            },
-        )
+        # ── Myah: include metadata in the callback payload ──────
+        payload = {
+            "type": "tool.confirmation_required",
+            "confirmation_id": confirmation_id,
+            "action_type": action_type,
+            "description": description,
+            "options": options,
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        # ────────────────────────────────────────────────────────
+        callback(session_key, payload)
     except Exception:
         logger.exception("request_action_confirmation: notify callback failed")
 

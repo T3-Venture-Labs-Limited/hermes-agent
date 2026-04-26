@@ -601,7 +601,21 @@ class MyahAdapter(BasePlatformAdapter):
         return response
 
     async def _handle_confirm_endpoint(self, request: "web.Request") -> "web.Response":
-        """POST /myah/v1/confirm/{stream_id} — resolve pending approval."""
+        """POST /myah/v1/confirm/{stream_id} — resolve a pending approval.
+
+        Body shape (Bug B fix — accept both queues):
+
+        * Modern action confirmation (cron creation, plugin install, etc.):
+          ``{"confirmation_id": "<uuid>", "choice": "approve|approve_session|deny"}``.
+          Routes to ``resolve_action_confirmation`` (`_action_queues`).
+
+        * Legacy terminal-command approval:
+          ``{"choice": "approve|approve_session|deny"}``.  Routes to
+          ``resolve_gateway_approval`` (`_gateway_queues`) using the
+          session_key bound to the stream — preserved for backwards
+          compatibility while the legacy approval flow is still
+          referenced by ``send_exec_approval``.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -626,9 +640,41 @@ class MyahAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        from tools.approval import resolve_gateway_approval
+        # ── Myah: Bug B — dispatch on confirmation_id ───────────
+        confirmation_id = body.get("confirmation_id")
+        if confirmation_id:
+            from tools.approval import resolve_action_confirmation
+
+            ok = resolve_action_confirmation(confirmation_id, choice)
+            if not ok:
+                return web.json_response(
+                    {
+                        "error": (
+                            f"No pending action confirmation matching "
+                            f"confirmation_id={confirmation_id!r}"
+                        )
+                    },
+                    status=404,
+                )
+            return web.json_response({"ok": True, "resolved": 1})
+        # ────────────────────────────────────────────────────────
+
+        from tools.approval import (
+            resolve_gateway_approval,
+            resolve_action_confirmation_by_session,
+        )
 
         resolved = resolve_gateway_approval(session_key, choice)
+        # ── Myah: fall back to action queue when frontend POSTs without confirmation_id ──
+        # The Myah frontend's ``ConfirmationCard.svelte`` posts ``{run_id, choice}``
+        # — it doesn't yet send ``confirmation_id``.  When the legacy queue
+        # has nothing for this session_key (the common case for cron approvals),
+        # resolve the oldest pending action confirmation belonging to the same
+        # session.  Mirrors the dual-queue resolution in ``/approve`` /
+        # ``/deny`` slash commands so HTTP and chat paths behave the same.
+        if resolved == 0:
+            resolved = resolve_action_confirmation_by_session(session_key, choice)
+        # ────────────────────────────────────────────────────────────────────────────────
         if resolved == 0:
             return web.json_response(
                 {"error": "No pending confirmation to resolve"},
@@ -870,6 +916,50 @@ class MyahAdapter(BasePlatformAdapter):
         })
 
         return SendResult(success=True)
+
+    # ── Myah: Bug A follow-on — structured action confirmation card ─────
+    async def send_action_confirmation(
+        self,
+        session_key: str,
+        payload: Dict[str, Any],
+    ) -> SendResult:
+        """Emit a ``tool.confirmation_required`` SSE event for a generic
+        action confirmation (cron creation, plugin install, ...).
+
+        Mirrors ``send_exec_approval`` but accepts the payload from
+        ``tools/approval.py::request_action_confirmation`` directly so
+        the frontend's ``ConfirmationCard`` renders an interactive
+        Approve / Deny card with the same ``confirmation_id`` the agent
+        is blocked on.  No text fallback — callers should fall back to
+        ``adapter.send`` if this returns ``success=False`` so users
+        without a live stream still see the prompt as plain text.
+
+        Payload contract (from ``approval.py::request_action_confirmation``):
+            ``type``           — always ``"tool.confirmation_required"``
+            ``confirmation_id`` — uuid the gateway resolves against
+            ``action_type``    — e.g. ``"cron_create"``
+            ``description``    — one-line human-readable summary
+            ``options``        — usually ``["approve", "approve_session", "deny"]``
+            ``metadata``       — optional structured fields for the card
+                                  (``schedule_display``, ``prompt_preview``, …)
+        """
+        stream_id = self._session_streams.get(session_key)
+        if not stream_id or stream_id not in self._streams:
+            return SendResult(success=False, error='No active stream')
+
+        self._push_event_sync(stream_id, {
+            'event': 'tool.confirmation_required',
+            'stream_id': stream_id,
+            'run_id': stream_id,
+            'timestamp': time.time(),
+            'confirmation_id': payload.get('confirmation_id', ''),
+            'action_type': payload.get('action_type', 'confirmation'),
+            'description': payload.get('description', ''),
+            'options': payload.get('options') or ['approve', 'deny'],
+            'metadata': payload.get('metadata') or {},
+        })
+        return SendResult(success=True)
+    # ────────────────────────────────────────────────────────────────────
 
     # ── Structured callbacks for gateway runner ───────────────────────────
 
@@ -1253,32 +1343,234 @@ class MyahAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Push a response to the SSE stream for the given chat.
+        """Push a response to the user.
 
-        The gateway calls this with chat_id = source.chat_id (the raw
-        session_id passed by the frontend).  We look up the stream_id
-        via _chat_id_streams (Fix 1).
+        Routing depends on the **caller**:
+
+        * **Cron deliveries** (``metadata.job_id`` is set — Bug D v4):
+          ALWAYS go through the webhook so the platform persists the
+          run to chat history.  SSE is *not* a persistence path —
+          ``message.delta`` events without a real consumer are silently
+          dropped, and even with a consumer the cron's payload would
+          be concatenated into whatever assistant message the chat
+          happens to be streaming for an unrelated turn.  The webhook
+          (``/api/v1/processes/webhook/run-complete``) is the only
+          surface that calls ``_inject_cron_output_to_chat`` and
+          writes the cron run to the chat's message history.
+
+        * **Live chat replies** (no ``metadata.job_id``):
+          1. Push as ``message.delta`` onto the active SSE stream when
+             a subscriber is bound to ``chat_id`` — the user sees
+             tokens stream into the message they just sent.
+          2. Fall back to ``"No active stream"`` failure when no
+             subscriber exists.  These are normal gateway-runner
+             responses; the runner has its own retry semantics, and
+             the cron-only webhook would 400 on missing ``job_id``.
+
+        Threading: invoked from the cron ``ThreadPoolExecutor`` worker
+        via ``asyncio.run_coroutine_threadsafe(adapter.send(...),
+        loop)`` (see ``cron/scheduler.py:_deliver_result``).  The body
+        is a plain ``async def`` — the threading bridge happens in the
+        caller, not here.  Never raises — the cron path relies on
+        ``SendResult.success`` to decide between adapter delivery and
+        the standalone fallback.
+
+        Bug D-v4 history (2026-04-25): an earlier version of this
+        method preferred SSE-first for ALL callers and only fell back
+        to the webhook when ``_chat_id_streams.get(chat_id)`` was
+        empty.  That broke "test it here" cron triggers — the
+        triggering chat turn had a live stream, the cron's content
+        was pushed onto that turn's SSE queue, ``send()`` returned
+        success, and the webhook never fired.  The output was either
+        appended into the unrelated assistant message buffer or
+        dropped on the floor when the run completed.  Output existed
+        on disk but never reached chat history.  See
+        ``docs/superpowers/specs/2026-04-24-cron-origin-and-approval-design.md``.
         """
-        stream_id = self._chat_id_streams.get(chat_id)
-        if not stream_id:
-            return SendResult(success=False, error=f"No active stream for chat_id={chat_id}")
+        meta = metadata or {}
+        is_cron_delivery = bool(meta.get("job_id"))
 
-        q = self._streams.get(stream_id)
-        if q is None:
-            return SendResult(success=False, error=f"Stream {stream_id} not found")
+        # ── Cron deliveries: always webhook (persistence path) ──
+        if is_cron_delivery:
+            # Optional live-preview: push the cron output to any active
+            # SSE stream so the user gets a quick visual confirmation if
+            # they happen to be watching this chat.  This is decoration
+            # only — the platform's webhook handler is what writes the
+            # cron run to chat history regardless of what we push here.
+            stream_id = self._chat_id_streams.get(chat_id) if chat_id else None
+            if stream_id and stream_id in self._streams:
+                try:
+                    self._push_event_sync(stream_id, {
+                        "event": "message.delta",
+                        "stream_id": stream_id,
+                        "run_id": stream_id,
+                        "timestamp": time.time(),
+                        "delta": content,
+                        "message_id": uuid.uuid4().hex[:12],
+                    })
+                except Exception as exc:  # noqa: BLE001 - best-effort preview
+                    logger.debug(
+                        f"Live-preview SSE push for cron delivery failed (non-fatal): {exc}"
+                    )
+            return await self._send_via_webhook(chat_id, content, metadata)
+        # ────────────────────────────────────────────────────────
 
-        # Push as a message.delta event (text content from the gateway)
-        msg_id = uuid.uuid4().hex[:12]
-        self._push_event_sync(stream_id, {
-            "event": "message.delta",
-            "stream_id": stream_id,
-            "run_id": stream_id,
-            "timestamp": time.time(),
-            "delta": content,
-            "message_id": msg_id,
-        })
+        # ── Live chat replies: SSE-first ────────────────────
+        stream_id = self._chat_id_streams.get(chat_id) if chat_id else None
+        if stream_id:
+            q = self._streams.get(stream_id)
+            if q is not None:
+                msg_id = uuid.uuid4().hex[:12]
+                self._push_event_sync(stream_id, {
+                    "event": "message.delta",
+                    "stream_id": stream_id,
+                    "run_id": stream_id,
+                    "timestamp": time.time(),
+                    "delta": content,
+                    "message_id": msg_id,
+                })
+                return SendResult(success=True, message_id=msg_id)
 
-        return SendResult(success=True, message_id=msg_id)
+        # No live stream and not a cron delivery — preserve the legacy
+        # ``No active stream`` failure shape.  The webhook is cron-only
+        # (rejects payloads without ``user_id``/``job_id``), so attempting
+        # it for a chat reply would always 400 and add log noise.
+        return SendResult(
+            success=False,
+            error=f"No active stream for chat_id={chat_id}",
+        )
+        # ────────────────────────────────────────────────────
+
+    # ── Myah: Bug D v3 — webhook delivery helper ────────────
+    async def _send_via_webhook(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """POST cron output to the platform webhook receiver.
+
+        Reads ``MYAH_PLATFORM_BASE_URL`` / ``MYAH_PLATFORM_BEARER`` /
+        ``MYAH_USER_ID`` fresh from ``os.environ`` per call (the
+        module-level cache at the top of this file is used by the
+        attachment-fetch path which has different startup ordering).
+
+        Payload shape pinned by ``platform/backend/open_webui/routers/
+        processes.py:824-831`` (the ``/webhook/run-complete`` handler).
+
+        **Only fires for cron deliveries.**  The platform's webhook
+        endpoint is ``/api/v1/processes/webhook/run-complete`` — it's
+        cron-specific and rejects payloads without ``user_id`` and
+        ``job_id``.  We detect cron callers by the presence of
+        ``metadata.job_id`` (populated by
+        ``cron/scheduler.py::_build_myah_send_metadata``) and skip the
+        webhook for non-cron chat replies that happen to hit a closed
+        SSE stream — those should preserve the legacy
+        ``"No active stream"`` failure so the gateway's standalone-send
+        retry path can take over.
+        """
+        meta = metadata or {}
+
+        # ── Skip for non-cron callers ──────────────────────
+        # Live chat replies (gateway/run.py → adapter.send) carry
+        # ``metadata={"thread_id": ...}`` or ``None`` — no cron context.
+        # Attempting the webhook there always fails (platform 400s on
+        # missing user_id/job_id) and adds noise to the logs.
+        if not meta.get('job_id'):
+            return SendResult(
+                success=False,
+                error=f"No active stream for chat_id={chat_id}",
+            )
+
+        base_url = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')
+        bearer = _myah_os.environ.get('MYAH_PLATFORM_BEARER')
+        if not (base_url and bearer):
+            # No webhook env — preserve the legacy ``No active stream``
+            # failure shape so existing callers (and existing tests)
+            # don't see new behaviour when the platform isn't wired in.
+            return SendResult(
+                success=False,
+                error=f"No active stream for chat_id={chat_id}",
+            )
+
+        # chat_id resolution: caller-supplied first, then origin metadata
+        # (cron path passes deliver=origin → adapter receives the origin
+        # chat_id via metadata enrichment in scheduler._deliver_result).
+        origin = meta.get('origin') if isinstance(meta.get('origin'), dict) else {}
+        resolved_chat_id = chat_id or (origin.get('chat_id') if origin else '') or ''
+        if not resolved_chat_id:
+            return SendResult(
+                success=False,
+                error="webhook fallback: no chat_id and no metadata.origin.chat_id",
+            )
+
+        user_id = _myah_os.environ.get('MYAH_USER_ID', '')
+        payload = {
+            'user_id': user_id,
+            'job_id': meta.get('job_id') or '',
+            'job_name': meta.get('job_name') or meta.get('job_id') or '',
+            'chat_id': resolved_chat_id,
+            'response': content,
+            'status': meta.get('status') or 'ok',
+            'ran_at': meta.get('ran_at') or '',
+            'tool_calls_log': meta.get('tool_calls_log'),
+        }
+        url = f"{base_url.rstrip('/')}/api/v1/processes/webhook/run-complete"
+        headers = {'Authorization': f'Bearer {bearer}'}
+
+        try:
+            import aiohttp
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if 200 <= resp.status < 300:
+                        msg_id = uuid.uuid4().hex[:12]
+                        return SendResult(success=True, message_id=msg_id)
+                    body_text = ''
+                    try:
+                        body_text = (await resp.text())[:200]
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"Myah webhook delivery failed: status={resp.status} "
+                        f"url={url} chat_id={resolved_chat_id} body={body_text!r}"
+                    )
+                    self._maybe_breadcrumb(
+                        f"webhook delivery non-2xx: {resp.status}",
+                        url=url, chat_id=resolved_chat_id, status=resp.status,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"webhook returned HTTP {resp.status}",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Myah webhook delivery raised {type(exc).__name__}: {exc} "
+                f"(url={url} chat_id={resolved_chat_id})"
+            )
+            self._maybe_breadcrumb(
+                f"webhook delivery exception: {type(exc).__name__}",
+                url=url, chat_id=resolved_chat_id, error=str(exc)[:200],
+            )
+            return SendResult(
+                success=False,
+                error=f"webhook error: {type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _maybe_breadcrumb(message: str, **data: Any) -> None:
+        """Best-effort Sentry breadcrumb at warning level — never raises."""
+        try:
+            import sentry_sdk  # type: ignore[import-not-found]
+            sentry_sdk.add_breadcrumb(
+                category="myah.adapter",
+                level="warning",
+                message=message,
+                data=data,
+            )
+        except Exception:  # noqa: BLE001 - breadcrumb is best-effort
+            pass
+    # ────────────────────────────────────────────────────────
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Push a typing/status indicator to the SSE stream."""
