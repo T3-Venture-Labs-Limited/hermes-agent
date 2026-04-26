@@ -2033,6 +2033,9 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            # ── Myah: Bug C-agent — accept and validate origin ──────
+            origin = body.get("origin")
+            # ────────────────────────────────────────────────────────
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -2049,6 +2052,68 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
 
+            # ── Myah: Bug C-agent — origin validation ────────────────
+            # Two failure modes the platform path can hit:
+            # (1) cron tool path — agent calls create_job() directly via the
+            #     ``cronjob`` tool, where origin is captured from session
+            #     contextvars (gateway/run.py:3785).  Origin reaches us only
+            #     by the agent forwarding it; not validated here.
+            # (2) HTTP form path — platform's ``processes`` router posts here
+            #     after building origin from the chat context.  THIS path
+            #     was silently dropping origin before the fix.
+            #
+            # Validation contract (rejects with 400 — never silent fallback):
+            #   * If ``deliver == "origin"``, an origin object MUST be present.
+            #   * Origin (when present) MUST be a dict with non-empty
+            #     ``platform`` AND ``chat_id``.
+            #   * ``platform`` MUST be a known delivery platform (so we don't
+            #     accidentally enable env-var enumeration via crafted names).
+            #   * Extra keys are preserved (forward-compat with future
+            #     contextvars like origin.thread_id).
+            origin_obj: Optional[Dict[str, Any]] = None
+            if origin is not None:
+                if not isinstance(origin, dict):
+                    return web.json_response(
+                        {"error": "origin must be an object with 'platform' and 'chat_id'"},
+                        status=400,
+                    )
+                origin_platform = (origin.get("platform") or "").strip()
+                origin_chat_id = (origin.get("chat_id") or "").strip() if isinstance(origin.get("chat_id"), str) else origin.get("chat_id")
+                if not origin_platform:
+                    return web.json_response(
+                        {"error": "origin.platform is required"},
+                        status=400,
+                    )
+                if not origin_chat_id:
+                    return web.json_response(
+                        {"error": "origin.chat_id is required"},
+                        status=400,
+                    )
+                # Late import — avoids touching scheduler import order at
+                # module load time, and matches the pattern used by
+                # _resolve_single_delivery_target in cron/scheduler.py.
+                from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
+                if origin_platform.lower() not in _KNOWN_DELIVERY_PLATFORMS:
+                    return web.json_response(
+                        {"error": f"origin.platform '{origin_platform}' is not a known delivery platform"},
+                        status=400,
+                    )
+                # Build the canonical origin object — preserves all extra keys.
+                origin_obj = {**origin, "platform": origin_platform, "chat_id": origin_chat_id}
+
+            if deliver == "origin" and origin_obj is None:
+                return web.json_response(
+                    {
+                        "error": (
+                            "deliver='origin' requires an 'origin' object with "
+                            "'platform' and 'chat_id' — refusing silent fallback "
+                            "(set deliver='local' if you do not need delivery)."
+                        )
+                    },
+                    status=400,
+                )
+            # ────────────────────────────────────────────────────────
+
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -2059,6 +2124,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            # ── Myah: Bug C-agent — forward origin to create_job ────
+            if origin_obj is not None:
+                kwargs["origin"] = origin_obj
+            # ────────────────────────────────────────────────────────
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})

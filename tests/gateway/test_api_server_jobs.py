@@ -233,6 +233,180 @@ class TestCreateJob:
                 assert "schedule" in data["error"].lower() or "Schedule" in data["error"]
 
 
+# ── Myah: Bug C-agent — origin acceptance and validation ────
+#
+# Before the fix, ``_handle_create_job`` silently dropped any
+# ``origin`` key from the request body.  When the platform set
+# ``deliver="origin"`` (because the job was created from a chat),
+# the resulting job had ``origin=None`` and ran successfully every
+# tick but never delivered: ``no delivery target resolved for
+# deliver=origin``.
+#
+# These tests pin three guarantees:
+#
+#   1. A valid ``origin`` payload is forwarded to ``create_job``.
+#   2. ``deliver="origin"`` without a valid origin is rejected
+#      with 400 — no silent fallback to ``deliver="local"``.
+#   3. Origin shape is validated (must be a dict with non-empty
+#      ``platform`` in ``_KNOWN_DELIVERY_PLATFORMS`` and non-empty
+#      ``chat_id``).  Extra keys are preserved (forward-compat).
+
+
+class TestCreateJobOrigin:
+    @pytest.mark.asyncio
+    async def test_create_job_persists_origin(self, adapter):
+        """Valid origin propagates as a kwarg to create_job."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value={**SAMPLE_JOB, "origin": {
+            "platform": "myah",
+            "chat_id": "abc-123",
+            "chat_name": "My Chat",
+            "thread_id": None,
+        }})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                    "origin": {
+                        "platform": "myah",
+                        "chat_id": "abc-123",
+                        "chat_name": "My Chat",
+                        "thread_id": None,
+                    },
+                })
+                assert resp.status == 200, await resp.text()
+                mock_create.assert_called_once()
+                kwargs = mock_create.call_args[1]
+                assert kwargs["deliver"] == "origin"
+                assert kwargs["origin"] == {
+                    "platform": "myah",
+                    "chat_id": "abc-123",
+                    "chat_name": "My Chat",
+                    "thread_id": None,
+                }
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_origin_deliver_without_origin(self, adapter):
+        """deliver='origin' with no origin object → 400 (no silent fallback)."""
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                })
+                assert resp.status == 400, await resp.text()
+                data = await resp.json()
+                assert "origin" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_origin_missing_chat_id(self, adapter):
+        """origin without chat_id → 400."""
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                    "origin": {"platform": "myah"},
+                })
+                assert resp.status == 400, await resp.text()
+                data = await resp.json()
+                assert "chat_id" in data["error"].lower() or "origin" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_origin_unknown_platform(self, adapter):
+        """origin.platform not in _KNOWN_DELIVERY_PLATFORMS → 400."""
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                    "origin": {"platform": "atlantis-9", "chat_id": "abc"},
+                })
+                assert resp.status == 400, await resp.text()
+                data = await resp.json()
+                assert "platform" in data["error"].lower() or "origin" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_origin_not_a_dict(self, adapter):
+        """origin must be a dict; a string → 400."""
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                    "origin": "not-a-dict",
+                })
+                assert resp.status == 400, await resp.text()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_extra_keys_preserved(self, adapter):
+        """Unknown keys in origin must NOT be stripped (forward-compat)."""
+        app = _create_app(adapter)
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return SAMPLE_JOB
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+             patch(f"{_MOD}._cron_create", side_effect=_capture):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "deliver": "origin",
+                    "origin": {
+                        "platform": "myah",
+                        "chat_id": "abc",
+                        "future_field": "preserved",
+                    },
+                })
+                assert resp.status == 200, await resp.text()
+                assert captured["origin"]["future_field"] == "preserved"
+
+    @pytest.mark.asyncio
+    async def test_create_job_without_origin_still_works(self, adapter):
+        """Backward compat: jobs without origin/deliver still create OK."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                })
+                assert resp.status == 200
+                kwargs = mock_create.call_args[1]
+                # No origin should be passed when none was supplied
+                assert "origin" not in kwargs or kwargs.get("origin") is None
+# ────────────────────────────────────────────────────────────
+
+
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
 # ---------------------------------------------------------------------------

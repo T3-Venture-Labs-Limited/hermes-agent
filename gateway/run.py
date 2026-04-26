@@ -364,6 +364,136 @@ class SessionOverride(TypedDict, total=False):
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# ── Myah: Bug A — variadic approval-notify dispatch ─────────────────
+async def _dispatch_approval_notify(
+    adapter: Any,
+    chat_id: str,
+    session_key: str,
+    *args: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Route both legacy and modern approval-callback shapes to the adapter.
+
+    Two callers register against ``_gateway_notify_cbs``:
+
+    1. **Legacy terminal-command approval** — invokes
+       ``cb(approval_data: dict)`` carrying ``command`` + ``description``
+       fields.  Routed to ``adapter.send_exec_approval`` (rich-button
+       UX) with text fallback when the adapter doesn't expose that
+       method.
+
+    2. **Modern action confirmation** — ``request_action_confirmation``
+       in ``tools/approval.py`` invokes ``cb(session_key: str,
+       payload: dict)`` with payload ``type ==
+       "tool.confirmation_required"`` and ``confirmation_id`` /
+       ``action_type`` / ``description`` / ``options`` keys.  Routed to
+       ``adapter.send`` with a human-readable approval card that surfaces
+       the choice options to the user.
+
+    Anything else logs a warning and returns; never raises (the calling
+    site in ``tools/approval.py`` swallows exceptions and would lose all
+    signal otherwise — see the `request_action_confirmation: notify
+    callback failed` regression that broke cron creation).
+    """
+    # Modern shape: (session_key_arg, payload_dict)
+    if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], dict):
+        cb_session_key = args[0]
+        payload = args[1]
+        confirmation_id = payload.get("confirmation_id", "")
+        action_type = payload.get("action_type", "action")
+        description = payload.get("description", "Confirm this action?")
+        options = payload.get("options") or ["approve", "deny"]
+
+        # Prefer the structured SSE path: emit a
+        # ``tool.confirmation_required`` event the frontend renders as
+        # an interactive ``ConfirmationCard`` (Approve / Deny buttons).
+        # Falls back to a plain-text approval card via ``adapter.send``
+        # only when the adapter doesn't expose the structured method
+        # (non-Myah platforms) or the call fails.
+        if getattr(type(adapter), "send_action_confirmation", None) is not None:
+            try:
+                result = await adapter.send_action_confirmation(cb_session_key, payload)
+                if getattr(result, "success", False):
+                    return
+                logger.info(
+                    "structured action confirmation failed (%s); falling back to text",
+                    getattr(result, "error", "unknown"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "send_action_confirmation raised %s — falling back to text",
+                    exc,
+                )
+
+        # Plain-text fallback (legacy adapters or stream gone).  Renders
+        # as markdown in the chat with clickable code formatting.
+        opts_str = " / ".join(f"`{o}`" for o in options)
+        msg = (
+            f"⚠️ **Confirmation required:** {action_type}\n"
+            f"{description}\n\n"
+            f"Reply with one of: {opts_str}\n"
+            f"(confirmation id: `{confirmation_id}`)"
+        )
+        try:
+            await adapter.send(chat_id, msg, metadata=metadata)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "approval-notify modern dispatch failed: %s "
+                "(action_type=%s confirmation_id=%s)",
+                exc, action_type, confirmation_id,
+            )
+        return
+
+    # Legacy shape: (approval_data: dict)
+    if len(args) >= 1 and isinstance(args[0], dict):
+        approval_data = args[0]
+        cmd = approval_data.get("command", "")
+        desc = approval_data.get("description", "dangerous command")
+
+        if getattr(type(adapter), "send_exec_approval", None) is not None:
+            try:
+                result = await adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=cmd,
+                    session_key=session_key,
+                    description=desc,
+                    metadata=metadata,
+                )
+                if getattr(result, "success", True):
+                    return
+                logger.warning(
+                    "Button-based approval failed (send returned error), falling back to text: %s",
+                    getattr(result, "error", "unknown"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Button-based approval failed, falling back to text: %s", exc,
+                )
+
+        # Plain-text fallback prompt
+        cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+        msg = (
+            f"⚠️ **Dangerous command requires approval:**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {desc}\n\n"
+            f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+            f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+        )
+        try:
+            await adapter.send(chat_id, msg, metadata=metadata)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to send approval request: %s", exc)
+        return
+
+    # Unknown shape — never raise (caller in tools/approval.py swallows
+    # exceptions; raising would lose telemetry without changing behavior).
+    logger.warning(
+        "approval-notify dispatch: unknown shape args=%r kwargs(metadata)=%r — ignoring",
+        args, metadata,
+    )
+# ────────────────────────────────────────────────────────────────────
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
@@ -7655,6 +7785,7 @@ class GatewayRunner:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            resolve_action_confirmation_by_session,
         )
 
         if not has_blocking_approval(session_key):
@@ -7679,6 +7810,18 @@ class GatewayRunner:
             scope_msg = ""
 
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        # ── Myah: also resolve modern action confirmations (cron, plugin install, …) ──
+        # The action-confirmation flow accepts only ``approve|approve_session|deny`` —
+        # map our richer command vocabulary down to that contract.
+        action_choice = (
+            "approve_session" if choice == "session"
+            else "approve" if choice in ("once", "always")
+            else "deny"
+        )
+        count += resolve_action_confirmation_by_session(
+            session_key, action_choice, resolve_all=resolve_all,
+        )
+        # ──────────────────────────────────────────────────────────────────────────────
         if not count:
             return "No pending command to approve."
 
@@ -7704,6 +7847,7 @@ class GatewayRunner:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            resolve_action_confirmation_by_session,
         )
 
         if not has_blocking_approval(session_key):
@@ -7716,6 +7860,11 @@ class GatewayRunner:
         resolve_all = "all" in args
 
         count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        # ── Myah: also deny pending modern action confirmations ──
+        count += resolve_action_confirmation_by_session(
+            session_key, "deny", resolve_all=resolve_all,
+        )
+        # ────────────────────────────────────────────────────────
         if not count:
             return "No pending command to deny."
 
@@ -10333,72 +10482,43 @@ class GatewayRunner:
                         reset_secret_request_session_key(secrets_token)
             # ────────────────────────────────────────────────────────
 
-            def _approval_notify_sync(approval_data: dict) -> None:
-                """Send the approval request to the user from the agent thread.
+            # ── Myah: Bug A — variadic notify, dispatch via module helper ──
+            def _approval_notify_sync(*cb_args: Any, **cb_kwargs: Any) -> None:
+                """Forward the approval-notify callback to the testable
+                module-level dispatcher (``_dispatch_approval_notify``).
 
-                If the adapter supports interactive button-based approvals
-                (e.g. Discord's ``send_exec_approval``), use that for a richer
-                UX.  Otherwise fall back to a plain text message with
-                ``/approve`` instructions.
+                Two callers register against ``_gateway_notify_cbs``:
+
+                1. Legacy terminal-command approval — invokes
+                   ``cb(approval_data: dict)``.
+                2. Modern action confirmation — invokes
+                   ``cb(session_key: str, payload: dict)``.
+
+                The previous single-arity ``def _approval_notify_sync(
+                approval_data: dict)`` raised a ``TypeError`` on the
+                modern path, breaking cron creation in chat.
+
+                Pause the typing indicator first (critical for Slack's
+                Assistant API where the compose box is disabled while
+                "is thinking..." is active — the user must be able to
+                respond), then schedule the dispatcher on the gateway's
+                event loop and block briefly for the result.
                 """
-                # Pause the typing indicator while the agent waits for
-                # user approval.  Critical for Slack's Assistant API where
-                # assistant_threads_setStatus disables the compose box — the
-                # user literally cannot type /approve while "is thinking..."
-                # is active.  The approval message send auto-clears the Slack
-                # status; pausing prevents _keep_typing from re-setting it.
-                # Typing resumes in _handle_approve_command/_handle_deny_command.
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
-
-                cmd = approval_data.get("command", "")
-                desc = approval_data.get("description", "dangerous command")
-
-                # Prefer button-based approval when the adapter supports it.
-                # Check the *class* for the method, not the instance — avoids
-                # false positives from MagicMock auto-attribute creation in tests.
-                if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
-                    try:
-                        _approval_result = asyncio.run_coroutine_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
-                            _loop_for_step,
-                        ).result(timeout=15)
-                        if _approval_result.success:
-                            return
-                        logger.warning(
-                            "Button-based approval failed (send returned error), falling back to text: %s",
-                            _approval_result.error,
-                        )
-                    except Exception as _e:
-                        logger.warning(
-                            "Button-based approval failed, falling back to text: %s", _e
-                        )
-
-                # Fallback: plain text approval prompt
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
-                )
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        _status_adapter.send(
+                        _dispatch_approval_notify(
+                            _status_adapter,
                             _status_chat_id,
-                            msg,
+                            _approval_session_key,
+                            *cb_args,
                             metadata=_status_thread_metadata,
                         ),
                         _loop_for_step,
                     ).result(timeout=15)
                 except Exception as _e:
-                    logger.error("Failed to send approval request: %s", _e)
+                    logger.error("approval notify dispatch failed: %s", _e)
+            # ────────────────────────────────────────────────────────────────
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})

@@ -86,6 +86,21 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
         }
+    # ── Myah: Bug E — origin capture failure must not be silent ─────
+    # When this branch fires, the cron job will be persisted with
+    # origin=null and (if the caller defaults to deliver="origin") will
+    # fail to deliver after every successful run.  Emit a structured
+    # WARNING so the next regression takes a minute to diagnose.
+    import threading
+    thread_name = threading.current_thread().name
+    env_session_key = os.environ.get("HERMES_SESSION_KEY", "")
+    logger.warning(
+        "CRON_ORIGIN unresolved: thread=%s HERMES_SESSION_PLATFORM=%r "
+        "HERMES_SESSION_CHAT_ID=%r HERMES_SESSION_KEY_env=%r — "
+        "cron job will be created without origin and may fail to deliver",
+        thread_name, origin_platform, origin_chat_id, env_session_key,
+    )
+    # ────────────────────────────────────────────────────────────────
     return None
 
 

@@ -258,6 +258,79 @@ class TestSendMethods:
         await adapter.send_typing("nonexistent-chat")
 
 
+# ── Myah: Bug A follow-on — structured action confirmation SSE event ──
+
+
+class TestSendActionConfirmation:
+    @pytest.mark.asyncio
+    async def test_emits_tool_confirmation_required_event(self):
+        """send_action_confirmation pushes a tool.confirmation_required event
+        onto the stream queue so the frontend renders the interactive card."""
+        adapter = _make_adapter()
+        q: asyncio.Queue = asyncio.Queue()
+        stream_id = "stream-conf-1"
+        session_key = "agent:main:myah:dm:chat-conf"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = q
+
+        result = await adapter.send_action_confirmation(
+            session_key,
+            {
+                "type": "tool.confirmation_required",
+                "confirmation_id": "conf-uuid-1",
+                "action_type": "cron_create",
+                "description": "Create recurring task: 'joke-teller' every 10m",
+                "options": ["approve", "approve_session", "deny"],
+                "metadata": {
+                    "schedule_display": "every 10m",
+                    "prompt_preview": "Tell a joke.",
+                },
+            },
+        )
+
+        assert result.success is True
+        event = q.get_nowait()
+        assert event["event"] == "tool.confirmation_required"
+        assert event["confirmation_id"] == "conf-uuid-1"
+        assert event["action_type"] == "cron_create"
+        assert event["description"].startswith("Create recurring task")
+        assert event["options"] == ["approve", "approve_session", "deny"]
+        assert event["metadata"]["schedule_display"] == "every 10m"
+        assert event["metadata"]["prompt_preview"] == "Tell a joke."
+        assert event["stream_id"] == stream_id
+        assert event["run_id"] == stream_id  # frontend uses this for the confirm POST
+
+    @pytest.mark.asyncio
+    async def test_no_stream_returns_failure_without_emitting(self):
+        """When session_key has no mapped stream, return failure (caller falls
+        back to text) and don't blow up."""
+        adapter = _make_adapter()
+        result = await adapter.send_action_confirmation(
+            "session-without-stream",
+            {"confirmation_id": "x", "action_type": "y", "description": "z", "options": ["approve"]},
+        )
+        assert result.success is False
+        assert "No active stream" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_default_options_when_payload_missing_options(self):
+        """Default to ['approve', 'deny'] when payload omits options."""
+        adapter = _make_adapter()
+        q: asyncio.Queue = asyncio.Queue()
+        stream_id = "stream-conf-2"
+        session_key = "agent:main:myah:dm:chat-default"
+        adapter._session_streams[session_key] = stream_id
+        adapter._streams[stream_id] = q
+
+        await adapter.send_action_confirmation(
+            session_key,
+            {"confirmation_id": "c", "action_type": "a", "description": "d"},
+        )
+        event = q.get_nowait()
+        assert event["options"] == ["approve", "deny"]
+        assert event["metadata"] == {}  # default when payload omits metadata
+
+
 # ── get_chat_info ───────────────────────────────────────────────────────────
 
 class TestGetChatInfo:

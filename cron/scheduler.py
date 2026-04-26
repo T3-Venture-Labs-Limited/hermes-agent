@@ -135,6 +135,34 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+# ── Myah: Bug D v3 — adapter metadata enrichment for offline delivery ──
+def _build_myah_send_metadata(job: dict, status_hint: str = "ok") -> dict:
+    """Build the supplemental metadata ``MyahAdapter.send()`` needs for
+    its offline-delivery webhook fallback.
+
+    Upstream's ``_deliver_result`` only passes ``{"thread_id": ...}`` to
+    the adapter.  The MyahAdapter's webhook fallback needs richer data
+    (``job_id``, ``job_name``, ``status``, ``ran_at``, plus the original
+    ``origin`` dict so it can fall back to ``origin.chat_id`` when the
+    caller-supplied ``chat_id`` is empty).
+
+    Keeping this helper here — instead of inside the Myah adapter — lets
+    the cron scheduler stay the single owner of cron-execution context
+    while still routing all delivery code through the platform-agnostic
+    ``adapter.send(..., metadata=...)`` interface.  Other platforms see
+    no change because we only call this helper for ``myah`` targets in
+    ``_deliver_result``.
+    """
+    return {
+        "job_id": job.get("id", ""),
+        "job_name": job.get("name") or job.get("id", ""),
+        "status": status_hint,
+        "ran_at": _hermes_now().isoformat(),
+        "origin": _resolve_origin(job),
+    }
+# ──────────────────────────────────────────────────────────────────────
+
+
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Return the configured home target chat/room ID for a delivery platform."""
     env_var = _HOME_TARGET_ENV_VARS.get(platform_name.lower())
@@ -298,7 +326,13 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    status_hint: str = "ok",  # Myah: forwarded to adapter.send metadata
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -306,6 +340,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    ``status_hint`` (Myah-only): forwarded into the adapter ``metadata`` so the
+    Myah offline-delivery webhook can stamp the platform's ``processes``
+    record correctly.  Defaults to ``"ok"``; ``_process_job`` overrides
+    with ``"error"`` when ``run_job`` returns ``success=False``.
 
     Returns None on success, or an error string on failure.
     """
@@ -410,6 +449,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
+            # ── Myah: enrich metadata so the offline-webhook fallback works ──
+            # See gateway/platforms/myah.py::_send_via_webhook — needs
+            # job_id/job_name/status/ran_at and the original origin to
+            # reconstruct the platform's /webhook/run-complete payload.
+            # Other platforms get no change (their adapters ignore the
+            # extra keys).
+            if platform_name.lower() == "myah":
+                if send_metadata is None:
+                    send_metadata = {}
+                send_metadata.update(_build_myah_send_metadata(job, status_hint=status_hint))
+            # ─────────────────────────────────────────────────────────────────
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -1168,7 +1218,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        # ── Myah: pass status_hint so adapter metadata is correct ─
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop,
+                            status_hint="ok" if success else "error",
+                        )
+                        # ──────────────────────────────────────────────────────────
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
