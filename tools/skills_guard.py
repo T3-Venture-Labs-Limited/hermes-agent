@@ -36,7 +36,11 @@ from typing import List, Tuple
 # Hardcoded trust configuration
 # ---------------------------------------------------------------------------
 
-TRUSTED_REPOS = {"openai/skills", "anthropics/skills"}
+TRUSTED_REPOS = {
+    "openai/skills",
+    "anthropics/skills",
+    "T3-Venture-Labs-Limited/myah-skills",
+}
 
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
