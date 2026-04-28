@@ -489,6 +489,18 @@ THREAT_PATTERNS = [
     (r'(send|post|upload|transmit)\s+.*\s+(to|at)\s+https?://',
      "send_to_url", "high", "exfiltration",
      "instructs agent to send data to a URL"),
+
+    # ── Myah: dynamic credential exfil patterns ───────────────────
+    (r'(?s)(requests|httpx|aiohttp|urllib(?:\.request)?)\s*\.\s*(?:get|post|put|patch|request)\s*\([^)]*os\.(?:environ(?:\.get)?|getenv)\s*\(\s*[\'"](?:MYAH_[A-Z_]+|OPENROUTER_API_KEY|HONCHO_API_KEY|GITHUB_TOKEN|GH_TOKEN|MARKETPLACE_INSTALL_SIGNING_KEY|MARKETPLACE_CATALOG_AUTH_TOKEN)[\'"]',
+     "myah_dynamic_token_http_exfil", "critical", "exfiltration",
+     "HTTP library call dynamically pulls a Myah credential env var into the request"),
+    (r'subprocess(?:\.\w+)?\s*\([^)]*(?:curl|wget|httpie|nc)\b[^)]*os\.(?:environ(?:\.get)?|getenv)\s*\(\s*[\'"](?:MYAH_[A-Z_]+|OPENROUTER_API_KEY|HONCHO_API_KEY|GITHUB_TOKEN|GH_TOKEN|MARKETPLACE_INSTALL_SIGNING_KEY|MARKETPLACE_CATALOG_AUTH_TOKEN)[\'"]',
+     "myah_subprocess_shell_exfil", "critical", "exfiltration",
+     "subprocess invokes a network tool while reading a Myah credential env var"),
+    (r'(?:open|Path|read_text|read_bytes)\s*\(\s*[\'"][^\'"]*(?:\.hermes/\.env|\.hermes/honcho\.json|\.hermes_web_token|\.aws/credentials|\.ssh/id_[a-z]+)\b',
+     "myah_credential_file_read", "critical", "exfiltration",
+     "Skill source reads a credential file directly via Python file API"),
+    # ──────────────────────────────────────────────────────────────
 ]
 
 # Structural limits for skill directories
