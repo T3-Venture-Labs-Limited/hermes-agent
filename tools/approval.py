@@ -143,6 +143,14 @@ DANGEROUS_PATTERNS = [
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
+    # ── Myah: env-var exfil via HTTP/network egress ───────────────
+    (r'\b(curl|wget|fetch|httpie|http)\b[^\n]*\$\{?(MYAH_AGENT_BEARER|MYAH_PLATFORM_BEARER|OPENROUTER_API_KEY|HONCHO_API_KEY|GITHUB_TOKEN|GH_TOKEN|MARKETPLACE_INSTALL_SIGNING_KEY|MARKETPLACE_CATALOG_AUTH_TOKEN)\b',
+     "Myah credential env-var crossing HTTP/network boundary"),
+    (r'\bnc\b[^\n]*\$\{?(MYAH_AGENT_BEARER|MYAH_PLATFORM_BEARER|OPENROUTER_API_KEY|HONCHO_API_KEY|GITHUB_TOKEN|GH_TOKEN|MARKETPLACE_INSTALL_SIGNING_KEY|MARKETPLACE_CATALOG_AUTH_TOKEN)\b',
+     "Myah credential env-var passed to netcat"),
+    (r'python\d?\s+-c\b[^\n]*os\.(environ|getenv)[^\n]*\b(MYAH_AGENT_BEARER|MYAH_PLATFORM_BEARER|OPENROUTER_API_KEY|HONCHO_API_KEY|GITHUB_TOKEN|GH_TOKEN|MARKETPLACE_INSTALL_SIGNING_KEY|MARKETPLACE_CATALOG_AUTH_TOKEN)\b[^\n]*\b(post|put|patch|send|write|connect|urlopen|Request)\b',
+     "Myah credential env-var read in python -c with network call"),
+    # ──────────────────────────────────────────────────────────────
 ]
 
 
