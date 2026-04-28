@@ -1141,22 +1141,75 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── Myah: media streaming endpoint ─────────────────────────────────────────
     def _myah_allowed_media_roots(self) -> 'list[_myah_Path]':
-        """Return the list of allowed cache directories for media streaming."""
+        """Return the list of allowed media-streaming roots.
+
+        Derived from THREE sources:
+          1. Hardcoded Hermes cache directories (always included for back-compat).
+          2. Hermes' configured terminal.cwd from config.yaml. This is where
+             the agent's bash/execute_code tools land by default. For hosted
+             Myah this is /root (Hermes' Docker default). For OSS-Myah this is
+             whatever the user configured (e.g. ~/workspace).
+          3. Optional MYAH_MEDIA_ALLOWED_ROOTS env var (colon-separated paths)
+             for explicit additions beyond terminal.cwd.
+
+        Each root is resolved (symlinks followed, strict=False so non-existent
+        paths don't raise) so the subpath check in _handle_media_get is
+        consistent with what the OS sees on disk.
+        """
+        import os as _myah_os_mod
         from hermes_constants import get_hermes_home, get_hermes_dir
+
         base = get_hermes_home()
-        roots = [
-            # ── Myah: root cache dir — allow any artifact the agent writes
-            # directly under /data/.hermes/cache/. Without this, files the
-            # agent creates via execute_code/terminal (which default to the
-            # cache root, not a subdirectory) return 403 and never persist
-            # back to the chat. T3-1001 dogfooding 2026-04-24.
+        roots: 'list[_myah_Path]' = [
+            # ── Myah: hermes cache directories (always allowed) ─────────────
+            # The four canonical cache dirs Hermes' own tools write to plus
+            # the cache root for tools that default to the root cache dir.
+            # T3-1001 dogfooding 2026-04-24.
             (base / 'cache').resolve(),
-            # ────────────────────────────────────────────────────────────
             get_hermes_dir('cache/images', 'image_cache').resolve(),
             get_hermes_dir('cache/audio', 'audio_cache').resolve(),
             get_hermes_dir('cache/documents', 'document_cache').resolve(),
             get_hermes_dir('cache/screenshots', 'browser_screenshots').resolve(),
+            # ────────────────────────────────────────────────────────────────
         ]
+
+        # ── Myah: derive allowed roots from terminal.cwd + env var (2026-04-28) ─
+        # Topology coverage:
+        #   - Hosted Myah: terminal.cwd: /root (Hermes default in our Docker
+        #     image) → /root is in the allowlist automatically.
+        #   - OSS Myah: user configures terminal.cwd to ~/workspace or similar
+        #     → that path is in the allowlist automatically.
+        #   - Anything else: MYAH_MEDIA_ALLOWED_ROOTS env var (colon-separated).
+        try:
+            from hermes_cli.config import load_config
+            _myah_cfg = load_config() or {}
+            _myah_terminal_cwd = (_myah_cfg.get('terminal', {}) or {}).get('cwd')
+            if _myah_terminal_cwd:
+                try:
+                    roots.append(_myah_Path(_myah_terminal_cwd).expanduser().resolve(strict=False))
+                except (OSError, ValueError):
+                    logger.warning(
+                        'Skipping unresolvable terminal.cwd in allowed media roots: %r',
+                        _myah_terminal_cwd,
+                    )
+        except ImportError:
+            # hermes_cli.config not importable in this context — fall back to env var only.
+            pass
+
+        _myah_extra_roots = _myah_os_mod.environ.get('MYAH_MEDIA_ALLOWED_ROOTS', '')
+        for _myah_extra in _myah_extra_roots.split(':'):
+            _myah_extra = _myah_extra.strip()
+            if not _myah_extra:
+                continue
+            try:
+                roots.append(_myah_Path(_myah_extra).expanduser().resolve(strict=False))
+            except (OSError, ValueError):
+                logger.warning(
+                    'Skipping unresolvable path in MYAH_MEDIA_ALLOWED_ROOTS: %r',
+                    _myah_extra,
+                )
+        # ────────────────────────────────────────────────────────────────────────
+
         return roots
 
     async def _handle_media_get(self, request: 'web.Request') -> 'web.Response':
