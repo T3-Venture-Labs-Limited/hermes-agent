@@ -232,6 +232,66 @@ async def append_session_message(
     }
 
 
+# ── Session events read (myah-adapter event log) ───────────────────────
+
+
+@router.get("/sessions/{session_id}/events")
+async def get_session_events(
+    session_id: str = Path(..., min_length=1),
+) -> dict[str, Any]:
+    """Return chronological raw events captured by the Myah adapter's
+    event log. Each event is the JSON-decoded dict that flowed through
+    the platform adapter's _push_event for this session.
+
+    Empty list for sessions that pre-date the Path C deploy or had no
+    agent activity captured (e.g., cron-only sessions). The platform's
+    read path tolerates an empty list — assistant messages without
+    matching events render their plain content.
+    """
+    import json
+    import sqlite3
+    from hermes_constants import get_hermes_home
+
+    db_path = get_hermes_home() / "state.db"
+    if not db_path.exists():
+        return {"session_id": session_id, "events": []}
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT position, hermes_message_id, event_type, payload, created_at "
+                    "FROM myah_session_events WHERE session_id = ? ORDER BY position",
+                    (session_id,),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc):
+                    return {"session_id": session_id, "events": []}
+                raise
+    except sqlite3.Error as exc:
+        logger.exception("[myah-admin] failed to read myah_session_events")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read session events: {exc}",
+        ) from exc
+
+    events = []
+    for position, msg_id, event_type, payload_raw, created_at in rows:
+        try:
+            payload = json.loads(payload_raw)
+        except (json.JSONDecodeError, TypeError):
+            payload = {"_raw": payload_raw, "_decode_error": True}
+        events.append({
+            "position": position,
+            "hermes_message_id": msg_id,
+            "event_type": event_type,
+            "payload": payload,
+            "created_at": created_at,
+        })
+
+    return {"session_id": session_id, "events": events}
+
+
 # ── Session-scoped model overrides (runner-coupled, proxied) ───────────────
 
 
