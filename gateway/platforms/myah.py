@@ -424,8 +424,27 @@ class MyahAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+        # ── Myah: synchronously resolve hermes_session_id for platform mapping ──
+        # The platform stores chat.hermes_session_id so its GET /api/sessions/{X}
+        # read paths can find the right SessionDB row. We need to return the real
+        # auto-generated session.id (not just the chat_id we received) in the 202
+        # response so the platform can capture and store the mapping.
+        hermes_session_id: Optional[str] = None
+        try:
+            _runner = self.gateway_runner
+            if _runner is not None and hasattr(_runner, 'session_store'):
+                _entry = _runner.session_store.get_or_create_session(source)
+                hermes_session_id = _entry.session_id
+        except Exception as _hsid_err:
+            logger.debug("[myah] failed to resolve hermes_session_id: %s", _hsid_err)
+        # ────────────────────────────────────────────────────────────────────────
+
         return web.json_response(
-            {"stream_id": stream_id, "session_id": session_id},
+            {
+                "stream_id": stream_id,
+                "session_id": session_id,
+                "hermes_session_id": hermes_session_id,  # Myah: real SessionDB id (or null on failure)
+            },
             status=202,
         )
 
