@@ -31,15 +31,15 @@ class ChatCompletionsTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
         """Messages are already in OpenAI format — sanitize Codex leaks only.
 
-        Strips Codex Responses API fields (``codex_reasoning_items`` on the
-        message, ``call_id``/``response_item_id`` on tool_calls) that strict
-        chat-completions providers reject with 400/422.
+        Strips Codex Responses API fields (``codex_reasoning_items`` /
+        ``codex_message_items`` on the message, ``call_id``/``response_item_id``
+        on tool_calls) that strict chat-completions providers reject with 400/422.
         """
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            if "codex_reasoning_items" in msg:
+            if "codex_reasoning_items" in msg or "codex_message_items" in msg:
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
@@ -59,6 +59,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if not isinstance(msg, dict):
                 continue
             msg.pop("codex_reasoning_items", None)
+            msg.pop("codex_message_items", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
@@ -187,6 +188,7 @@ class ChatCompletionsTransport(ProviderTransport):
         anthropic_max_out = params.get("anthropic_max_output")
         is_nvidia_nim = params.get("is_nvidia_nim", False)
         is_kimi = params.get("is_kimi", False)
+        is_tokenhub = params.get("is_tokenhub", False)
         reasoning_config = params.get("reasoning_config")
 
         if ephemeral is not None and max_tokens_fn:
@@ -217,6 +219,21 @@ class ChatCompletionsTransport(ProviderTransport):
                     if _e in ("low", "medium", "high"):
                         _kimi_effort = _e
                 api_kwargs["reasoning_effort"] = _kimi_effort
+
+        # Tencent TokenHub: top-level reasoning_effort (unless thinking disabled)
+        if is_tokenhub:
+            _tokenhub_thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not _tokenhub_thinking_off:
+                _tokenhub_effort = "high"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in ("low", "medium", "high"):
+                        _tokenhub_effort = _e
+                api_kwargs["reasoning_effort"] = _tokenhub_effort
 
         # extra_body assembly
         extra_body: Dict[str, Any] = {}
