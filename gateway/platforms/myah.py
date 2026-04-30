@@ -108,6 +108,13 @@ class MyahAdapter(BasePlatformAdapter):
         # stream_id → creation timestamp (for TTL sweep)
         self._streams_created: Dict[str, float] = {}
 
+        # ── Myah: event log for reload UX ───────────────────────────────────
+        # Maps stream_id → SessionDB session.id so _push_event knows where
+        # to persist captured events. Populated in _handle_message_endpoint
+        # when H1 resolves session.id from the gateway's session_store.
+        self._stream_to_session_id: Dict[str, str] = {}
+        # ────────────────────────────────────────────────────────────────────
+
         # ── Dual session mapping (Fix 1) ────────────────────────────────
         # The gateway calls adapter.send(chat_id=source.chat_id) where
         # chat_id is the RAW session_id from the source.  But the
@@ -174,6 +181,26 @@ class MyahAdapter(BasePlatformAdapter):
         except RuntimeError:
             pass  # Event loop closed
 
+        # ── Myah: persist event for reload UX ───────────────────────────
+        try:
+            session_id = self._stream_to_session_id.get(stream_id)
+            if session_id:
+                from gateway.platforms.myah_event_log import (
+                    append_event as _myah_append_event,
+                    backfill_message_id as _myah_backfill_msg_id,
+                )
+                _myah_append_event(session_id, event)
+                if event.get("event") == "run.completed":
+                    msg_id = self._latest_assistant_message_id(session_id)
+                    if msg_id is not None:
+                        _myah_backfill_msg_id(session_id, msg_id)
+                if event.get("event") in ("run.completed", "run.failed"):
+                    # Stream is ending; clean up the mapping.
+                    self._stream_to_session_id.pop(stream_id, None)
+        except Exception as _ev_log_exc:
+            logger.debug("[myah] event log fan-out failed: %s", _ev_log_exc)
+        # ────────────────────────────────────────────────────────────────
+
     def _push_event_sync(self, stream_id: str, event: Dict[str, Any]) -> None:
         """Direct push — only safe from the event loop thread."""
         q = self._streams.get(stream_id)
@@ -183,6 +210,49 @@ class MyahAdapter(BasePlatformAdapter):
             q.put_nowait(event)
         except asyncio.QueueFull:
             pass
+
+        # ── Myah: persist event for reload UX ───────────────────────────
+        try:
+            session_id = self._stream_to_session_id.get(stream_id)
+            if session_id:
+                from gateway.platforms.myah_event_log import (
+                    append_event as _myah_append_event,
+                    backfill_message_id as _myah_backfill_msg_id,
+                )
+                _myah_append_event(session_id, event)
+                if event.get("event") == "run.completed":
+                    msg_id = self._latest_assistant_message_id(session_id)
+                    if msg_id is not None:
+                        _myah_backfill_msg_id(session_id, msg_id)
+                if event.get("event") in ("run.completed", "run.failed"):
+                    # Stream is ending; clean up the mapping.
+                    self._stream_to_session_id.pop(stream_id, None)
+        except Exception as _ev_log_exc:
+            logger.debug("[myah] event log fan-out failed: %s", _ev_log_exc)
+        # ────────────────────────────────────────────────────────────────
+
+    # ── Myah: latest-assistant-message lookup for event log back-fill ───
+    def _latest_assistant_message_id(self, session_id: str) -> Optional[int]:
+        """Return the most recent messages.id where role='assistant' for the
+        given session. Used at run.completed to link the just-captured events
+        to the assistant message row the gateway just wrote."""
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                with db._lock:  # noqa: SLF001
+                    row = db._conn.execute(  # noqa: SLF001
+                        "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                return row[0] if row else None
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.debug("[myah] latest-assistant lookup failed: %s", exc)
+            return None
+    # ────────────────────────────────────────────────────────────────────
 
     # ── HTTP endpoint handlers ──────────────────────────────────────────
 
@@ -438,6 +508,11 @@ class MyahAdapter(BasePlatformAdapter):
         except Exception as _hsid_err:
             logger.debug("[myah] failed to resolve hermes_session_id: %s", _hsid_err)
         # ────────────────────────────────────────────────────────────────────────
+
+        # ── Myah: record stream→session mapping for event log ───────────
+        if hermes_session_id:
+            self._stream_to_session_id[stream_id] = hermes_session_id
+        # ────────────────────────────────────────────────────────────────
 
         return web.json_response(
             {
