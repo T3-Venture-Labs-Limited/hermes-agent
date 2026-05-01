@@ -113,6 +113,11 @@ class MyahAdapter(BasePlatformAdapter):
         # to persist captured events. Populated in _handle_message_endpoint
         # when H1 resolves session.id from the gateway's session_store.
         self._stream_to_session_id: Dict[str, str] = {}
+        # stream_id → max(messages.id) at run START. Used at run.completed
+        # to scope the back-fill to messages written by THIS run, eliminating
+        # a race with cron appends landing in the microseconds between the
+        # gateway writing the agent's message and run.completed firing.
+        self._stream_to_start_message_id: Dict[str, int] = {}
         # ────────────────────────────────────────────────────────────────────
 
         # ── Dual session mapping (Fix 1) ────────────────────────────────
@@ -182,23 +187,7 @@ class MyahAdapter(BasePlatformAdapter):
             pass  # Event loop closed
 
         # ── Myah: persist event for reload UX ───────────────────────────
-        try:
-            session_id = self._stream_to_session_id.get(stream_id)
-            if session_id:
-                from gateway.platforms.myah_event_log import (
-                    append_event as _myah_append_event,
-                    backfill_message_id as _myah_backfill_msg_id,
-                )
-                _myah_append_event(session_id, event)
-                if event.get("event") == "run.completed":
-                    msg_id = self._latest_assistant_message_id(session_id)
-                    if msg_id is not None:
-                        _myah_backfill_msg_id(session_id, msg_id)
-                if event.get("event") in ("run.completed", "run.failed"):
-                    # Stream is ending; clean up the mapping.
-                    self._stream_to_session_id.pop(stream_id, None)
-        except Exception as _ev_log_exc:
-            logger.debug("[myah] event log fan-out failed: %s", _ev_log_exc)
+        self._myah_fan_event_to_log(stream_id, event)
         # ────────────────────────────────────────────────────────────────
 
     def _push_event_sync(self, stream_id: str, event: Dict[str, Any]) -> None:
@@ -212,46 +201,47 @@ class MyahAdapter(BasePlatformAdapter):
             pass
 
         # ── Myah: persist event for reload UX ───────────────────────────
-        try:
-            session_id = self._stream_to_session_id.get(stream_id)
-            if session_id:
-                from gateway.platforms.myah_event_log import (
-                    append_event as _myah_append_event,
-                    backfill_message_id as _myah_backfill_msg_id,
-                )
-                _myah_append_event(session_id, event)
-                if event.get("event") == "run.completed":
-                    msg_id = self._latest_assistant_message_id(session_id)
-                    if msg_id is not None:
-                        _myah_backfill_msg_id(session_id, msg_id)
-                if event.get("event") in ("run.completed", "run.failed"):
-                    # Stream is ending; clean up the mapping.
-                    self._stream_to_session_id.pop(stream_id, None)
-        except Exception as _ev_log_exc:
-            logger.debug("[myah] event log fan-out failed: %s", _ev_log_exc)
+        self._myah_fan_event_to_log(stream_id, event)
         # ────────────────────────────────────────────────────────────────
 
-    # ── Myah: latest-assistant-message lookup for event log back-fill ───
-    def _latest_assistant_message_id(self, session_id: str) -> Optional[int]:
-        """Return the most recent messages.id where role='assistant' for the
-        given session. Used at run.completed to link the just-captured events
-        to the assistant message row the gateway just wrote."""
+    # ── Myah: shared event-log fan-out (called from both push paths) ────
+    def _myah_fan_event_to_log(self, stream_id: str, event: Dict[str, Any]) -> None:
+        """Persist one event to ``myah_session_events`` for reload UX, and
+        on run.completed back-fill ``hermes_message_id`` for events captured
+        during this run.
+
+        Persistence failures must NEVER propagate — the live SSE stream
+        cannot break because of an event-log write error. All exceptions
+        are caught and logged at debug.
+
+        Race-fix: at run.completed we look up the max assistant message id
+        whose id is greater than the one captured at run START
+        (``_stream_to_start_message_id``). This scopes the back-fill to
+        messages written by THIS run, ignoring any cron append that may
+        have landed for the same session in the interim.
+        """
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                with db._lock:  # noqa: SLF001
-                    row = db._conn.execute(  # noqa: SLF001
-                        "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
-                        "ORDER BY id DESC LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                return row[0] if row else None
-            finally:
-                db.close()
-        except Exception as exc:
-            logger.debug("[myah] latest-assistant lookup failed: %s", exc)
-            return None
+            session_id = self._stream_to_session_id.get(stream_id)
+            if not session_id:
+                return
+            from gateway.platforms.myah_event_log import (
+                append_event as _myah_append_event,
+                backfill_message_id as _myah_backfill_msg_id,
+                get_max_assistant_message_id as _myah_get_max_msg_id,
+            )
+            _myah_append_event(session_id, event)
+            event_type = event.get("event")
+            if event_type == "run.completed":
+                start_id = self._stream_to_start_message_id.get(stream_id, 0)
+                msg_id = _myah_get_max_msg_id(session_id, after_id=start_id)
+                if msg_id is not None:
+                    _myah_backfill_msg_id(session_id, msg_id)
+            if event_type in ("run.completed", "run.failed"):
+                # Stream is ending; clean up the mappings.
+                self._stream_to_session_id.pop(stream_id, None)
+                self._stream_to_start_message_id.pop(stream_id, None)
+        except Exception as _ev_log_exc:
+            logger.debug("[myah] event log fan-out failed: %s", _ev_log_exc)
     # ────────────────────────────────────────────────────────────────────
 
     # ── HTTP endpoint handlers ──────────────────────────────────────────
@@ -510,8 +500,24 @@ class MyahAdapter(BasePlatformAdapter):
         # ────────────────────────────────────────────────────────────────────────
 
         # ── Myah: record stream→session mapping for event log ───────────
+        # Also capture the current MAX assistant message id so run.completed
+        # can scope the back-fill query to messages written DURING this run
+        # (eliminates the race with cron appends — see myah_event_log.py
+        # docstring on get_max_assistant_message_id).
         if hermes_session_id:
             self._stream_to_session_id[stream_id] = hermes_session_id
+            try:
+                from gateway.platforms.myah_event_log import (
+                    get_max_assistant_message_id as _myah_get_max_msg_id,
+                )
+                self._stream_to_start_message_id[stream_id] = (
+                    _myah_get_max_msg_id(hermes_session_id) or 0
+                )
+            except Exception as _start_err:
+                self._stream_to_start_message_id[stream_id] = 0
+                logger.debug(
+                    "[myah] start-message-id capture failed: %s", _start_err
+                )
         # ────────────────────────────────────────────────────────────────
 
         return web.json_response(
@@ -691,6 +697,14 @@ class MyahAdapter(BasePlatformAdapter):
             # Clean up the stream
             self._streams.pop(stream_id, None)
             self._streams_created.pop(stream_id, None)
+            # ── Myah: also drop event-log mappings — _push_event only
+            # cleans these on run.completed/run.failed, but streams can
+            # also exit via SSE timeout, client disconnect, or agent
+            # cancellation. Without this the dicts grow unbounded over a
+            # long-running container's lifetime.
+            self._stream_to_session_id.pop(stream_id, None)
+            self._stream_to_start_message_id.pop(stream_id, None)
+            # ────────────────────────────────────────────────────────────
 
         return response
 
@@ -1209,6 +1223,10 @@ class MyahAdapter(BasePlatformAdapter):
                 logger.debug("[myah] sweeping orphaned stream %s", sid)
                 q = self._streams.pop(sid, None)
                 self._streams_created.pop(sid, None)
+                # ── Myah: also drop event-log mappings on TTL sweep ──
+                self._stream_to_session_id.pop(sid, None)
+                self._stream_to_start_message_id.pop(sid, None)
+                # ─────────────────────────────────────────────────────
                 # Also clean up any lingering mappings
                 session_key = self._stream_sessions.pop(sid, None)
                 if session_key:
