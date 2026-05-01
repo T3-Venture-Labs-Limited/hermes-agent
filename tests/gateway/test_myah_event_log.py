@@ -232,3 +232,73 @@ def test_position_recovery_after_process_restart():
             ("s1",),
         ).fetchall()
     assert [r[0] for r in rows] == [1, 2, 3]
+
+
+# ── get_max_assistant_message_id (race-fix helper) ─────────────────────
+
+
+def test_max_assistant_message_id_returns_none_for_empty_session():
+    """No messages yet → None (not 0, not error)."""
+    _seed_session("empty_session")
+    assert myah_event_log.get_max_assistant_message_id("empty_session") is None
+
+
+def test_max_assistant_message_id_returns_max_id():
+    """Returns the highest id among assistant messages."""
+    _seed_session("s1")
+    msg1 = _append_real_message("s1", "first")
+    msg2 = _append_real_message("s1", "second")
+    msg3 = _append_real_message("s1", "third")
+    result = myah_event_log.get_max_assistant_message_id("s1")
+    assert result == msg3
+    # Sanity: the ids are monotonic increasing
+    assert msg1 < msg2 < msg3
+
+
+def test_max_assistant_message_id_filters_by_after_id():
+    """Race-fix path: only returns ids strictly greater than after_id."""
+    _seed_session("s1")
+    msg1 = _append_real_message("s1", "before run")
+    msg2 = _append_real_message("s1", "during run")
+
+    # Pretend the run started after msg1 was already in the DB.
+    # Only msg2 should qualify.
+    result = myah_event_log.get_max_assistant_message_id("s1", after_id=msg1)
+    assert result == msg2
+
+    # If after_id is the most recent message, no qualifying row exists.
+    result_none = myah_event_log.get_max_assistant_message_id("s1", after_id=msg2)
+    assert result_none is None
+
+
+def test_max_assistant_message_id_ignores_non_assistant_roles():
+    """Tool / user / session_meta rows must not satisfy the query."""
+    _seed_session("s1")
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        # Insert several non-assistant messages
+        db.append_message("s1", role="user", content="q")
+        db.append_message("s1", role="tool", tool_call_id="c1", content="r")
+        # Then one assistant
+        asst_id = db.append_message("s1", role="assistant", content="a")
+        # Then more non-assistants AFTER the assistant — these must NOT be returned.
+        db.append_message("s1", role="user", content="q2")
+        db.append_message("s1", role="tool", tool_call_id="c2", content="r2")
+    finally:
+        db.close()
+
+    assert myah_event_log.get_max_assistant_message_id("s1") == asst_id
+
+
+def test_max_assistant_message_id_tolerates_missing_db():
+    """Querying when the DB file doesn't exist returns None (not raise)."""
+    # autouse fixture has reset state but not created any DB; this test just
+    # passes session_id without seeding to confirm graceful handling.
+    assert myah_event_log.get_max_assistant_message_id("never_seeded") is None
+
+
+def test_max_assistant_message_id_handles_empty_session_id():
+    """Defensive: empty session_id returns None without touching the DB."""
+    assert myah_event_log.get_max_assistant_message_id("") is None
+    assert myah_event_log.get_max_assistant_message_id(None) is None  # type: ignore[arg-type]

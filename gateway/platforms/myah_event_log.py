@@ -153,6 +153,40 @@ def backfill_message_id(session_id: str, hermes_message_id: int) -> None:
         logger.warning("[myah_event_log] back-fill failed for %s: %s", session_id, exc)
 
 
+def get_max_assistant_message_id(session_id: str, after_id: int = 0) -> int | None:
+    """Return ``MAX(messages.id)`` where ``session_id=?`` AND ``role='assistant'``
+    AND ``id > after_id``.
+
+    Used by the Myah adapter to decide which assistant message a just-completed
+    run's events should be linked to. Passing ``after_id`` (the max assistant
+    message id captured at run START) eliminates a race with concurrent cron
+    appends: without it, a cron append landing in the microseconds between the
+    gateway writing the agent's assistant message and the adapter's
+    ``run.completed`` handler firing would cause the adapter to back-fill the
+    cron's id instead of the agent's.
+
+    Uses a separate sqlite3 connection rather than ``SessionDB`` private
+    attributes (``_lock``, ``_conn``) so upstream Hermes refactors of
+    SessionDB internals don't silently break the Myah adapter.
+
+    Returns ``None`` if no qualifying message exists or on any sqlite error
+    (callers must tolerate ``None``).
+    """
+    if not session_id:
+        return None
+    try:
+        with sqlite3.connect(str(_db_path())) as conn:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND id > ?",
+                (session_id, after_id),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+    except sqlite3.Error as exc:
+        logger.debug("[myah_event_log] max-assistant lookup failed: %s", exc)
+        return None
+
+
 def reset_state_for_tests() -> None:
     """Reset module-level state. For test isolation only."""
     global _schema_ensured
