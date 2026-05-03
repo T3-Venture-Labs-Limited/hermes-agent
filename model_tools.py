@@ -136,7 +136,7 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()  # auto-imports every tools/*.py with a top-level registry.register() (includes tools/secrets_tool.py)
+discover_builtin_tools()  # auto-imports every tools/*.py with a top-level registry.register()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()

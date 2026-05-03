@@ -10916,26 +10916,22 @@ class GatewayRunner:
                 set_secret_session_key,
                 reset_secret_session_key,
             )
-            from tools.secrets_tool import (
-                set_secrets_request_callback,
-                set_secret_request_session_key,
-                reset_secret_request_session_key,
-            )
 
             def _cleanup_secret_callbacks(
                 session_key,
                 skills_registered, skills_token,
-                secrets_registered, secrets_token,
             ):
-                """Unregister all secret capture callbacks for the session."""
+                """Unregister skills_tool secret-capture callback for the session.
+
+                The secrets_tool callback used to be unregistered here too,
+                but secrets_tool moved out of core in Phase 4c; the
+                myah-hermes-plugin's platform adapter (Phase 4d) will own that
+                callback's lifecycle once it's wired up.
+                """
                 if skills_registered:
                     set_secret_capture_callback(session_key, None)
                     if skills_token is not None:
                         reset_secret_session_key(skills_token)
-                if secrets_registered:
-                    set_secrets_request_callback(session_key, None)
-                    if secrets_token is not None:
-                        reset_secret_request_session_key(secrets_token)
             # ────────────────────────────────────────────────────────
 
             # ── Myah: Bug A — variadic notify, dispatch via module helper ──
@@ -11035,10 +11031,13 @@ class GatewayRunner:
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
 
             # ── Myah: secret capture callback ────────────────────────
+            # skills_tool (skill-driven capture) is wired here. The secrets_tool
+            # (ad-hoc requests) callback used to be wired alongside it but
+            # secrets_tool moved into the myah-hermes-plugin in Phase 4c — the
+            # plugin's platform adapter (Phase 4d) will re-register that
+            # callback against the same SecretInputCard delivery path.
             _secret_cb_registered = False
             _secret_session_token = None
-            _secrets_tool_registered = False
-            _secrets_tool_token = None
             if _plat_adapter and hasattr(_plat_adapter, '_secret_capture_callback'):
                 _sid = _plat_adapter._session_streams.get(session_key) if hasattr(_plat_adapter, '_session_streams') else None
                 if _sid:
@@ -11049,12 +11048,6 @@ class GatewayRunner:
                     _secret_session_token = set_secret_session_key(_approval_session_key)
                     set_secret_capture_callback(_approval_session_key, _secret_cb)
                     _secret_cb_registered = True
-                    # Also wire the same callback for the generic secrets tool
-                    # so both skills_tool (skill-driven capture) and secrets_tool
-                    # (ad-hoc requests) use the same SecretInputCard delivery path.
-                    _secrets_tool_token = set_secret_request_session_key(_approval_session_key)
-                    set_secrets_request_callback(_approval_session_key, _secret_cb)
-                    _secrets_tool_registered = True
             # ────────────────────────────────────────────────────────
 
             # If _prepare_inbound_message_text buffered image paths for native
@@ -11117,7 +11110,6 @@ class GatewayRunner:
                         _cleanup_secret_callbacks(
                             _approval_session_key,
                             _secret_cb_registered, _secret_session_token,
-                            _secrets_tool_registered, _secrets_tool_token,
                         )
                         if _sentry_tx:
                             try:
@@ -11145,7 +11137,6 @@ class GatewayRunner:
                         _cleanup_secret_callbacks(
                             _approval_session_key,
                             _secret_cb_registered, _secret_session_token,
-                            _secrets_tool_registered, _secrets_tool_token,
                         )
             else:
                 try:
@@ -11156,7 +11147,6 @@ class GatewayRunner:
                     _cleanup_secret_callbacks(
                         _approval_session_key,
                         _secret_cb_registered, _secret_session_token,
-                        _secrets_tool_registered, _secrets_tool_token,
                     )
             # ────────────────────────────────────────────────────────
             result_holder[0] = result
