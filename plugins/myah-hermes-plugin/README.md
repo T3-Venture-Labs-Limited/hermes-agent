@@ -26,7 +26,10 @@ runs cleanly against upstream.
 ## Install
 
 ```bash
-pip install -e plugins/myah-hermes-plugin    # from the hermes fork checkout
+# From the hermes fork checkout. Use --no-deps until hermes-agent is
+# published to PyPI (the runtime that loads this plugin already has
+# hermes-agent importable, so the dep declaration is documentary).
+pip install -e plugins/myah-hermes-plugin --no-deps
 ```
 
 After install, verify the entry point is registered:

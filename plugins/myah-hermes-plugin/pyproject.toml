@@ -17,9 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
-[project.scripts]
-myah-hermes-plugin = "myah_hermes_plugin._cli:main"
-
 [project.entry-points."hermes_agent.plugins"]
 myah-platform = "myah_hermes_plugin.myah_platform:register"
 
