@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tools.secrets_tool import (
+from myah_hermes_plugin.myah_tools.secrets_tool import (
     secrets_tool,
     set_secrets_request_callback,
     set_secret_request_session_key,

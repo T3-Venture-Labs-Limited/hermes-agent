@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from tools.env_passthrough import get_all_passthrough, register_env_passthrough
-from tools.registry import registry
 from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, _get_required_environment_variables
 from hermes_cli.config import OPTIONAL_ENV_VARS, get_env_value, load_env, save_env_value, get_env_path
 
@@ -300,46 +299,48 @@ def secrets_tool(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps({"error": f"Unknown action: {action}"})
 
 
-registry.register(
-    name="secrets",
-    toolset="secrets",
-    description="Securely manage API keys and other credentials without exposing values to the model. List configured secret names, check which keys are missing, request secure input in CLI, delete secrets, or register secrets for env passthrough.",
-    emoji="🔐",
-    schema={
-        "name": "secrets",
-        "description": "Manage API keys and credentials. ALWAYS use this tool BEFORE attempting any API call that requires authentication. Use 'check' to see if a key is configured, 'request' to securely prompt the user for a missing key (the value never enters the conversation), 'list' to see all configured secret names, 'delete' to remove a key, or 'inject' to pass secrets to a sandboxed subprocess. Never try to use an API without first checking/requesting its key through this tool.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "check", "request", "delete", "inject"],
-                    "description": "The secrets action to perform.",
-                },
-                "keys": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Secret names to check or inject.",
-                },
-                "key": {
-                    "type": "string",
-                    "description": "Single secret name for request/delete.",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Human-readable description shown during secure prompt.",
-                },
-                "instructions": {
-                    "type": "string",
-                    "description": "Optional user instructions for where to find the secret.",
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Custom secure prompt text.",
-                },
+# Top-level schema/handler so the myah-hermes-plugin's `register(ctx)` can call
+# `ctx.register_tool(schema=SCHEMA, handler=handle, ...)`. The registry.register()
+# call that used to live here at module import time was removed when secrets_tool
+# moved out of tools/ and into the plugin (Phase 4c).
+SCHEMA = {
+    "name": "secrets",
+    "description": "Manage API keys and credentials. ALWAYS use this tool BEFORE attempting any API call that requires authentication. Use 'check' to see if a key is configured, 'request' to securely prompt the user for a missing key (the value never enters the conversation), 'list' to see all configured secret names, 'delete' to remove a key, or 'inject' to pass secrets to a sandboxed subprocess. Never try to use an API without first checking/requesting its key through this tool.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "check", "request", "delete", "inject"],
+                "description": "The secrets action to perform.",
             },
-            "required": ["action"],
+            "keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Secret names to check or inject.",
+            },
+            "key": {
+                "type": "string",
+                "description": "Single secret name for request/delete.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Human-readable description shown during secure prompt.",
+            },
+            "instructions": {
+                "type": "string",
+                "description": "Optional user instructions for where to find the secret.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Custom secure prompt text.",
+            },
         },
+        "required": ["action"],
     },
-    handler=secrets_tool,
-)
+}
+
+
+def handle(args: Dict[str, Any], **kwargs) -> str:
+    """Plugin-facing handler entry point — thin wrapper around `secrets_tool`."""
+    return secrets_tool(args, **kwargs)
