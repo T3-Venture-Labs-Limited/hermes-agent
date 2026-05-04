@@ -53,6 +53,28 @@ WRITE_DENIED_PATHS = build_write_denied_paths(_HOME)
 
 WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
+# ── Myah: deny read on Hermes credential files ────────────────
+_MYAH_READ_DENIED_FILES = (
+    '.env',
+    'honcho.json',
+    '.hermes_web_token',
+)
+READ_DENIED_PATHS = frozenset(
+    os.path.normpath(os.path.join(base, name))
+    for base in (_HOME + '/.hermes', '/data/.hermes', '/root/.hermes')
+    for name in _MYAH_READ_DENIED_FILES
+)
+
+def _is_read_denied(path: str) -> bool:
+    """Return True if path matches a Myah read-deny entry."""
+    try:
+        expanded = os.path.expanduser(path)
+        normalized = os.path.normpath(os.path.abspath(expanded))
+    except (TypeError, ValueError):
+        return False
+    return normalized in READ_DENIED_PATHS
+# ──────────────────────────────────────────────────────────────
+
 
 def _get_safe_write_root() -> Optional[str]:
     """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
@@ -502,6 +524,11 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
+        # ── Myah: read-deny enforcement ───────────────────────────────
+        if _is_read_denied(path):
+            return ReadResult(error=f"Read denied: {path} is a protected credential path")
+        # ──────────────────────────────────────────────────────────────
+        
         offset, limit = normalize_read_pagination(offset, limit)
         
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
@@ -634,6 +661,10 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
+        # ── Myah: read-deny enforcement ───────────────────────────────
+        if _is_read_denied(path):
+            return ReadResult(error=f"Read denied: {path} is a protected credential path")
+        # ──────────────────────────────────────────────────────────────
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
         if stat_result.exit_code != 0:

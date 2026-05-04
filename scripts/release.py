@@ -584,6 +584,8 @@ AUTHOR_MAP = {
     "hekaru.agent@gmail.com": "hekaru-agent",
     "jas9000@gmail.com": "twozle",
     "r.filgueiras@apheris.com": "rfilgueiras",
+    # T3-1003 marketplace + container hardening (Myah fork contributor)
+    "zacharynelson1@gmail.com": "zrmnelson",
 }
 
 

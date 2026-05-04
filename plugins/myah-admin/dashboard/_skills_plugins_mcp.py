@@ -247,13 +247,22 @@ router = APIRouter(dependencies=[Depends(require_session_token)])
 
 @router.get('/skills/{name}')
 async def get_skill(name: str) -> dict[str, Any]:
-    """Return the full SKILL.md content for ``name``."""
+    """Return the full SKILL.md content for ``name``.
+
+    Lookup tries the SKILL.md frontmatter ``name`` first, then falls back
+    to the containing directory name. The fallback exists because
+    marketplace-installed skills land at ``skills/<slug>/SKILL.md`` but
+    their frontmatter ``name`` may diverge from ``<slug>`` (case, spacing,
+    upstream rename), so a slug-based lookup would otherwise 404.
+    """
     _validate_name(name)
     skills_dir = _hermes_home() / 'skills'
     if not skills_dir.exists():
         raise HTTPException(status_code=404, detail='Skill not found')
+    fallback: Path | None = None
     for skill_md in skills_dir.rglob('SKILL.md'):
-        fm = _parse_frontmatter(skill_md.read_text())
+        text = skill_md.read_text()
+        fm = _parse_frontmatter(text)
         if fm.get('name', skill_md.parent.name) == name:
             category = (
                 skill_md.parent.parent.name
@@ -263,8 +272,21 @@ async def get_skill(name: str) -> dict[str, Any]:
             return {
                 'name': name,
                 'category': category,
-                'content': skill_md.read_text(),
+                'content': text,
             }
+        if fallback is None and skill_md.parent.name == name:
+            fallback = skill_md
+    if fallback is not None:
+        category = (
+            fallback.parent.parent.name
+            if fallback.parent.parent != skills_dir
+            else 'general'
+        )
+        return {
+            'name': name,
+            'category': category,
+            'content': fallback.read_text(),
+        }
     raise HTTPException(status_code=404, detail='Skill not found')
 
 
