@@ -4,7 +4,6 @@ import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 
@@ -23,7 +22,7 @@ def _make_adapter():
     """Construct a MyahAdapter with register_pre_setup_hook mocked out."""
     from gateway.config import PlatformConfig
     with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         return MyahAdapter(PlatformConfig(enabled=True, extra={'auth_key': ''}))
 
 

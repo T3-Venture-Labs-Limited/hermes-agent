@@ -74,9 +74,6 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
-    # ── Myah: platform enum ──────────────────────────────────
-    MYAH = "myah"
-    # ────────────────────────────────────────────────────────
 
     @classmethod
     def _missing_(cls, value):
@@ -1398,23 +1395,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
-
-    # ── Myah: adapter env overrides ──────────────────────────
-    myah_enabled = os.getenv("MYAH_ADAPTER_ENABLED", "").lower() in ("true", "1", "yes")
-    myah_auth_key = os.getenv("MYAH_ADAPTER_AUTH_KEY", "")
-    if myah_enabled or myah_auth_key:
-        if Platform.MYAH not in config.platforms:
-            config.platforms[Platform.MYAH] = PlatformConfig()
-        config.platforms[Platform.MYAH].enabled = True
-        if myah_auth_key:
-            config.platforms[Platform.MYAH].extra["auth_key"] = myah_auth_key
-        myah_port = os.getenv("MYAH_ADAPTER_PORT")
-        if myah_port:
-            try:
-                config.platforms[Platform.MYAH].extra["port"] = int(myah_port)
-            except ValueError:
-                pass
-    # ────────────────────────────────────────────────────────
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

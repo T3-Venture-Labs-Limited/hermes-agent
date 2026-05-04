@@ -142,10 +142,121 @@ def _get_plugin_toolset_keys() -> set:
 # compatibility with existing ``PLATFORMS[key]["label"]`` access patterns.
 from hermes_cli.platforms import PLATFORMS as _PLATFORMS_REGISTRY
 
-PLATFORMS = {
+
+class _RegistryAwarePlatformDict(dict):
+    """Dict-like view that falls back to gateway platform registry on miss.
+
+    Phase 4d (2026-05-04): when the Myah platform adapter moved into a
+    plugin, ``hermes_cli/platforms.py``'s static OrderedDict lost its
+    ``"myah"`` row. Code paths using ``PLATFORMS[key]["default_toolset"]``
+    or ``PLATFORMS[key]["label"]`` would then raise ``KeyError`` for any
+    plugin-registered platform. This subclass keeps the static-data fast
+    path for built-in platforms and exposes registry-registered platforms
+    on every read path — point lookup (``__getitem__``, ``get``,
+    ``__contains__``) **and** iteration (``__iter__``, ``keys``,
+    ``values``, ``items``, ``__len__``) — so consumers that enumerate
+    PLATFORMS (e.g. ``platform_default_keys = {p["default_toolset"] for p
+    in PLATFORMS.values()}``) see plugin platforms too.
+
+    Registry entries take precedence over the static dict on duplicate
+    keys so plugins can override built-in metadata if needed.
+    """
+
+    # ── Point lookup ────────────────────────────────────────────────
+
+    def __getitem__(self, key):  # type: ignore[override]
+        # Registry wins on overlap so a plugin can override a static entry.
+        registry_entry = self._lookup_registry(key)
+        if registry_entry is not None:
+            return registry_entry
+        return super().__getitem__(key)
+
+    def __contains__(self, key) -> bool:  # type: ignore[override]
+        if super().__contains__(key):
+            return True
+        return self._lookup_registry(key) is not None
+
+    def get(self, key, default=None):  # type: ignore[override]
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    # ── Iteration ────────────────────────────────────────────────────
+
+    def __iter__(self):  # type: ignore[override]
+        return iter(self._merged_keys())
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self._merged_keys())
+
+    def keys(self):  # type: ignore[override]
+        return self._merged_keys()
+
+    def values(self):  # type: ignore[override]
+        return [self[k] for k in self._merged_keys()]
+
+    def items(self):  # type: ignore[override]
+        return [(k, self[k]) for k in self._merged_keys()]
+
+    def _merged_keys(self) -> list:
+        """Return the merged ordered key list (static first, then plugins).
+
+        Static keys preserve insertion order from ``hermes_cli/platforms.py``;
+        plugin-registered keys are appended in registry order. Duplicates
+        are deduped so a plugin overriding a built-in name appears once
+        (in its static slot) — but ``__getitem__`` will still surface the
+        plugin entry's data.
+        """
+        seen: set = set()
+        merged: list = []
+        for k in super().keys():
+            if k not in seen:
+                seen.add(k)
+                merged.append(k)
+        for entry in self._all_registry_entries():
+            if entry.name in seen:
+                continue
+            seen.add(entry.name)
+            merged.append(entry.name)
+        return merged
+
+    # ── Registry helpers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _lookup_registry(key):
+        try:
+            from gateway.platform_registry import platform_registry
+        except Exception:
+            return None
+        entry = platform_registry.get(key)
+        if entry is None:
+            return None
+        return _RegistryAwarePlatformDict._entry_to_dict(entry)
+
+    @staticmethod
+    def _all_registry_entries() -> list:
+        try:
+            from gateway.platform_registry import platform_registry
+        except Exception:
+            return []
+        try:
+            return platform_registry.all_entries()
+        except Exception:
+            return []
+
+    @staticmethod
+    def _entry_to_dict(entry) -> dict:
+        return {
+            "label": entry.label,
+            "default_toolset": entry.default_toolset or f"hermes-{entry.name}",
+        }
+
+
+PLATFORMS = _RegistryAwarePlatformDict({
     k: {"label": info.label, "default_toolset": info.default_toolset}
     for k, info in _PLATFORMS_REGISTRY.items()
-}
+})
 
 
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────

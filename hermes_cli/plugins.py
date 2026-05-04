@@ -455,12 +455,29 @@ class PluginContext:
         validate_config: Callable | None = None,
         required_env: list | None = None,
         install_hint: str = "",
+        # Phase 4d: capability fields exposed on PlatformEntry so plugin
+        # adapters can express what previously had to be hardcoded in core.
+        allowed_users_env: str | None = None,
+        allow_all_env: str | None = None,
+        max_message_length: int | None = None,
+        platform_hint: str | None = None,
+        default_toolset: str | None = None,
+        skip_user_authorization: bool = False,
+        skip_home_channel_prompt: bool = False,
+        connect_last: bool = False,
     ) -> None:
         """Register a gateway platform adapter.
 
         The adapter_factory receives a ``PlatformConfig`` and returns a
         ``BasePlatformAdapter`` subclass instance.  The gateway calls
         ``check_fn()`` before instantiation to verify dependencies.
+
+        Optional capability fields (``allowed_users_env``, ``allow_all_env``,
+        ``platform_hint``, ``default_toolset``, ``skip_user_authorization``,
+        ``skip_home_channel_prompt``, ``connect_last``, ``max_message_length``)
+        let the adapter declare behaviour that core previously encoded as
+        per-platform branches. See ``gateway/platform_registry.py`` for
+        per-field semantics.
 
         Example::
 
@@ -482,6 +499,14 @@ class PluginContext:
             required_env=required_env or [],
             install_hint=install_hint,
             source="plugin",
+            allowed_users_env=allowed_users_env,
+            allow_all_env=allow_all_env,
+            max_message_length=max_message_length,
+            platform_hint=platform_hint,
+            default_toolset=default_toolset,
+            skip_user_authorization=skip_user_authorization,
+            skip_home_channel_prompt=skip_home_channel_prompt,
+            connect_last=connect_last,
         )
         platform_registry.register(entry)
         self._manager._plugin_platform_names.add(name)

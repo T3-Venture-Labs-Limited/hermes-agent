@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 
 
@@ -31,7 +31,7 @@ class NativeStreamingAdapter(BasePlatformAdapter):
     """Mock adapter mirroring Myah's structured-callback streaming pattern."""
 
     def __init__(self) -> None:
-        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.MYAH)
+        super().__init__(PlatformConfig(enabled=True, token="***"), Platform("myah"))
         self.sent: list[dict] = []
         self.deltas: list[str] = []
 
@@ -148,7 +148,7 @@ async def _run_native_streaming(monkeypatch, tmp_path, *, streaming_enabled: boo
     )
 
     source = SessionSource(
-        platform=Platform.MYAH,
+        platform=Platform("myah"),
         chat_id="myah-chat-1",
         chat_type="dm",
     )

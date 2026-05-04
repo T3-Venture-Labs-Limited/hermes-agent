@@ -1,18 +1,26 @@
 """
 Myah web platform adapter.
 
-Routes messages through the gateway's _handle_message() pipeline (unlike
-the API server which bypasses it), giving Myah access to all 30 slash
-commands, agent caching, and session management.
+Routes messages through the gateway's ``_handle_message()`` pipeline (unlike
+the API server which bypasses it), giving Myah access to all slash commands,
+agent caching, and session management.
 
-Registers HTTP endpoints on the shared aiohttp Application created by
-the API server adapter.
+In **hosted** mode the adapter registers HTTP endpoints on the shared
+aiohttp Application created by the API server adapter (single-process,
+shared port). In **standalone** mode (no API server adapter present) the
+adapter spins up its own aiohttp ``AppRunner`` on the configured port —
+this is the OSS-Myah path, where the user runs Hermes locally and Myah
+talks to it on ``http://localhost:8642`` (or whatever port is configured).
 
 Endpoints:
-    POST /myah/v1/message          — dispatch a message or slash command
+    POST /myah/v1/message            — dispatch a message or slash command
     GET  /myah/v1/events/{stream_id} — SSE event stream
-    POST /myah/v1/confirm/{stream_id} — resolve pending approval
-    GET  /myah/health              — health check
+    POST /myah/v1/confirm/{stream_id}— resolve pending approval
+    POST /myah/v1/secret/{stream_id} — receive a secret value from the frontend
+    GET  /myah/v1/media              — stream a cached media file
+    POST /myah/v1/aux/{task}         — auxiliary LLM call passthrough
+    GET  /myah/health                — health check
+    /myah/v1/admin/*                  — runtime control surface (see runtime_admin)
 
 Requires: aiohttp (provided by gateway dependencies)
 """
@@ -99,8 +107,32 @@ class MyahAdapter(BasePlatformAdapter):
     """
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform.MYAH)
-        self._auth_key: str = (config.extra or {}).get("auth_key", "")
+        # ``Platform.MYAH`` was removed from the core enum in Phase 4d
+        # (2026-05-04). ``Platform("myah")`` resolves through the enum's
+        # ``_missing_`` hook to a cached pseudo-member with value="myah",
+        # mirroring how ``IRCAdapter`` constructs its platform identifier.
+        super().__init__(config, Platform("myah"))
+        # Auth key resolution order: config.extra.auth_key (yaml) →
+        # MYAH_ADAPTER_AUTH_KEY env (legacy hosted-mode path that used to
+        # be wired up by the deleted ``_apply_env_overrides`` block in
+        # ``gateway/config.py``).
+        _extra = config.extra or {}
+        self._auth_key: str = _extra.get("auth_key") or _myah_os.environ.get(
+            "MYAH_ADAPTER_AUTH_KEY", ""
+        )
+        # Standalone-mode runtime state — populated lazily in connect() when
+        # there's no shared aiohttp app to attach to.
+        self._standalone_mode: bool = False
+        self._own_app: Optional["web.Application"] = None
+        self._own_runner: Optional["web.AppRunner"] = None
+        self._own_site: Optional["web.TCPSite"] = None
+        # Port resolution order: config.extra.port (yaml) → MYAH_ADAPTER_PORT
+        # env → 8642 default.
+        _port_str = str(_extra.get("port") or _myah_os.environ.get("MYAH_ADAPTER_PORT", ""))
+        try:
+            self._port: int = int(_port_str) if _port_str else 8642
+        except ValueError:
+            self._port = 8642
 
         # ── Stream state ────────────────────────────────────────────────
         # stream_id → asyncio.Queue of SSE event dicts (None = sentinel)
@@ -130,11 +162,24 @@ class MyahAdapter(BasePlatformAdapter):
         # can safely push events to asyncio.Queue via call_soon_threadsafe.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # ── GatewayRunner backref ─────────────────────────────────────
+        # The ``GatewayRunner._create_adapter`` path sets this attribute on
+        # plugin-registered adapters after instantiation (Phase 4d). Initialise
+        # to None so unit tests that bypass the runner factory and direct calls
+        # like ``MyahAdapter(config)`` don't trip on AttributeError.
+        self.gateway_runner = None
+
         # ── Route registration state ──────────────────────────────────
         self._routes_registered = False
         # Register a pre-setup hook so our routes are added to the shared
         # aiohttp app BEFORE the API server calls runner.setup() (which
         # freezes the router and rejects new route additions).
+        #
+        # In standalone mode (no API server adapter — OSS Myah path) there
+        # is no shared app to hook into; ``connect()`` detects this and
+        # spins up its own aiohttp ``AppRunner``. ``register_pre_setup_hook``
+        # is still safe to call: ``API_SERVER`` simply never connects, so
+        # the hook never fires and is harmless.
         from gateway.platforms.api_server import register_pre_setup_hook
         register_pre_setup_hook(self._register_routes_on_app)
 
@@ -1303,7 +1348,7 @@ class MyahAdapter(BasePlatformAdapter):
         # refresh). Everything else (file-system admin: SOUL, skills, plugins,
         # MCP CRUD, providers, reset) lives in the myah-admin DASHBOARD plugin
         # at agent/hermes/plugins/myah-admin/dashboard/plugin_api.py.
-        from gateway.platforms.myah_runtime_admin import register_runtime_admin_routes
+        from .runtime_admin import register_runtime_admin_routes
         register_runtime_admin_routes(
             app,
             runner=self.gateway_runner,
@@ -1317,13 +1362,20 @@ class MyahAdapter(BasePlatformAdapter):
     async def connect(self) -> bool:
         """Finalize adapter connection after routes are registered.
 
-        Routes are registered via the pre-setup hook (called during API server
-        connect, before the router is frozen).  This method waits for the API
-        server to be ready, then starts background tasks.
+        Two operating modes:
 
-        If routes were already registered via the hook, we just need to verify
-        and start.  If the API server hasn't connected yet, we return False
-        and the gateway retries.
+        - **Hosted mode** (default in production Myah): the API server adapter
+          owns the aiohttp ``Application``. Our routes are registered via the
+          pre-setup hook (called during API server ``connect()``, before the
+          router is frozen). This method just captures the loop and starts
+          background tasks.
+
+        - **Standalone mode** (OSS-Myah, ``hermes gateway`` without the
+          API server adapter enabled): no shared app exists — we create our
+          own aiohttp ``Application`` + ``AppRunner`` + ``TCPSite`` bound to
+          the configured port. Phase 4d (2026-05-04): folded in from the
+          original Phase 1 design to make ``myah-hermes-plugin`` standalone-
+          deployable on a fresh ``hermes-agent`` install.
         """
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
@@ -1332,27 +1384,72 @@ class MyahAdapter(BasePlatformAdapter):
         from gateway.platforms.api_server import get_shared_app
         app = get_shared_app()
 
-        if not self._routes_registered:
-            if app is None:
-                logger.info(
-                    "[%s] Shared aiohttp app not available yet. Will retry.",
+        if app is None:
+            # ── Standalone mode ──────────────────────────────────────
+            logger.info(
+                "[%s] No shared aiohttp app — entering standalone mode on port %d",
+                self.name,
+                self._port,
+            )
+            self._standalone_mode = True
+            self._own_app = web.Application()
+            # The same _register_routes_on_app routine works for both modes —
+            # it only adds routes + sets app["myah_adapter"] = self.
+            try:
+                self._register_routes_on_app(self._own_app)
+            except Exception:
+                logger.exception(
+                    "[%s] Failed to register routes on standalone app",
                     self.name,
                 )
                 return False
-            # API server is up but our pre-setup hook didn't fire (adapter
-            # was created after API server connect).  Try registering routes
-            # directly — this will only work if the router isn't frozen yet.
+
             try:
-                self._register_routes_on_app(app)
-            except RuntimeError as e:
-                if "frozen" in str(e).lower():
-                    logger.error(
-                        "[%s] Cannot register routes: aiohttp router is frozen. "
-                        "Ensure MYAH adapter is created BEFORE API_SERVER connect().",
-                        self.name,
-                    )
-                    return False
-                raise
+                self._own_runner = web.AppRunner(self._own_app)
+                await self._own_runner.setup()
+                self._own_site = web.TCPSite(
+                    self._own_runner,
+                    host="0.0.0.0",
+                    port=self._port,
+                )
+                await self._own_site.start()
+            except Exception:
+                logger.exception(
+                    "[%s] Failed to start standalone aiohttp site on port %d",
+                    self.name,
+                    self._port,
+                )
+                # Best-effort cleanup; AppRunner.cleanup() is the documented
+                # teardown for partially-started runners.
+                try:
+                    if self._own_runner is not None:
+                        await self._own_runner.cleanup()
+                except Exception:
+                    pass
+                return False
+            logger.info(
+                "[%s] Standalone aiohttp site listening on http://0.0.0.0:%d",
+                self.name,
+                self._port,
+            )
+        else:
+            # ── Hosted mode ──────────────────────────────────────────
+            if not self._routes_registered:
+                # API server is up but our pre-setup hook didn't fire
+                # (adapter was created after API server connect). Try
+                # registering routes directly — only works if the router
+                # isn't frozen yet.
+                try:
+                    self._register_routes_on_app(app)
+                except RuntimeError as e:
+                    if "frozen" in str(e).lower():
+                        logger.error(
+                            "[%s] Cannot register routes: aiohttp router is frozen. "
+                            "Ensure MYAH adapter is created BEFORE API_SERVER connect().",
+                            self.name,
+                        )
+                        return False
+                    raise
 
         # Capture the event loop for thread-safe queue access (Fix 2)
         self._loop = asyncio.get_running_loop()
@@ -1367,7 +1464,11 @@ class MyahAdapter(BasePlatformAdapter):
             sweep_task.add_done_callback(self._background_tasks.discard)
 
         self._mark_connected()
-        logger.info("[%s] Myah adapter connected", self.name)
+        logger.info(
+            "[%s] Myah adapter connected (%s mode)",
+            self.name,
+            "standalone" if self._standalone_mode else "hosted",
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -1394,6 +1495,22 @@ class MyahAdapter(BasePlatformAdapter):
         self._session_streams.clear()
         self._chat_id_streams.clear()
         self._stream_sessions.clear()
+
+        # Tear down standalone-mode aiohttp site/runner if we created them.
+        if self._standalone_mode:
+            try:
+                if self._own_site is not None:
+                    await self._own_site.stop()
+            except Exception:
+                logger.debug("[%s] standalone TCPSite.stop() raised", self.name, exc_info=True)
+            try:
+                if self._own_runner is not None:
+                    await self._own_runner.cleanup()
+            except Exception:
+                logger.debug("[%s] standalone AppRunner.cleanup() raised", self.name, exc_info=True)
+            self._own_site = None
+            self._own_runner = None
+            self._own_app = None
 
         logger.info("[%s] Myah adapter disconnected", self.name)
 

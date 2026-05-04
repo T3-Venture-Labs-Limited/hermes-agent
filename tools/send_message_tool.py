@@ -224,9 +224,19 @@ def _handle_send(args):
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
         "yuanbao": Platform.YUANBAO,
-        "myah": Platform.MYAH,  # Myah: platform map entry
     }
     platform = platform_map.get(platform_name)
+    if not platform:
+        # Phase 4d: plugin-registered platforms resolve via Platform's
+        # _missing_ hook (e.g. myah). Accept the lookup if such an adapter
+        # is in the registry — that's our source of truth for valid plugin
+        # platform identifiers.
+        try:
+            from gateway.platform_registry import platform_registry as _pr
+            if _pr.get(platform_name) is not None:
+                platform = Platform(platform_name)
+        except Exception:
+            platform = None
     if not platform:
         avail = ", ".join(platform_map.keys())
         return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
@@ -600,10 +610,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
-        # ── Myah: send_message dispatch ──────────────────────────
-        elif platform == Platform.MYAH:
-            result = await _send_myah(pconfig, chat_id, chunk)
-        # ────────────────────────────────────────────────────────
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1478,40 +1484,6 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         }
     except Exception as e:
         return _error(f"Feishu send failed: {e}")
-
-
-# ── Myah: send delivery function ────────────────────────────
-async def _send_myah(pconfig, chat_id: str, message: str):
-    """Send a message to a Myah chat via the live adapter's send() method."""
-    try:
-        from gateway.platforms.api_server import get_shared_app
-
-        app = get_shared_app()
-        if app is None:
-            return {"error": "Myah adapter not available (gateway API server not running)"}
-
-        myah_adapter = app.get("myah_adapter")
-        if myah_adapter is None:
-            return {
-                "error": (
-                    "Myah adapter instance not accessible. Myah messages are "
-                    "delivered via SSE streams — cross-platform send_message "
-                    "to Myah is not yet supported."
-                )
-            }
-
-        result = await myah_adapter.send(chat_id, message)
-        if result.success:
-            return {
-                "success": True,
-                "platform": "myah",
-                "chat_id": chat_id,
-                "message_id": result.message_id,
-            }
-        return _error(f"Myah send failed: {result.error}")
-    except Exception as e:
-        return _error(f"Myah send failed: {e}")
-# ────────────────────────────────────────────────────────
 
 
 def _check_send_message():

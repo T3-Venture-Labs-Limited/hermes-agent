@@ -40,13 +40,25 @@ PLATFORMS: OrderedDict[str, PlatformInfo] = OrderedDict([
     ("webhook",        PlatformInfo(label="🔗 Webhook",         default_toolset="hermes-webhook")),
     ("api_server",     PlatformInfo(label="🌐 API Server",      default_toolset="hermes-api-server")),
     ("cron",           PlatformInfo(label="⏰ Cron",            default_toolset="hermes-cron")),
-    # ── Myah: platform registry entry ────────────────────────
-    ("myah",           PlatformInfo(label="🌐 Myah",            default_toolset="hermes-myah")),
-    # ────────────────────────────────────────────────────────
 ])
 
 
 def platform_label(key: str, default: str = "") -> str:
-    """Return the display label for a platform key, or *default*."""
+    """Return the display label for a platform key, or *default*.
+
+    Falls back to the gateway platform registry when *key* is a
+    plugin-registered platform (Phase 4d) so plugin adapters still get a
+    label in ``hermes`` TUI menus without having to mutate this static
+    OrderedDict.
+    """
     info = PLATFORMS.get(key)
-    return info.label if info is not None else default
+    if info is not None:
+        return info.label
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(key)
+        if entry is not None:
+            return entry.label
+    except Exception:
+        pass
+    return default

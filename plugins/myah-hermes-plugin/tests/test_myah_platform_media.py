@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import PlatformConfig
 
 
 JPEG_BYTES = b'\xff\xd8\xff\xe0\x00\x10JFIF' + b'\x00' * 100
@@ -24,7 +24,7 @@ def _make_adapter():
         extra={'auth_key': 'test-bearer'},
     )
     with patch('gateway.platforms.api_server.register_pre_setup_hook'):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         adapter = MyahAdapter(config)
 
     # Mark as connected so _handle_message_endpoint doesn't bail on stream limits
@@ -45,33 +45,33 @@ def _make_request(body: dict) -> MagicMock:
 
 class TestMyahExt:
     def test_uses_filename_extension(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         assert _myah_ext('image/jpeg', 'photo.jpg', '.png') == '.jpg'
 
     def test_filename_takes_priority_over_mime(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         # filename extension beats MIME
         assert _myah_ext('image/png', 'file.gif', '.jpg') == '.gif'
 
     def test_falls_back_to_mime_when_no_filename_ext(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         result = _myah_ext('image/png', 'noext', '.jpg')
         # Mime lookup result varies by platform — just confirm it's an extension
         assert result.startswith('.')
         assert len(result) >= 2
 
     def test_uses_default_on_empty_mime_and_filename(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         assert _myah_ext('', '', '.jpg') == '.jpg'
 
     def test_uses_default_on_no_dot_in_filename(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         # "attachment" has no dot — fall through to mime, then default
         result = _myah_ext('', 'attachment', '.bin')
         assert result == '.bin'
 
     def test_rejects_very_short_extension(self):
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         # ".x" length 2 is the minimum; ".j" would also be accepted
         # A single-char extension like ".x" is allowed (len == 2)
         # An empty extension from rsplit wouldn't happen, but let's verify
@@ -82,7 +82,7 @@ class TestMyahExt:
 
     def test_rejects_missing_file_id(self):
         """_myah_ext itself doesn't reject file_id; just verify it's isolated."""
-        from gateway.platforms.myah import _myah_ext
+        from myah_hermes_plugin.myah_platform.adapter import _myah_ext
         # Independent of file_id — pure filename/mime helper
         assert _myah_ext('audio/mpeg', 'track.mp3', '.ogg') == '.mp3'
 
@@ -146,8 +146,8 @@ class TestHandleMessageMissingEnv:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', None), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', None):
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', None), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', None):
             resp = await adapter._handle_message_endpoint(req)
 
         assert resp.status == 500
@@ -165,8 +165,8 @@ class TestHandleMessageMissingEnv:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', None), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'):
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', None), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'):
             resp = await adapter._handle_message_endpoint(req)
 
         assert resp.status == 500
@@ -189,8 +189,8 @@ class TestHandleMessageOversizeAttachment:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'):
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'):
             resp = await adapter._handle_message_endpoint(req)
 
         assert resp.status == 502
@@ -208,8 +208,8 @@ class TestHandleMessageOversizeAttachment:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'):
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'):
             resp = await adapter._handle_message_endpoint(req)
 
         assert resp.status == 502
@@ -243,9 +243,9 @@ class TestHandleMessagePlatformError:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'), \
-             patch('gateway.platforms.myah._myah_aiohttp') as mock_aiohttp:
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._myah_aiohttp') as mock_aiohttp:
             mock_aiohttp.ClientSession.return_value = mock_session
             mock_aiohttp.ClientTimeout.return_value = MagicMock()
             resp = await adapter._handle_message_endpoint(req)
@@ -281,10 +281,10 @@ class TestHandleMessageJpeg:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'), \
-             patch('gateway.platforms.myah._myah_aiohttp') as mock_aiohttp, \
-             patch('gateway.platforms.myah.cache_image_from_bytes',
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._myah_aiohttp') as mock_aiohttp, \
+             patch('myah_hermes_plugin.myah_platform.adapter.cache_image_from_bytes',
                    return_value='/cache/img.jpg') as mock_cache_img, \
              patch.object(adapter, '_dispatch_message', new=AsyncMock()):
 
@@ -329,10 +329,10 @@ class TestHandleMessageAudio:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'), \
-             patch('gateway.platforms.myah._myah_aiohttp') as mock_aiohttp, \
-             patch('gateway.platforms.myah.cache_audio_from_bytes',
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._myah_aiohttp') as mock_aiohttp, \
+             patch('myah_hermes_plugin.myah_platform.adapter.cache_audio_from_bytes',
                    return_value='/cache/audio.mp3') as mock_cache_audio, \
              patch.object(adapter, '_dispatch_message', new=AsyncMock()):
 
@@ -373,10 +373,10 @@ class TestHandleMessageDocument:
         }
         req = _make_request(body)
 
-        with patch('gateway.platforms.myah._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
-             patch('gateway.platforms.myah._MYAH_PLATFORM_BEARER', 'tok'), \
-             patch('gateway.platforms.myah._myah_aiohttp') as mock_aiohttp, \
-             patch('gateway.platforms.myah.cache_document_from_bytes',
+        with patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BASE_URL', 'http://plat'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._MYAH_PLATFORM_BEARER', 'tok'), \
+             patch('myah_hermes_plugin.myah_platform.adapter._myah_aiohttp') as mock_aiohttp, \
+             patch('myah_hermes_plugin.myah_platform.adapter.cache_document_from_bytes',
                    return_value='/cache/doc.pdf') as mock_cache_doc, \
              patch.object(adapter, '_dispatch_message', new=AsyncMock()):
 

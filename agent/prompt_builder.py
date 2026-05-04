@@ -451,15 +451,33 @@ PLATFORM_HINTS = {
         "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
         "— when a sticker is the right response, use yb_send_sticker."
     ),
-    # ── Myah: platform hint ──────────────────────────────────
-    "myah": (
-        "User is interacting via the Myah web platform. "
-        "Full markdown rendering is supported including code blocks, tables, "
-        "images (via URL), and links. The user can see tool call progress "
-        "and reasoning in real time."
-    ),
-    # ────────────────────────────────────────────────────────
 }
+
+
+def get_platform_hint(platform_key: str) -> str | None:
+    """Return the system-prompt hint for *platform_key* if any.
+
+    Resolution order:
+      1. Built-in :data:`PLATFORM_HINTS` dict (covers core platforms).
+      2. Plugin-registered platforms via the gateway platform registry's
+         ``platform_hint`` field on :class:`PlatformEntry`.
+
+    Returns ``None`` when the platform is unknown or has no hint configured.
+    The registry import is wrapped in try/except so this helper stays usable
+    in CLI-only contexts where the gateway package isn't loaded.
+    """
+    if not platform_key:
+        return None
+    if platform_key in PLATFORM_HINTS:
+        return PLATFORM_HINTS[platform_key]
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_key)
+    except Exception:
+        return None
+    if entry is None:
+        return None
+    return entry.platform_hint
 
 # ---------------------------------------------------------------------------
 # Environment hints — execution-environment awareness for the agent.

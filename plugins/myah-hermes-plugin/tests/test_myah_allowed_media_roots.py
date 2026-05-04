@@ -6,15 +6,13 @@ in addition to the always-allowed cache directories.
 """
 from __future__ import annotations
 
-import os
 from unittest.mock import patch
 
-import pytest
 
 
 def _make_adapter():
     """Return a MyahAdapter instance bypassing __init__ for unit tests."""
-    from gateway.platforms.myah import MyahAdapter
+    from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
     return MyahAdapter.__new__(MyahAdapter)
 
 
