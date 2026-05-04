@@ -380,8 +380,15 @@ def _deliver_result(
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
         "yuanbao": Platform.YUANBAO,
-        "myah": Platform.MYAH,  # Myah: platform mapping
     }
+    # NOTE Phase 4d (2026-05-04): the ``"myah"`` entry was removed when the
+    # Myah platform adapter moved into ``myah-hermes-plugin``. ``Platform``'s
+    # ``_missing_`` accepts unknown platform values for plugin adapters, so
+    # cron jobs delivering to ``myah`` resolve via ``Platform("myah")`` below
+    # instead of via this static map. Phase 4f will move the cron->Myah
+    # offline-delivery integration (``_build_myah_send_metadata`` enrichment
+    # plus the ``status_hint`` plumbing in ``_deliver_result``) into the
+    # plugin so Myah-routed cron deliveries are restored end-to-end.
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
@@ -440,6 +447,18 @@ def _deliver_result(
             )
 
         platform = platform_map.get(platform_name.lower())
+        if not platform:
+            # Phase 4d: plugin-registered platforms (e.g. ``myah``) live
+            # outside the static map but resolve through Platform's
+            # ``_missing_`` hook, which accepts arbitrary lowercase strings
+            # for adapters registered via ``register_platform``. We accept
+            # anything in ``_KNOWN_DELIVERY_PLATFORMS`` so we don't expand
+            # the env-var enumeration surface.
+            if platform_name.lower() in _KNOWN_DELIVERY_PLATFORMS:
+                try:
+                    platform = Platform(platform_name.lower())
+                except Exception:
+                    platform = None
         if not platform:
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)

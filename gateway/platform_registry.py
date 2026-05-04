@@ -67,6 +67,53 @@ class PlatformEntry:
     # "builtin" or "plugin"
     source: str = "plugin"
 
+    # ── Phase 4d: capability fields generalised from previously hardcoded
+    # ── Myah-specific behaviour in core. Plugin adapters set these on
+    # ── registration; core consults the registry instead of branching on
+    # ── Platform enum members.
+
+    # Env var name listing per-user allowed identifiers (e.g. ``"MYAH_ALLOWED_USERS"``).
+    # Replaces the hardcoded ``platform_env_map`` entries in
+    # ``GatewayRunner._is_user_authorized``. ``None`` means the platform has
+    # no per-user allowlist of its own (fall back to global ``GATEWAY_ALLOWED_USERS``).
+    allowed_users_env: Optional[str] = None
+
+    # Env var name for the platform's "allow all users" flag (e.g.
+    # ``"MYAH_ALLOW_ALL_USERS"``). ``None`` means the platform has no such
+    # flag — auth defaults to allowlist-only.
+    allow_all_env: Optional[str] = None
+
+    # Optional per-message length limit for outgoing messages. ``None`` means
+    # no limit. Stored on the entry for consumer use (e.g. ``send_message_tool``);
+    # not yet wired through to the dispatcher.
+    max_message_length: Optional[int] = None
+
+    # Optional system-prompt hint string injected by ``agent.prompt_builder``
+    # when the agent is running on this platform. Replaces the hardcoded
+    # ``PLATFORM_HINTS`` entry. ``None`` means no platform-specific hint.
+    platform_hint: Optional[str] = None
+
+    # Default toolset preset key (e.g. ``"hermes-myah"``) used by
+    # ``hermes_cli/platforms.py``'s ``PlatformInfo``. ``None`` means the
+    # platform has no preset (falls through to platform-agnostic defaults).
+    default_toolset: Optional[str] = None
+
+    # When True, ``GatewayRunner._is_user_authorized`` short-circuits and
+    # returns True for this platform. Use when the platform handles its own
+    # user authorization upstream (e.g. Open WebUI for Myah).
+    skip_user_authorization: bool = False
+
+    # When True, the gateway skips the one-time "no home channel set" prompt
+    # for first-time messages. Set for platforms where the home-channel
+    # concept does not apply (e.g. Myah web DMs).
+    skip_home_channel_prompt: bool = False
+
+    # When True, this platform's adapter should be connected LAST in the
+    # gateway startup sequence. Used by Myah, which expects API_SERVER's
+    # pre-setup hooks to have fired (and routes registered) before its
+    # own ``connect()`` runs.
+    connect_last: bool = False
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

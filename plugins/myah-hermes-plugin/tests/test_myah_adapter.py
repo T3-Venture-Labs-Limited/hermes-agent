@@ -11,12 +11,10 @@ Tests cover:
 """
 
 import asyncio
-import time
 import pytest
 from unittest.mock import MagicMock, patch
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import SendResult
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -29,7 +27,7 @@ def _make_adapter(auth_key: str = "", **extra_kwargs):
     config = PlatformConfig(enabled=True, extra=extra)
 
     with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         return MyahAdapter(config)
 
 
@@ -37,7 +35,7 @@ def _make_adapter(auth_key: str = "", **extra_kwargs):
 
 class TestCheckRequirements:
     def test_requirements_available(self):
-        from gateway.platforms.myah import check_myah_requirements
+        from myah_hermes_plugin.myah_platform.adapter import check_myah_requirements
         assert check_myah_requirements() is True
 
 
@@ -46,7 +44,11 @@ class TestCheckRequirements:
 class TestMyahAdapterInit:
     def test_default_config(self):
         adapter = _make_adapter()
-        assert adapter.platform == Platform.MYAH
+        # Platform.MYAH was removed from the core enum in Phase 4d.
+        # Plugin-registered platforms resolve via Platform("myah") through
+        # the enum's _missing_ hook (cached pseudo-member, identity-stable).
+        assert adapter.platform == Platform("myah")
+        assert adapter.platform.value == "myah"
         assert adapter._auth_key == ""
         assert adapter._streams == {}
         assert adapter._session_streams == {}
@@ -146,7 +148,7 @@ class TestFormatToolEvent:
     """Test _format_tool_event with all 4 invocation patterns from run_agent.py."""
 
     def setup_method(self):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         self.stream_id = "test-stream-42"
         # _format_tool_event is a @staticmethod — no adapter instance needed
         self._fmt = MyahAdapter._format_tool_event

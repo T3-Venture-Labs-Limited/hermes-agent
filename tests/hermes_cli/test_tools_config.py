@@ -590,37 +590,19 @@ def test_numeric_mcp_server_name_does_not_crash_sorted():
     sorted(enabled)
 
 
-# ── Myah: secrets toolset regression coverage ───────────────────────────────
-class TestMyahPlatformSecrets:
-    """Regression: secrets toolset must be exposed to the Myah platform.
+# ── secrets toolset regression coverage (platform-agnostic part) ────────────
+class TestSecretsToolsetCoreRegistration:
+    """Regression: ``secrets`` must appear in ``CONFIGURABLE_TOOLSETS``.
 
-    Previously the secrets tool was registered but missing from CONFIGURABLE_TOOLSETS
-    and the TOOLSETS dict, so _get_platform_tools never included it. Agents on
-    the Myah platform couldn't see the secrets tool in their schema and would
-    tell users "there is no secrets tool" when asked to use it.
+    Phase 4d (2026-05-04) moved the Myah-platform-specific assertions about
+    ``_get_platform_tools("myah")`` into ``plugins/myah-hermes-plugin/tests/
+    test_myah_platform_toolsets.py`` because they require the plugin to be
+    installed (the ``"myah"`` key only resolves through
+    ``hermes_cli.tools_config.PLATFORMS`` once the plugin's
+    ``register_platform`` callback has run). The platform-agnostic part —
+    that the ``secrets`` toolset is wired into ``CONFIGURABLE_TOOLSETS`` so
+    ``hermes tools`` can list it — stays here.
     """
-
-    def test_secrets_in_myah_default_toolsets(self):
-        """Default (no explicit platform_toolsets) — secrets must be enabled."""
-        config = {}
-        enabled = _get_platform_tools(config, "myah")
-        assert "secrets" in enabled, (
-            f"secrets toolset missing from myah default platform tools: "
-            f"{sorted(enabled)}"
-        )
-
-    def test_secrets_in_myah_with_explicit_config(self):
-        """Explicit platform_toolsets config containing secrets — must be enabled."""
-        config = {"platform_toolsets": {"myah": ["secrets", "terminal"]}}
-        enabled = _get_platform_tools(config, "myah")
-        assert "secrets" in enabled
-
-    def test_secrets_excluded_when_explicitly_omitted(self):
-        """Explicit config without secrets — must be excluded (user opt-out)."""
-        config = {"platform_toolsets": {"myah": ["terminal"]}}
-        enabled = _get_platform_tools(config, "myah")
-        assert "secrets" not in enabled
-        assert "terminal" in enabled
 
     def test_secrets_configurable_entry_exists(self):
         """secrets must appear in CONFIGURABLE_TOOLSETS so `hermes tools` shows it."""

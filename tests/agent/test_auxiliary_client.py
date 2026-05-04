@@ -1489,13 +1489,24 @@ class TestHonchoAuxIsolation:
 
         The Myah HTTP /myah/v1/aux/{task} endpoint delegates to
         auxiliary_client.call_llm — it must not inject any Honcho context.
-        Other parts of myah.py that set up Honcho for the main agent are fine.
-        """
-        import re
-        import gateway.platforms.myah
-        import inspect
+        Other parts of the adapter that set up Honcho for the main agent
+        are fine.
 
-        source = inspect.getsource(gateway.platforms.myah)
+        Phase 4d (2026-05-04): adapter moved from
+        ``gateway.platforms.myah`` to
+        ``myah_hermes_plugin.myah_platform.adapter``. The test is
+        skipped when the plugin is not installed (e.g. fresh CI runs that
+        haven't pip-installed the plugin).
+        """
+        import inspect
+        import re
+
+        try:
+            import myah_hermes_plugin.myah_platform.adapter as myah_adapter
+        except ImportError:
+            pytest.skip("myah-hermes-plugin not installed in this environment")
+
+        source = inspect.getsource(myah_adapter)
         # Locate _handle_aux_endpoint function body up to the next top-level
         # definition or end of source.
         m = re.search(
@@ -1503,7 +1514,7 @@ class TestHonchoAuxIsolation:
             source,
             re.DOTALL,
         )
-        assert m, "Could not locate _handle_aux_endpoint body in gateway.platforms.myah"
+        assert m, "Could not locate _handle_aux_endpoint body in MyahAdapter"
         aux_body = m.group(0)
 
         forbidden = ["honcho", "memory_manager", "peer_card"]

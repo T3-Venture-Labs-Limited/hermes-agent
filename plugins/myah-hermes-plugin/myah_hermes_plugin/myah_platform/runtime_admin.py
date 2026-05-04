@@ -10,7 +10,8 @@ process.
 Mounting:
     Routes are added under ``/myah/v1/admin/*`` via
     ``register_runtime_admin_routes(app, *, runner, auth_key)`` from
-    ``gateway/platforms/myah.py::_register_routes_on_app``.
+    :mod:`myah_hermes_plugin.myah_platform.adapter`'s
+    ``MyahAdapter._register_routes_on_app``.
 
 Auth:
     Same Bearer-token model as the rest of the Myah adapter. The platform
@@ -20,9 +21,9 @@ Auth:
     ``MYAH_ADAPTER_AUTH_KEY`` env var inside the container.
 
 Why a separate module:
-    Keeps ``myah.py`` focused on chat I/O. The whole ``myah_management.py`` (-2,035
-    LOC) was deleted in this PR; this module replaces only the runner-coupled
-    sliver (~150 LOC). All file-system admin moved to the plugin.
+    Keeps the adapter focused on chat I/O. Phase 4d (2026-05-04) moved this
+    file out of the core hermes-agent repo and into ``myah-hermes-plugin``;
+    upstream Hermes sees zero Myah-specific admin code now.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import hmac
 import logging
 import shutil
 import subprocess
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 
 try:
     from aiohttp import web
+
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
@@ -51,7 +53,9 @@ logger = logging.getLogger(__name__)
 # ── Auth helper ─────────────────────────────────────────────────────────────
 
 
-def _check_auth(request: "web.Request", auth_key: Optional[str]) -> Optional["web.Response"]:
+def _check_auth(
+    request: "web.Request", auth_key: Optional[str]
+) -> Optional["web.Response"]:
     """Same Bearer-token model as MyahAdapter._check_auth."""
     if not auth_key:
         return None

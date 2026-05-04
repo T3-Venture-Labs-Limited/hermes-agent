@@ -328,12 +328,6 @@ def show_status(args):
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQ_HOME_CHANNEL"),
         "Yuanbao": ("YUANBAO_APP_ID", "YUANBAO_HOME_CHANNEL"),
-        # ── Myah: status row ─────────────────────────────────
-        # Myah has no bot token / home channel — it pairs with the Myah platform
-        # backend via a shared bearer secret (MYAH_ADAPTER_AUTH_KEY on the
-        # adapter side, MYAH_AGENT_BEARER_TOKEN on the platform side).
-        "Myah": ("MYAH_ADAPTER_AUTH_KEY", None),
-        # ────────────────────────────────────────────────────
     }
     
     for name, (token_var, home_var) in platforms.items():

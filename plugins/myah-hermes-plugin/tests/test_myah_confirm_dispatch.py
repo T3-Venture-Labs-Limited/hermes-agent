@@ -18,8 +18,7 @@ The fix accepts an optional ``confirmation_id`` in the body:
 * absent   → ``resolve_gateway_approval(session_key, choice)`` (legacy)
 """
 
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from aiohttp import web
@@ -34,7 +33,7 @@ def _make_adapter(auth_key: str = ""):
         extra["auth_key"] = auth_key
     config = PlatformConfig(enabled=True, extra=extra)
     with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         return MyahAdapter(config)
 
 

@@ -90,7 +90,7 @@ from agent.memory_manager import StreamingContextScrubber, build_memory_context_
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
+    DEFAULT_AGENT_IDENTITY, get_platform_hint,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     build_nous_subscription_prompt,
@@ -4705,8 +4705,9 @@ class AIAgent:
             prompt_parts.append(_env_hints)
 
         platform_key = (self.platform or "").lower().strip()
-        if platform_key in PLATFORM_HINTS:
-            prompt_parts.append(PLATFORM_HINTS[platform_key])
+        _platform_hint = get_platform_hint(platform_key)
+        if _platform_hint:
+            prompt_parts.append(_platform_hint)
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 

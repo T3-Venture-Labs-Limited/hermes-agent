@@ -29,12 +29,11 @@ thread directly (as our tests do) still works.
 
 import asyncio
 import logging
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import SendResult
+from gateway.config import PlatformConfig
 
 
 _PLATFORM_BASE_URL = "http://platform:8081"
@@ -51,7 +50,7 @@ def _make_adapter(auth_key: str = ""):
         extra["auth_key"] = auth_key
     config = PlatformConfig(enabled=True, extra=extra)
     with patch("gateway.platforms.api_server.register_pre_setup_hook"):
-        from gateway.platforms.myah import MyahAdapter
+        from myah_hermes_plugin.myah_platform.adapter import MyahAdapter
         return MyahAdapter(config)
 
 
@@ -275,7 +274,7 @@ class TestSendOfflineWebhookFallback:
         recorder = _RecordingClientSession(response=_RecordingResponse(status=500, text="boom"))
 
         with patch("aiohttp.ClientSession", return_value=recorder), \
-             caplog.at_level(logging.WARNING, logger="gateway.platforms.myah"):
+             caplog.at_level(logging.WARNING, logger="myah_hermes_plugin.myah_platform.adapter"):
             result = await adapter.send(_CHAT_ID, "content", metadata={
                 "job_id": _JOB_ID,
                 "job_name": _JOB_NAME,
@@ -304,7 +303,7 @@ class TestSendOfflineWebhookFallback:
         recorder = _RecordingClientSession(raise_exc=aiohttp.ClientConnectionError("connection refused"))
 
         with patch("aiohttp.ClientSession", return_value=recorder), \
-             caplog.at_level(logging.WARNING, logger="gateway.platforms.myah"):
+             caplog.at_level(logging.WARNING, logger="myah_hermes_plugin.myah_platform.adapter"):
             result = await adapter.send(_CHAT_ID, "content", metadata={
                 "job_id": _JOB_ID,
                 "job_name": _JOB_NAME,
