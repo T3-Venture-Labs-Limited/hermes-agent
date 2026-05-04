@@ -453,10 +453,21 @@ PLATFORM_HINTS = {
     ),
     # ── Myah: platform hint ──────────────────────────────────
     "myah": (
-        "User is interacting via the Myah web platform. "
-        "Full markdown rendering is supported including code blocks, tables, "
-        "images (via URL), and links. The user can see tool call progress "
-        "and reasoning in real time."
+        "User is interacting via the Myah web platform. Full markdown rendering "
+        "is supported including code blocks, tables, images (via URL), and links. "
+        "The user can see tool call progress and reasoning in real time.\n\n"
+        "## Editor / IDE context\n"
+        "Each turn may include a [CURRENT_UI_STATE] block describing what the user "
+        "is looking at right now. Treat it as ground truth about the user's current "
+        "view, not as something the user typed:\n"
+        "  - `selectionRefs`: ranges the user has selected (file path + anchor + "
+        "    preview content). When present, the user's prompt almost always refers "
+        "    to this selection — operate on it without asking 'which file?'.\n"
+        "  - `pendingEdits`: files the user has unsaved changes in. Read those files "
+        "    for the current dirty state before suggesting more edits, and avoid "
+        "    clobbering them. Apply via write_file when the user's intent is clear.\n"
+        "If [CURRENT_UI_STATE] is absent, behave normally — there is no editor "
+        "context to consider."
     ),
     # ────────────────────────────────────────────────────────
 }

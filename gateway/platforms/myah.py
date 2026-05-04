@@ -401,6 +401,23 @@ class MyahAdapter(BasePlatformAdapter):
                 _myah_media_types.append(_mime)
         # ────────────────────────────────────────────────────────────────────
 
+        # ── Myah: ui_state → channel_prompt ─────────────────────
+        # Lift the per-turn UI state shipped by the Myah platform
+        # (selectionRefs + pendingEdits) into Hermes's ephemeral channel_prompt.
+        # Cache-safe: combined_ephemeral is appended to the cached system prompt
+        # at API call time without mutating the cache.
+        _ui_state_dict = body.get('ui_state')
+        _channel_prompt: Optional[str] = None
+        if _ui_state_dict:
+            try:
+                _ui_state_json = json.dumps(_ui_state_dict, indent=2)
+                _channel_prompt = f'[CURRENT_UI_STATE]\n{_ui_state_json}\n[/CURRENT_UI_STATE]'
+            except (TypeError, ValueError) as _exc:
+                # Defensive: malformed ui_state must NOT abort the message —
+                # the chat continues without UI context.
+                logger.warning(f'[myah] malformed ui_state, skipping channel_prompt: {_exc}')
+        # ────────────────────────────────────────────────────────
+
         # Build the message event
         msg_type = MessageType.COMMAND if message.startswith('/') else _myah_msg_type  # Myah: upgraded by attachments
         event = MessageEvent(
@@ -410,6 +427,7 @@ class MyahAdapter(BasePlatformAdapter):
             message_id=stream_id,
             media_urls=_myah_media_urls,    # Myah: propagate attachments
             media_types=_myah_media_types,  # Myah: propagate attachments
+            channel_prompt=_channel_prompt,  # Myah: ui_state lifted to channel_prompt
         )
 
         # Dispatch in background — the gateway's handle_message spawns its
