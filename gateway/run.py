@@ -3378,6 +3378,17 @@ class GatewayRunner:
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
             return True
 
+        # Look up the platform's registry entry once. Plugin-registered
+        # platforms expose their auth env-var names (allow_all_env,
+        # allowed_users_env) here; built-in platforms still use the
+        # static maps below. The registry lookup is best-effort — if
+        # the import or lookup fails we fall back to the static maps.
+        try:
+            from gateway.platform_registry import platform_registry
+            _registry_entry = platform_registry.get(source.platform.value) if source.platform else None
+        except Exception:
+            _registry_entry = None
+
         user_id = source.user_id
         if not user_id:
             return False
@@ -3463,7 +3474,7 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists. Plugin-registered
         # platforms expose their allowlist env var via the registry entry's
-        # allowed_users_env field (Phase 4d).
+        # allowed_users_env field.
         _platform_env_var = platform_env_map.get(source.platform, "")
         if not _platform_env_var and _registry_entry is not None:
             _platform_env_var = _registry_entry.allowed_users_env or ""
