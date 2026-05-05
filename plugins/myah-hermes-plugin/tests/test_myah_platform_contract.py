@@ -69,11 +69,6 @@ class TestPluginRegistersMyahPlatform:
         entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
         assert entry.get("label") == "🌐 Myah"
 
-    def test_default_toolset(self, captured_registration: _RecordingContext) -> None:
-        """Replaces the old ('myah', PlatformInfo(default_toolset='hermes-myah')) entry."""
-        entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
-        assert entry.get("default_toolset") == "hermes-myah"
-
     def test_allowed_users_env(self, captured_registration: _RecordingContext) -> None:
         """Replaces the hardcoded MYAH_ALLOWED_USERS entry in core's platform_env_map."""
         entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
@@ -83,23 +78,6 @@ class TestPluginRegistersMyahPlatform:
         """Replaces the hardcoded MYAH_ALLOW_ALL_USERS entry in core's platform_allow_all_map."""
         entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
         assert entry.get("allow_all_env") == "MYAH_ALLOW_ALL_USERS"
-
-    def test_skip_user_authorization(self, captured_registration: _RecordingContext) -> None:
-        """Replaces the (HOMEASSISTANT, WEBHOOK, MYAH) tuple in _is_user_authorized."""
-        entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
-        assert entry.get("skip_user_authorization") is True
-
-    def test_skip_home_channel_prompt(
-        self, captured_registration: _RecordingContext
-    ) -> None:
-        """Replaces the `source.platform != Platform.MYAH` carve-out in run.py."""
-        entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
-        assert entry.get("skip_home_channel_prompt") is True
-
-    def test_connect_last(self, captured_registration: _RecordingContext) -> None:
-        """Replaces the Myah-specific sort key in the connect-order pass."""
-        entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
-        assert entry.get("connect_last") is True
 
     def test_platform_hint_present(self, captured_registration: _RecordingContext) -> None:
         """Replaces the 'myah' entry deleted from PLATFORM_HINTS in prompt_builder."""

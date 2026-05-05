@@ -58,61 +58,57 @@ class PlatformEntry:
     # fail at connect() time with a descriptive error.
     validate_config: Optional[Callable[[Any], bool]] = None
 
+    # Optional: given a PlatformConfig, is the platform connected/enabled?
+    # Used by ``GatewayConfig.get_connected_platforms()`` and setup UI status.
+    # If None, falls back to ``validate_config`` or ``check_fn``.
+    is_connected: Optional[Callable[[Any], bool]] = None
+
     # Env vars this platform needs (for ``hermes setup`` display).
     required_env: list = field(default_factory=list)
 
     # Hint shown when check_fn returns False.
     install_hint: str = ""
 
+    # Optional setup function for interactive configuration.
+    # Signature: () -> None (prompts user, saves env vars).
+    # If None, falls back to _setup_standard_platform (needs token_var + vars)
+    # or a generic "set these env vars" display.
+    setup_fn: Optional[Callable[[], None]] = None
+
     # "builtin" or "plugin"
     source: str = "plugin"
 
-    # ── Phase 4d: capability fields generalised from previously hardcoded
-    # ── Myah-specific behaviour in core. Plugin adapters set these on
-    # ── registration; core consults the registry instead of branching on
-    # ── Platform enum members.
+    # Name of the plugin manifest that registered this entry (empty for
+    # built-ins).  Used by ``hermes gateway setup`` to auto-enable the
+    # owning plugin when the user configures its platform.
+    plugin_name: str = ""
 
-    # Env var name listing per-user allowed identifiers (e.g. ``"MYAH_ALLOWED_USERS"``).
-    # Replaces the hardcoded ``platform_env_map`` entries in
-    # ``GatewayRunner._is_user_authorized``. ``None`` means the platform has
-    # no per-user allowlist of its own (fall back to global ``GATEWAY_ALLOWED_USERS``).
-    allowed_users_env: Optional[str] = None
+    # ── Auth env var names (for _is_user_authorized integration) ──
+    # E.g. "IRC_ALLOWED_USERS" — checked for comma-separated user IDs.
+    allowed_users_env: str = ""
+    # E.g. "IRC_ALLOW_ALL_USERS" — if truthy, all users authorized.
+    allow_all_env: str = ""
 
-    # Env var name for the platform's "allow all users" flag (e.g.
-    # ``"MYAH_ALLOW_ALL_USERS"``). ``None`` means the platform has no such
-    # flag — auth defaults to allowlist-only.
-    allow_all_env: Optional[str] = None
+    # ── Message limits ──
+    # Max message length for smart-chunking.  0 = no limit.
+    max_message_length: int = 0
 
-    # Optional per-message length limit for outgoing messages. ``None`` means
-    # no limit. Stored on the entry for consumer use (e.g. ``send_message_tool``);
-    # not yet wired through to the dispatcher.
-    max_message_length: Optional[int] = None
+    # ── Privacy ──
+    # If True, session descriptions redact PII (phone numbers, etc.)
+    pii_safe: bool = False
 
-    # Optional system-prompt hint string injected by ``agent.prompt_builder``
-    # when the agent is running on this platform. Replaces the hardcoded
-    # ``PLATFORM_HINTS`` entry. ``None`` means no platform-specific hint.
-    platform_hint: Optional[str] = None
+    # ── Display ──
+    # Emoji for CLI/gateway display (e.g. "💬")
+    emoji: str = "🔌"
 
-    # Default toolset preset key (e.g. ``"hermes-myah"``) used by
-    # ``hermes_cli/platforms.py``'s ``PlatformInfo``. ``None`` means the
-    # platform has no preset (falls through to platform-agnostic defaults).
-    default_toolset: Optional[str] = None
+    # Whether this platform should appear in _UPDATE_ALLOWED_PLATFORMS
+    # (allows /update command from this platform).
+    allow_update_command: bool = True
 
-    # When True, ``GatewayRunner._is_user_authorized`` short-circuits and
-    # returns True for this platform. Use when the platform handles its own
-    # user authorization upstream (e.g. Open WebUI for Myah).
-    skip_user_authorization: bool = False
-
-    # When True, the gateway skips the one-time "no home channel set" prompt
-    # for first-time messages. Set for platforms where the home-channel
-    # concept does not apply (e.g. Myah web DMs).
-    skip_home_channel_prompt: bool = False
-
-    # When True, this platform's adapter should be connected LAST in the
-    # gateway startup sequence. Used by Myah, which expects API_SERVER's
-    # pre-setup hooks to have fired (and routes registered) before its
-    # own ``connect()`` runs.
-    connect_last: bool = False
+    # ── LLM guidance ──
+    # Platform hint injected into the system prompt (e.g. "You are on IRC.
+    # Do not use markdown.").  Empty string = no hint.
+    platform_hint: str = ""
 
 
 class PlatformRegistry:

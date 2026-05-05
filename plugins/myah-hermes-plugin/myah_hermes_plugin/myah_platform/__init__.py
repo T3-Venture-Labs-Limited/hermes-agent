@@ -48,10 +48,9 @@ def register(ctx: Any) -> None:
     1. **Secrets tool** (Phase 4c): the ``secrets`` tool under the
        ``hermes-myah`` toolset.
     2. **Platform adapter** (Phase 4d): the Myah web platform via
-       ``ctx.register_platform(...)`` with capability fields previously
-       hardcoded in core (``allowed_users_env``, ``platform_hint``,
-       ``connect_last``, ``skip_user_authorization``,
-       ``skip_home_channel_prompt``, ``default_toolset``).
+       ``ctx.register_platform(...)`` with capability fields supported by
+       upstream's ``PlatformEntry`` (``allowed_users_env``,
+       ``allow_all_env``, ``platform_hint``).
     3. **Phase 4f (TODO)**: cron status_hint plumbing, boot_md hook,
        offline cron delivery — all currently no-ops in upstream Hermes.
 
@@ -89,13 +88,11 @@ def register(ctx: Any) -> None:
         validate_config=_validate_myah_config,
         required_env=["MYAH_ADAPTER_AUTH_KEY"],
         install_hint="pip install aiohttp",
-        # Capability fields (Phase 4d): replace previously hardcoded
-        # Myah-specific behaviour in core.
+        # Capability fields supported by upstream's PlatformEntry. Auth
+        # bypass for the platform's authenticated upstream users flows
+        # through ``allow_all_env`` (set via ``MYAH_ALLOW_ALL_USERS=true``
+        # in the agent container's entrypoint).
         allowed_users_env="MYAH_ALLOWED_USERS",
         allow_all_env="MYAH_ALLOW_ALL_USERS",
         platform_hint=_MYAH_PLATFORM_HINT,
-        default_toolset="hermes-myah",
-        skip_user_authorization=True,  # Myah handles auth via Open WebUI / single-tenant
-        skip_home_channel_prompt=True,  # Web DMs don't use home-channel semantics
-        connect_last=True,  # Connect after API_SERVER so its pre-setup hook fires
     )

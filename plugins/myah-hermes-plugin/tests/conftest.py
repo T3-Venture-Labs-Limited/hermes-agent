@@ -56,10 +56,6 @@ def _register_myah_platform_for_tests():
             check_fn=lambda: True,
             allowed_users_env="MYAH_ALLOWED_USERS",
             allow_all_env="MYAH_ALLOW_ALL_USERS",
-            default_toolset="hermes-myah",
-            skip_user_authorization=True,
-            skip_home_channel_prompt=True,
-            connect_last=True,
             source="plugin",
         )
     )
