@@ -2417,17 +2417,15 @@ class GatewayRunner:
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         
-        # Two-pass adapter startup (Phase 4d generalisation, originally
-        # Myah-driven):
+        # Two-pass adapter startup:
         #   Pass 1 — instantiate ALL adapters and set up handlers so any
-        #     ``__init__``-time pre-setup hook registration (e.g. Myah
-        #     registering routes on the API server's shared aiohttp app)
-        #     happens before ``connect()`` is called on anything.
+        #     ``__init__``-time pre-setup hook registration (e.g. plugin
+        #     adapters registering routes on the API server's shared
+        #     aiohttp app) happens before ``connect()`` is called on
+        #     anything.
         #   Pass 2 — connect adapters in order. ``API_SERVER`` must connect
         #     first because its ``connect()`` is what fires the pre-setup
-        #     hooks. Plugin platforms that opt in via ``connect_last=True``
-        #     in their PlatformEntry connect last (their ``connect()``
-        #     expects routes already registered by the API server's hook).
+        #     hooks; everything else connects after.
         _pending: list[tuple] = []  # [(Platform, PlatformConfig, adapter)]
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
@@ -2443,21 +2441,12 @@ class GatewayRunner:
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _pending.append((platform, platform_config, adapter))
 
-        # Sort: API_SERVER first; registry plugins flagged connect_last go
-        # last; everything else in the middle. Stable so order within each
-        # bucket is preserved (matches insertion order from config.platforms).
-        try:
-            from gateway.platform_registry import platform_registry as _pr
-        except Exception:  # pragma: no cover - import guard
-            _pr = None
-
+        # Sort: API_SERVER first; everything else after. Stable so order
+        # within each bucket is preserved (matches insertion order from
+        # config.platforms).
         def _connect_priority(p: Platform) -> int:
             if p == Platform.API_SERVER:
                 return 0
-            if _pr is not None:
-                _entry = _pr.get(p.value)
-                if _entry is not None and _entry.connect_last:
-                    return 2
             return 1
 
         _pending.sort(key=lambda t: _connect_priority(t[0]))
@@ -3386,18 +3375,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        # Plugin-registered platforms can opt-in via skip_user_authorization
-        # (e.g. Myah, where Open WebUI handles auth upstream).
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
-            return True
-
-        # Phase 4d: registry-driven skip for plugin platforms.
-        try:
-            from gateway.platform_registry import platform_registry
-            _registry_entry = platform_registry.get(source.platform.value) if source.platform else None
-        except Exception:
-            _registry_entry = None
-        if _registry_entry is not None and _registry_entry.skip_user_authorization:
             return True
 
         user_id = source.user_id
@@ -5090,21 +5068,12 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform.
         # Skip for webhooks (they deliver to configured targets like
-        # github_comment), and for plugin platforms that opt out via the
-        # registry's ``skip_home_channel_prompt`` field (e.g. Myah, where
-        # home-channel semantics don't apply to web DMs).
-        try:
-            from gateway.platform_registry import platform_registry as _hp_registry
-            _hp_entry = _hp_registry.get(source.platform.value) if source.platform else None
-        except Exception:
-            _hp_entry = None
-        _hp_plugin_skip = bool(_hp_entry is not None and _hp_entry.skip_home_channel_prompt)
+        # github_comment).
         if (
             not history
             and source.platform
             and source.platform != Platform.LOCAL
             and source.platform != Platform.WEBHOOK
-            and not _hp_plugin_skip
         ):
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"

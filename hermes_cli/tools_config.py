@@ -249,7 +249,7 @@ class _RegistryAwarePlatformDict(dict):
     def _entry_to_dict(entry) -> dict:
         return {
             "label": entry.label,
-            "default_toolset": entry.default_toolset or f"hermes-{entry.name}",
+            "default_toolset": f"hermes-{entry.name}",
         }
 
 
