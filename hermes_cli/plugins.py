@@ -455,16 +455,7 @@ class PluginContext:
         validate_config: Callable | None = None,
         required_env: list | None = None,
         install_hint: str = "",
-        # Phase 4d: capability fields exposed on PlatformEntry so plugin
-        # adapters can express what previously had to be hardcoded in core.
-        allowed_users_env: str | None = None,
-        allow_all_env: str | None = None,
-        max_message_length: int | None = None,
-        platform_hint: str | None = None,
-        default_toolset: str | None = None,
-        skip_user_authorization: bool = False,
-        skip_home_channel_prompt: bool = False,
-        connect_last: bool = False,
+        **entry_kwargs: Any,
     ) -> None:
         """Register a gateway platform adapter.
 
@@ -472,12 +463,9 @@ class PluginContext:
         ``BasePlatformAdapter`` subclass instance.  The gateway calls
         ``check_fn()`` before instantiation to verify dependencies.
 
-        Optional capability fields (``allowed_users_env``, ``allow_all_env``,
-        ``platform_hint``, ``default_toolset``, ``skip_user_authorization``,
-        ``skip_home_channel_prompt``, ``connect_last``, ``max_message_length``)
-        let the adapter declare behaviour that core previously encoded as
-        per-platform branches. See ``gateway/platform_registry.py`` for
-        per-field semantics.
+        Extra keyword arguments are forwarded to ``PlatformEntry`` (e.g.
+        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``).
+        Unknown keys raise TypeError from the dataclass constructor.
 
         Example::
 
@@ -486,10 +474,13 @@ class PluginContext:
                 label="IRC",
                 adapter_factory=lambda cfg: IRCAdapter(cfg),
                 check_fn=lambda: True,
+                emoji="💬",
+                setup_fn=irc_interactive_setup,
             )
         """
         from gateway.platform_registry import platform_registry, PlatformEntry
 
+        entry_kwargs.setdefault("plugin_name", self.manifest.name)
         entry = PlatformEntry(
             name=name,
             label=label,
@@ -499,14 +490,7 @@ class PluginContext:
             required_env=required_env or [],
             install_hint=install_hint,
             source="plugin",
-            allowed_users_env=allowed_users_env,
-            allow_all_env=allow_all_env,
-            max_message_length=max_message_length,
-            platform_hint=platform_hint,
-            default_toolset=default_toolset,
-            skip_user_authorization=skip_user_authorization,
-            skip_home_channel_prompt=skip_home_channel_prompt,
-            connect_last=connect_last,
+            **entry_kwargs,
         )
         platform_registry.register(entry)
         self._manager._plugin_platform_names.add(name)
