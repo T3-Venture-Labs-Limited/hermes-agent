@@ -358,42 +358,30 @@ class MyahAdapter(BasePlatformAdapter):
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
                     })
-                    # ── Myah: heal auth.json:active_provider on every chat ────────────
-                    # Synchronously updating auth.json:active_provider whenever the user
-                    # chats fixes the production case where active_provider is stuck on
-                    # a provider whose model family no longer matches what the user is
-                    # actually using (e.g. active=openai-codex but the user picked an
-                    # OpenRouter model). Without this, cron's resolve_provider("auto")
-                    # at hermes_cli/auth.py:1188 returns the stale active_provider and
-                    # pairs it with the user's model — producing 400s from
-                    # chatgpt.com/backend-api/codex/responses for non-Codex models.
-                    #
-                    # POST /myah/v1/active-provider does the same thing on explicit
-                    # onboarding (TASK 1 of this fix); this in-line sync covers the
-                    # already-broken users whose active_provider was set by the
-                    # entrypoint heal before our fix landed. They heal on next chat.
+                    # ── Myah: heal auth.json + .env via vanilla-style provider sync ────
+                    # Synchronously updating auth.json:active_provider (and writing
+                    # OPENROUTER_API_KEY to .env when applicable) whenever the user
+                    # chats fixes the production case where state is stale or missing.
+                    # Vanilla rule: PROVIDER_REGISTRY providers set active_provider=<id>;
+                    # non-registry providers (openrouter) set active_provider=None and
+                    # rely on the .env env-var fallback branch in resolve_provider("auto").
+                    # See myah_hermes_plugin/_provider_sync.py for the full rationale.
                     _new_provider = (_result.target_provider or "").strip()
                     if _new_provider:
                         try:
-                            from hermes_cli.auth import _load_auth_store, _save_auth_store
-                            _store = _load_auth_store()
-                            _current_active = _store.get("active_provider")
-                            if _current_active != _new_provider:
-                                _store["active_provider"] = _new_provider
-                                _providers = _store.get("providers")
-                                if not isinstance(_providers, dict):
-                                    _providers = {}
-                                    _store["providers"] = _providers
-                                _providers.setdefault(_new_provider, {})
-                                _save_auth_store(_store)
-                                logger.info(
-                                    f"[myah] active_provider auto-synced on chat: "
-                                    f"{_current_active!r} -> {_new_provider!r} "
-                                    f"(session={session_key})"
-                                )
+                            from myah_hermes_plugin._provider_sync import sync_provider_state
+                            _sync_result = sync_provider_state(
+                                _new_provider,
+                                api_key=getattr(_result, "api_key", "") or None,
+                            )
+                            logger.info(
+                                "[myah] chat heal complete for session %s: %s",
+                                session_key,
+                                _sync_result,
+                            )
                         except Exception:
                             logger.debug(
-                                "[myah] active_provider auto-sync failed (non-fatal)",
+                                "[myah] chat-side provider sync failed (non-fatal)",
                                 exc_info=True,
                             )
                     # ────────────────────────────────────────────────────────────────────
@@ -1005,22 +993,24 @@ class MyahAdapter(BasePlatformAdapter):
 
     # ── Myah: POST /myah/v1/active-provider — sync auth.json:active_provider ──
     async def _handle_active_provider_endpoint(self, request: 'web.Request') -> 'web.Response':
-        """POST /myah/v1/active-provider — set auth.json:active_provider.
+        """POST /myah/v1/active-provider — sync provider state, vanilla-style.
 
         Bug B follow-up (PR #74, May 1): Myah's onboarding handlers add a
-        credential to ``auth.json:credential_pool`` but never set
-        ``auth.json:active_provider``. Cron jobs that auto-resolve a provider
-        read a stale ``active_provider`` value (set by the entrypoint heal
-        block, which picks the first OAuth provider from a hardcoded tuple)
-        and pair it with config.yaml's model, producing requests to the
-        wrong upstream.
+        credential to ``auth.json:credential_pool`` but never sync the
+        downstream provider state. Cron jobs that auto-resolve a provider
+        read a stale ``active_provider`` value and pair it with
+        config.yaml's model, producing requests to the wrong upstream.
 
-        This endpoint lets the platform write ``active_provider`` from any
-        onboarding flow (API-key save, OAuth complete, manual switch)
-        without touching hermes-core code.
+        This endpoint delegates to ``sync_provider_state`` which mirrors
+        vanilla hermes' two-category model:
+          * PROVIDER_REGISTRY providers → ``active_provider=<id>``
+          * non-registry providers (openrouter) → ``active_provider=None``
+            plus ``OPENROUTER_API_KEY`` written to ``.env`` (resolve_provider
+            falls through to the env-var branch).
 
         Request body: ``{"provider": "<provider_id>"}``
-        Response (200): ``{"active_provider": "<id>", "previous": <old|null>}``
+        Response (200): ``{"active_provider": <id|null>, "previous": <old|null>,
+                            "env_var_written": <name|null>}``
         Errors: 400 (missing/empty/unknown provider), 401 (auth), 500.
         """
         auth_err = self._check_auth(request)
@@ -1040,7 +1030,7 @@ class MyahAdapter(BasePlatformAdapter):
             )
 
         try:
-            from hermes_cli.auth import _load_auth_store, _save_auth_store
+            from hermes_cli.auth import _load_auth_store
             auth_store = _load_auth_store()
 
             credential_pool = auth_store.get('credential_pool')
@@ -1050,27 +1040,20 @@ class MyahAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
+            # Capture the pre-sync value for the response payload.
             previous = auth_store.get('active_provider')
-            auth_store['active_provider'] = provider_id
 
-            # Mirror the entrypoint heal pattern (entrypoint.sh:247-252):
-            # ensure providers dict exists and contains an entry for the new
-            # active provider. resolve_provider("auto") in hermes_cli/auth.py
-            # only considers providers that appear here.
-            providers = auth_store.get('providers')
-            if not isinstance(providers, dict):
-                auth_store['providers'] = {}
-                providers = auth_store['providers']
-            providers.setdefault(provider_id, {})
-
-            _save_auth_store(auth_store)
+            from myah_hermes_plugin._provider_sync import sync_provider_state
+            result = sync_provider_state(provider_id)
 
             logger.info(
-                f'[myah] active_provider set to {provider_id} (previous={previous!r})'
+                f'[myah] active-provider endpoint: provider={provider_id!r} '
+                f'previous={previous!r} result={result}'
             )
             return web.json_response({
-                'active_provider': provider_id,
+                'active_provider': result['active_provider'],
                 'previous': previous,
+                'env_var_written': result['env_var_written'],
             })
         except Exception as exc:
             logger.exception('[myah] active-provider endpoint error')

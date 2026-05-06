@@ -55,7 +55,8 @@ def _make_adapter_with_runner():
     return adapter, runner
 
 
-def _install_fake_model_switch(target_provider: str, new_model: str = 'haiku'):
+def _install_fake_model_switch(target_provider: str, new_model: str = 'haiku',
+                                api_key: str = 'ak'):
     fake_mod = types.ModuleType('hermes_cli.model_switch')
 
     def _switch_model(**kwargs):  # noqa: ARG001
@@ -64,7 +65,7 @@ def _install_fake_model_switch(target_provider: str, new_model: str = 'haiku'):
             error_message='',
             new_model=new_model,
             target_provider=target_provider,
-            api_key='ak',
+            api_key=api_key,
             base_url='https://x',
             api_mode='chat_completions',
         )
@@ -76,7 +77,14 @@ def _install_fake_model_switch(target_provider: str, new_model: str = 'haiku'):
 
 @pytest.fixture
 def fake_switch_to_openrouter():
-    fake_mod = _install_fake_model_switch(target_provider='openrouter')
+    fake_mod = _install_fake_model_switch(target_provider='openrouter', api_key='sk-or-explicit')
+    yield fake_mod
+    sys.modules.pop('hermes_cli.model_switch', None)
+
+
+@pytest.fixture
+def fake_switch_to_codex():
+    fake_mod = _install_fake_model_switch(target_provider='openai-codex', api_key='sk-c')
     yield fake_mod
     sys.modules.pop('hermes_cli.model_switch', None)
 
@@ -113,13 +121,20 @@ def _read_auth_store():
 
 @pytest.mark.asyncio
 async def test_chat_heals_stale_active_provider(fake_switch_to_openrouter):
-    """A successful chat with provider=openrouter must heal active_provider.
+    """A successful chat with provider=openrouter must heal state vanilla-style.
 
-    This is the production case: the entrypoint heal locked active_provider
-    to openai-codex even though the user has both codex AND openrouter in
-    the pool. After our fix lands, the user's NEXT chat with an openrouter
-    model will heal the state without any explicit re-onboarding action.
+    Vanilla rule for non-PROVIDER_REGISTRY providers (openrouter):
+      * auth.json:active_provider → None (so resolve_provider("auto") falls
+        through to the env-var branch)
+      * .env gains OPENROUTER_API_KEY (so the env-var branch finds the key)
+
+    Production case: the entrypoint heal locked active_provider to
+    openai-codex even though the user has both codex AND openrouter in the
+    pool. After our fix lands, the user's NEXT chat with an openrouter
+    model heals the state without any explicit re-onboarding action.
     """
+    from hermes_cli.config import get_env_value
+
     _seed_auth_store(active='openai-codex', pool_keys=['openai-codex', 'openrouter'])
     adapter, _runner = _make_adapter_with_runner()
 
@@ -136,21 +151,52 @@ async def test_chat_heals_stale_active_provider(fake_switch_to_openrouter):
     # The chat itself must accept (202 — adapter starts an async task).
     assert resp.status == 202, f'expected 202, got {resp.status} body={resp.body!r}'
 
-    # auth.json:active_provider must now be openrouter.
+    # auth.json:active_provider must now be None (vanilla rule for openrouter).
     store = _read_auth_store()
-    assert store['active_provider'] == 'openrouter', (
-        f'expected active_provider=openrouter after chat, got {store["active_provider"]!r}'
+    assert store.get('active_provider') is None, (
+        f'expected active_provider=None after openrouter chat, '
+        f'got {store.get("active_provider")!r}'
     )
-    # providers entry must exist for the new active provider.
-    assert 'openrouter' in store.get('providers', {}), (
-        f'expected providers to contain openrouter, got {list(store.get("providers", {}).keys())}'
+    # OPENROUTER_API_KEY must now be in .env.
+    assert get_env_value('OPENROUTER_API_KEY') == 'sk-or-explicit', (
+        f'expected OPENROUTER_API_KEY in .env, '
+        f'got {get_env_value("OPENROUTER_API_KEY")!r}'
     )
 
 
 @pytest.mark.asyncio
+async def test_chat_with_codex_sets_active_provider(fake_switch_to_codex):
+    """Category 1: chat with PROVIDER_REGISTRY provider sets active_provider=<id>."""
+    _seed_auth_store(active=None, pool_keys=['openai-codex'])
+    adapter, _runner = _make_adapter_with_runner()
+
+    request = _make_message_request({
+        'message': 'hello',
+        'session_id': 'chat-codex-1',
+        'user_id': 'u-codex-1',
+        'model': 'gpt-5',
+        'provider': 'openai-codex',
+    })
+
+    resp = await adapter._handle_message_endpoint(request)
+    assert resp.status == 202, f'expected 202, got {resp.status} body={resp.body!r}'
+
+    store = _read_auth_store()
+    assert store.get('active_provider') == 'openai-codex'
+    assert 'openai-codex' in store.get('providers', {})
+
+
+@pytest.mark.asyncio
 async def test_chat_does_not_change_active_provider_when_already_correct(fake_switch_to_openrouter):
-    """If active_provider already matches, the heal is a no-op (no churn)."""
-    _seed_auth_store(active='openrouter', pool_keys=['openrouter'])
+    """If state is already vanilla-correct for openrouter, the heal is a no-op.
+
+    Vanilla state for openrouter is: active_provider=None, .env has
+    OPENROUTER_API_KEY. We seed exactly that, then expect no change.
+    """
+    from hermes_cli.config import get_env_value, save_env_value
+
+    _seed_auth_store(active=None, pool_keys=['openrouter'])
+    save_env_value('OPENROUTER_API_KEY', 'sk-or-pre-existing')
     adapter, _runner = _make_adapter_with_runner()
 
     request = _make_message_request({
@@ -166,7 +212,9 @@ async def test_chat_does_not_change_active_provider_when_already_correct(fake_sw
     assert resp.status == 202
 
     store = _read_auth_store()
-    assert store['active_provider'] == 'openrouter'
+    assert store.get('active_provider') is None
+    # Pre-existing .env value must NOT be overwritten.
+    assert get_env_value('OPENROUTER_API_KEY') == 'sk-or-pre-existing'
 
 
 @pytest.mark.asyncio

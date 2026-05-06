@@ -97,11 +97,35 @@ async def test_endpoint_rejects_unknown_provider():
 
 @pytest.mark.asyncio
 async def test_endpoint_sets_active_provider():
+    """Category 1: PROVIDER_REGISTRY provider → active_provider=<id>."""
     _seed_auth_store(
         credential_pool={
             'openai-codex': {'api_key': 'sk-c'},
-            'openrouter': {'api_key': 'sk-or'},
+            'zai': {'api_key': 'sk-z'},
         },
+        active_provider='openai-codex',
+        providers={'openai-codex': {}},
+    )
+    adapter = _make_adapter()
+    request = _make_request({'provider': 'zai'})
+    resp = await adapter._handle_active_provider_endpoint(request)
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body['active_provider'] == 'zai'
+    assert body['previous'] == 'openai-codex'
+
+    # Verify auth.json was actually written.
+    store = _read_auth_store()
+    assert store['active_provider'] == 'zai'
+    # providers entry is created for the new active provider.
+    assert 'zai' in store.get('providers', {})
+
+
+@pytest.mark.asyncio
+async def test_endpoint_openrouter_sets_active_provider_to_none():
+    """Category 2 (vanilla rule): openrouter → active_provider=None."""
+    _seed_auth_store(
+        credential_pool={'openrouter': {'api_key': 'sk-or'}},
         active_provider='openai-codex',
         providers={'openai-codex': {}},
     )
@@ -110,45 +134,42 @@ async def test_endpoint_sets_active_provider():
     resp = await adapter._handle_active_provider_endpoint(request)
     assert resp.status == 200
     body = json.loads(resp.body)
-    assert body['active_provider'] == 'openrouter'
+    assert body['active_provider'] is None
     assert body['previous'] == 'openai-codex'
+    assert 'env_var_written' in body
 
-    # Verify auth.json was actually written
     store = _read_auth_store()
-    assert store['active_provider'] == 'openrouter'
+    assert store.get('active_provider') is None
 
 
 @pytest.mark.asyncio
-async def test_endpoint_sets_active_provider_first_time():
+async def test_endpoint_openrouter_bridges_pool_to_env():
+    """Category 2: pool has openrouter entry, .env empty → OPENROUTER_API_KEY written."""
+    from hermes_cli.config import get_env_value
+
+    # Mirror the vanilla credential_pool entry shape (list of dicts with access_token).
     _seed_auth_store(
-        credential_pool={'openrouter': {'api_key': 'sk-or'}},
+        credential_pool={
+            'openrouter': [
+                {
+                    'id': 'openrouter-1',
+                    'access_token': 'sk-or-from-pool',
+                    'auth_type': 'api_key',
+                    'priority': 0,
+                }
+            ]
+        },
         active_provider=None,
         providers={},
     )
+    # Sanity: .env empty before the call.
+    assert not (get_env_value('OPENROUTER_API_KEY') or '').strip()
+
     adapter = _make_adapter()
     request = _make_request({'provider': 'openrouter'})
     resp = await adapter._handle_active_provider_endpoint(request)
     assert resp.status == 200
     body = json.loads(resp.body)
-    assert body['active_provider'] == 'openrouter'
-    assert body['previous'] is None
+    assert body['env_var_written'] == 'OPENROUTER_API_KEY'
 
-    store = _read_auth_store()
-    assert store['active_provider'] == 'openrouter'
-
-
-@pytest.mark.asyncio
-async def test_endpoint_creates_providers_entry_if_missing():
-    _seed_auth_store(
-        credential_pool={'openrouter': {'api_key': 'sk-or'}},
-        providers={},  # no 'openrouter' key in providers dict
-    )
-    adapter = _make_adapter()
-    request = _make_request({'provider': 'openrouter'})
-    resp = await adapter._handle_active_provider_endpoint(request)
-    assert resp.status == 200
-
-    store = _read_auth_store()
-    assert isinstance(store.get('providers'), dict)
-    assert 'openrouter' in store['providers']
-    assert store['providers']['openrouter'] == {}
+    assert get_env_value('OPENROUTER_API_KEY') == 'sk-or-from-pool'
