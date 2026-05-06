@@ -161,7 +161,7 @@ class TestConfirmEndpointActionDispatch:
 
     @pytest.mark.asyncio
     async def test_no_session_for_stream_returns_404(self):
-        """Unknown stream_id → 404 before either resolver is called."""
+        """Unknown stream_id with NO confirmation_id → 404 (legacy path only)."""
         adapter = _make_adapter()
         # do NOT populate _stream_sessions
 
@@ -176,4 +176,70 @@ class TestConfirmEndpointActionDispatch:
         assert resp.status == 404
         mock_action.assert_not_called()
         mock_legacy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_confirmation_id_resolves_without_stream_session(self):
+        """REGRESSION: action confirmations must not require _stream_sessions.
+
+        Production hot-fix 2026-05-06.  Reproduces the exact failure mode
+        observed against ``app.myah.dev``:
+
+        1. Agent emits ``tool.confirmation_required`` for a python ``-c``
+           exec_approval.
+        2. The SSE stream closes (browser tab idle, network blip, or the
+           dispatch task's ``finally`` block runs and pops the mapping).
+        3. User clicks Approve — frontend POSTs
+           ``{run_id, confirmation_id, choice}``.
+        4. Old behaviour: handler did ``_stream_sessions.get(stream_id)``
+           BEFORE looking at ``confirmation_id`` and returned 404 even
+           though ``_action_queues`` still held the pending confirmation.
+
+        Action confirmations are keyed by ``confirmation_id`` in the
+        global ``_action_queues``; they have no dependency on the
+        per-stream session_key map.  Resolving them must NOT depend on
+        the SSE stream still being attached.
+        """
+        adapter = _make_adapter()
+        # Deliberately do NOT populate _stream_sessions — simulates the
+        # window between the agent blocking on approval and the user
+        # clicking Approve where the dispatch task's finally block has
+        # already run, OR an SSE reconnect that lost the mapping.
+
+        with patch("tools.approval.resolve_action_confirmation", return_value=True) as mock_action, \
+             patch("tools.approval.resolve_gateway_approval") as mock_legacy:
+            async with TestClient(TestServer(_make_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/myah/v1/confirm/stream-with-no-session",
+                    json={"confirmation_id": "exec-approval-123", "choice": "approve"},
+                )
+                body = await resp.json()
+
+        assert resp.status == 200, body
+        assert body.get("ok") is True
+        mock_action.assert_called_once_with("exec-approval-123", "approve")
+        # Legacy resolver MUST NOT be called when confirmation_id is present.
+        mock_legacy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_confirmation_id_unknown_id_404_even_without_stream_session(self):
+        """confirmation_id present but unknown to the action queue → 404.
+
+        Distinct from ``test_no_session_for_stream_returns_404``: this
+        case takes the action-queue branch and 404s there, not via the
+        ``_stream_sessions`` guard.  The error message must mention the
+        confirmation_id (debugging aid)."""
+        adapter = _make_adapter()
+        # No stream_sessions, no matching confirmation_id in _action_queues.
+
+        with patch("tools.approval.resolve_action_confirmation", return_value=False) as mock_action:
+            async with TestClient(TestServer(_make_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/myah/v1/confirm/any-stream",
+                    json={"confirmation_id": "stale-id", "choice": "deny"},
+                )
+                body = await resp.json()
+
+        assert resp.status == 404, body
+        assert "stale-id" in body.get("error", "")
+        mock_action.assert_called_once_with("stale-id", "deny")
 # ─────────────────────────────────────────────────────────────────
