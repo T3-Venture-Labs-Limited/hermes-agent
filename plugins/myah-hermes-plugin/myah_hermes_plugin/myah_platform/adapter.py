@@ -358,6 +358,45 @@ class MyahAdapter(BasePlatformAdapter):
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
                     })
+                    # ── Myah: heal auth.json:active_provider on every chat ────────────
+                    # Synchronously updating auth.json:active_provider whenever the user
+                    # chats fixes the production case where active_provider is stuck on
+                    # a provider whose model family no longer matches what the user is
+                    # actually using (e.g. active=openai-codex but the user picked an
+                    # OpenRouter model). Without this, cron's resolve_provider("auto")
+                    # at hermes_cli/auth.py:1188 returns the stale active_provider and
+                    # pairs it with the user's model — producing 400s from
+                    # chatgpt.com/backend-api/codex/responses for non-Codex models.
+                    #
+                    # POST /myah/v1/active-provider does the same thing on explicit
+                    # onboarding (TASK 1 of this fix); this in-line sync covers the
+                    # already-broken users whose active_provider was set by the
+                    # entrypoint heal before our fix landed. They heal on next chat.
+                    _new_provider = (_result.target_provider or "").strip()
+                    if _new_provider:
+                        try:
+                            from hermes_cli.auth import _load_auth_store, _save_auth_store
+                            _store = _load_auth_store()
+                            _current_active = _store.get("active_provider")
+                            if _current_active != _new_provider:
+                                _store["active_provider"] = _new_provider
+                                _providers = _store.get("providers")
+                                if not isinstance(_providers, dict):
+                                    _providers = {}
+                                    _store["providers"] = _providers
+                                _providers.setdefault(_new_provider, {})
+                                _save_auth_store(_store)
+                                logger.info(
+                                    f"[myah] active_provider auto-synced on chat: "
+                                    f"{_current_active!r} -> {_new_provider!r} "
+                                    f"(session={session_key})"
+                                )
+                        except Exception:
+                            logger.debug(
+                                "[myah] active_provider auto-sync failed (non-fatal)",
+                                exc_info=True,
+                            )
+                    # ────────────────────────────────────────────────────────────────────
                 else:
                     # ── Myah: clear stale override + surface failure (Bug B follow-up) ──
                     # Previously this branch only logged a warning, leaving any prior
