@@ -730,12 +730,6 @@ class MyahAdapter(BasePlatformAdapter):
             return auth_err
 
         stream_id = request.match_info["stream_id"]
-        session_key = self._stream_sessions.get(stream_id)
-        if not session_key:
-            return web.json_response(
-                {"error": f"No active stream or session for stream_id={stream_id}"},
-                status=404,
-            )
 
         try:
             body = await request.json()
@@ -749,7 +743,15 @@ class MyahAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        # ── Myah: Bug B — dispatch on confirmation_id ───────────
+        # ── Myah: Bug B — dispatch on confirmation_id ────────────────────
+        # Action confirmations live in the global ``_action_queues`` keyed
+        # by ``confirmation_id``.  They have NO dependency on the stream →
+        # session_key mapping, so resolve them BEFORE the legacy
+        # ``_stream_sessions`` lookup.  Otherwise an exec_approval whose
+        # SSE stream has been closed (or whose run finished and cleaned up
+        # the mapping in ``_dispatch_message``) returns a spurious 404
+        # even though the action queue still has the pending confirmation
+        # waiting to be resolved.  Production hot-fix 2026-05-06.
         confirmation_id = body.get("confirmation_id")
         if confirmation_id:
             from tools.approval import resolve_action_confirmation
@@ -766,7 +768,17 @@ class MyahAdapter(BasePlatformAdapter):
                     status=404,
                 )
             return web.json_response({"ok": True, "resolved": 1})
-        # ────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────────
+
+        # Legacy gateway-queue path needs the stream → session mapping.
+        # Action-queue path above already returned, so reaching here means
+        # the frontend sent ``{choice}`` only (no ``confirmation_id``).
+        session_key = self._stream_sessions.get(stream_id)
+        if not session_key:
+            return web.json_response(
+                {"error": f"No active stream or session for stream_id={stream_id}"},
+                status=404,
+            )
 
         from tools.approval import (
             resolve_gateway_approval,
