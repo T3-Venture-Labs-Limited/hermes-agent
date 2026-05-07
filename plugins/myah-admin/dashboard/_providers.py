@@ -110,7 +110,7 @@ async def _build_catalog() -> dict:
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_MODELS
-    from hermes_cli.myah_overrides import MYAH_OVERRIDES
+    from myah_hermes_plugin.myah_admin.myah_overrides import MYAH_OVERRIDES
     from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
 
     out: dict[str, dict] = {}

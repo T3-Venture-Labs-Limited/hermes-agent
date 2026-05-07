@@ -115,7 +115,7 @@ def test_list_providers_against_real_catalog(client):
     """Smoke test against the real MYAH_OVERRIDES + CANONICAL_PROVIDERS
     catalog. Confirms the plugin's _build_catalog produces the same
     v1_visible filter the frontend onboarding depends on."""
-    from hermes_cli.myah_overrides import MYAH_OVERRIDES
+    from myah_hermes_plugin.myah_admin.myah_overrides import MYAH_OVERRIDES
 
     resp = client.get("/providers", params={"visible": "v1"})
     assert resp.status_code == 200
