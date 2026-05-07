@@ -15,6 +15,7 @@ secrets tool. Phase 4f will follow with cron/status_hint/boot_md hooks.
 
 from typing import Any
 
+from .. import sentry_init
 from ..myah_tools import secrets_tool
 
 # Platform-hint string injected by ``agent.prompt_builder.get_platform_hint``
@@ -61,6 +62,14 @@ def register(ctx: Any) -> None:
     callback registration belongs here and will land in a follow-up
     PR alongside the cron hooks.
     """
+    # ── Sentry / TelemetryHook initialization (Tier 2A Task 2A.7) ──────
+    # Idempotent — silently no-ops when SENTRY_DSN_AGENT is unset (the
+    # OSS-user case). For hosted Myah agent containers SENTRY_DSN_AGENT
+    # is injected at spawn time and this call wires up Sentry SDK +
+    # registers the SentryHook adapter so Hermes runtime telemetry calls
+    # (which only see agent.telemetry.TelemetryHook) route through it.
+    sentry_init.setup_sentry()
+
     # ── Secrets tool registration (Phase 4c) ───────────────────────────
     ctx.register_tool(
         name="secrets",

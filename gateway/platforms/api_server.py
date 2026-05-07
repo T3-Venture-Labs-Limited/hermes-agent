@@ -73,14 +73,6 @@ def register_pre_setup_hook(hook):
     _pre_setup_hooks.append(hook)
 # ────────────────────────────────────────────────────────────────────
 
-# ── Myah: Sentry distributed tracing ──────────────────────────────
-try:
-    from logging_setup import setup_sentry
-    setup_sentry()
-except ImportError:
-    pass
-# ────────────────────────────────────────────────────────────────────
-
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
