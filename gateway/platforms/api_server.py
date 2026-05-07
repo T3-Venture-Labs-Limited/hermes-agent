@@ -2616,15 +2616,6 @@ class APIServerAdapter(BasePlatformAdapter):
         request_model = body.get("model") or None
         # ────────────────────────────────────────────────────────────
 
-        # ── Myah: session env vars for context ───────────────────────
-        # TODO: os.environ is process-global — concurrent requests will
-        # overwrite each other's CHAT_ID. Migrate to contextvars in a
-        # follow-up (see set_current_session_key() for the pattern).
-        if session_id:
-            os.environ["HERMES_SESSION_PLATFORM"] = "myah"
-            os.environ["CHAT_ID"] = session_id
-        # ────────────────────────────────────────────────────────────
-
         # ── Myah: reasoning token streaming ──────────────────────────
         def _reasoning_cb(text: str):
             """Forward reasoning tokens as reasoning.delta SSE events."""
