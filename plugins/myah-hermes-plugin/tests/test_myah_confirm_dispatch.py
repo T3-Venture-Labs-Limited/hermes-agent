@@ -1,12 +1,14 @@
 """Test for Bug B: /myah/v1/confirm/{stream_id} dispatches to the right resolver.
 
-Two queues exist in tools/approval.py:
+Two queues exist on the approval surface:
 
-* ``_gateway_queues`` — legacy terminal-command approvals; resolved by
-  ``resolve_gateway_approval(session_key, choice)``.
-* ``_action_queues`` — modern action confirmations (cron creation,
-  plugin install, etc.); resolved by
-  ``resolve_action_confirmation(confirmation_id, choice)``.
+* upstream's ``tools/approval.py:_gateway_queues`` — legacy
+  terminal-command approvals; resolved by
+  ``tools.approval.resolve_gateway_approval(session_key, choice)``.
+* the plugin's ``myah_hermes_plugin.cron_approval._action_queues`` —
+  modern action confirmations (cron creation, plugin install, etc.);
+  resolved by
+  ``myah_hermes_plugin.cron_approval.resolve_action_confirmation(confirmation_id, choice)``.
 
 The current ``_handle_confirm_endpoint`` only calls
 ``resolve_gateway_approval`` — Approve/Deny clicks for cron approval
@@ -56,7 +58,7 @@ class TestConfirmEndpointActionDispatch:
         session_key = "sess-1"
         adapter._stream_sessions[stream_id] = session_key
 
-        with patch("tools.approval.resolve_action_confirmation", return_value=True) as mock_action, \
+        with patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation", return_value=True) as mock_action, \
              patch("tools.approval.resolve_gateway_approval", return_value=0) as mock_legacy:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
@@ -84,8 +86,8 @@ class TestConfirmEndpointActionDispatch:
         adapter._stream_sessions[stream_id] = session_key
 
         with patch("tools.approval.resolve_gateway_approval", return_value=0) as mock_legacy, \
-             patch("tools.approval.resolve_action_confirmation_by_session", return_value=1) as mock_action_session, \
-             patch("tools.approval.resolve_action_confirmation", return_value=False) as mock_action_byid:
+             patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation_by_session", return_value=1) as mock_action_session, \
+             patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation", return_value=False) as mock_action_byid:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
@@ -110,7 +112,7 @@ class TestConfirmEndpointActionDispatch:
         adapter._stream_sessions[stream_id] = session_key
 
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_legacy, \
-             patch("tools.approval.resolve_action_confirmation_by_session", return_value=99) as mock_action_session:
+             patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation_by_session", return_value=99) as mock_action_session:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
@@ -131,7 +133,7 @@ class TestConfirmEndpointActionDispatch:
         stream_id = "stream-3"
         adapter._stream_sessions[stream_id] = "sess-3"
 
-        with patch("tools.approval.resolve_action_confirmation", return_value=False):
+        with patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation", return_value=False):
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     f"/myah/v1/confirm/{stream_id}",
@@ -165,7 +167,7 @@ class TestConfirmEndpointActionDispatch:
         adapter = _make_adapter()
         # do NOT populate _stream_sessions
 
-        with patch("tools.approval.resolve_action_confirmation") as mock_action, \
+        with patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation") as mock_action, \
              patch("tools.approval.resolve_gateway_approval") as mock_legacy:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
@@ -205,7 +207,7 @@ class TestConfirmEndpointActionDispatch:
         # clicking Approve where the dispatch task's finally block has
         # already run, OR an SSE reconnect that lost the mapping.
 
-        with patch("tools.approval.resolve_action_confirmation", return_value=True) as mock_action, \
+        with patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation", return_value=True) as mock_action, \
              patch("tools.approval.resolve_gateway_approval") as mock_legacy:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
@@ -231,7 +233,7 @@ class TestConfirmEndpointActionDispatch:
         adapter = _make_adapter()
         # No stream_sessions, no matching confirmation_id in _action_queues.
 
-        with patch("tools.approval.resolve_action_confirmation", return_value=False) as mock_action:
+        with patch("myah_hermes_plugin.cron_approval.resolve_action_confirmation", return_value=False) as mock_action:
             async with TestClient(TestServer(_make_app(adapter))) as cli:
                 resp = await cli.post(
                     "/myah/v1/confirm/any-stream",

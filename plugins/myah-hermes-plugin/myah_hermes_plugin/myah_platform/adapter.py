@@ -742,7 +742,7 @@ class MyahAdapter(BasePlatformAdapter):
         # waiting to be resolved.  Production hot-fix 2026-05-06.
         confirmation_id = body.get("confirmation_id")
         if confirmation_id:
-            from tools.approval import resolve_action_confirmation
+            from myah_hermes_plugin.cron_approval import resolve_action_confirmation
 
             ok = resolve_action_confirmation(confirmation_id, choice)
             if not ok:
@@ -768,10 +768,8 @@ class MyahAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        from tools.approval import (
-            resolve_gateway_approval,
-            resolve_action_confirmation_by_session,
-        )
+        from tools.approval import resolve_gateway_approval
+        from myah_hermes_plugin.cron_approval import resolve_action_confirmation_by_session
 
         resolved = resolve_gateway_approval(session_key, choice)
         # ── Myah: fall back to action queue when frontend POSTs without confirmation_id ──
@@ -1105,14 +1103,14 @@ class MyahAdapter(BasePlatformAdapter):
         action confirmation (cron creation, plugin install, ...).
 
         Mirrors ``send_exec_approval`` but accepts the payload from
-        ``tools/approval.py::request_action_confirmation`` directly so
-        the frontend's ``ConfirmationCard`` renders an interactive
-        Approve / Deny card with the same ``confirmation_id`` the agent
-        is blocked on.  No text fallback — callers should fall back to
-        ``adapter.send`` if this returns ``success=False`` so users
-        without a live stream still see the prompt as plain text.
+        ``myah_hermes_plugin.cron_approval.request_action_confirmation``
+        directly so the frontend's ``ConfirmationCard`` renders an
+        interactive Approve / Deny card with the same ``confirmation_id``
+        the agent is blocked on.  No text fallback — callers should fall
+        back to ``adapter.send`` if this returns ``success=False`` so
+        users without a live stream still see the prompt as plain text.
 
-        Payload contract (from ``approval.py::request_action_confirmation``):
+        Payload contract (from ``cron_approval.request_action_confirmation``):
             ``type``           — always ``"tool.confirmation_required"``
             ``confirmation_id`` — uuid the gateway resolves against
             ``action_type``    — e.g. ``"cron_create"``
@@ -1298,7 +1296,7 @@ class MyahAdapter(BasePlatformAdapter):
                 if session_key:
                     self._session_streams.pop(session_key, None)
                     try:
-                        from tools.approval import unregister_gateway_notify
+                        from myah_hermes_plugin.dispatcher import unregister_gateway_notify
                         unregister_gateway_notify(session_key)
                     except Exception:
                         pass
@@ -1620,7 +1618,7 @@ class MyahAdapter(BasePlatformAdapter):
                 pass
 
         # Unregister all approval callbacks
-        from tools.approval import unregister_gateway_notify
+        from myah_hermes_plugin.dispatcher import unregister_gateway_notify
         for session_key in list(self._session_streams.keys()):
             try:
                 unregister_gateway_notify(session_key)
