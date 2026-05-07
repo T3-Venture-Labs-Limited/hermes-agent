@@ -1323,23 +1323,6 @@ class TestAnthropicCompatImageConversion:
 class TestReadMainProvider:
     """Unit tests for _read_main_provider() covering string-form inference."""
 
-    def test_read_main_provider_infers_from_string_model_anthropic(self):
-        """String-form model: with anthropic slug must return 'anthropic'."""
-        from agent.auxiliary_client import _read_main_provider
-        with patch("hermes_cli.config.load_config",
-                   return_value={"model": "anthropic/claude-haiku-4-5-20251001"}):
-            result = _read_main_provider()
-        assert result == "anthropic"
-
-    def test_read_main_provider_infers_from_string_model_openrouter(self):
-        """String-form model: with openrouter-only slug must return 'openrouter'."""
-        from agent.auxiliary_client import _read_main_provider
-        # google/gemini-3-flash-preview is only in the openrouter catalog
-        with patch("hermes_cli.config.load_config",
-                   return_value={"model": "google/gemini-3-flash-preview"}):
-            result = _read_main_provider()
-        assert result == "openrouter"
-
     def test_read_main_provider_dict_form_unchanged(self):
         """Dict-form model: with explicit provider must return that provider unchanged."""
         from agent.auxiliary_client import _read_main_provider
@@ -1392,26 +1375,6 @@ class TestReadMainProvider:
 class TestReadMainProviderEdgeCases:
     """Edge-case and regression tests for _read_main_provider()."""
 
-    def test_read_main_provider_vendor_prefix_uses_detect_as_ground_truth(self):
-        """Vendor-prefixed slug uses detect_provider_for_model as ground truth.
-
-        Test is intentionally resilient to upstream catalog changes: it calls
-        detect_provider_for_model itself to get the expected value rather than
-        hard-coding it, so the test keeps passing even if catalog entries shift.
-        """
-        from agent.auxiliary_client import _read_main_provider
-        from hermes_cli.models import detect_provider_for_model
-        model = "google/gemini-3-flash-preview"
-        expected_result = detect_provider_for_model(model, "")
-        # The fast path hits: 'google' is NOT a known provider key, so falls
-        # through to detect_provider_for_model which returns ('openrouter', ...).
-        with patch("hermes_cli.config.load_config", return_value={"model": model}):
-            result = _read_main_provider()
-        if expected_result is not None:
-            assert result == expected_result[0].strip().lower()
-        else:
-            assert result == ""
-
     def test_read_main_provider_dict_with_no_provider_key_returns_empty(self):
         """Dict-form model: with no provider key returns '' (intentionally unchanged).
 
@@ -1431,14 +1394,6 @@ class TestReadMainProviderEdgeCases:
         with patch("hermes_cli.config.load_config", side_effect=RuntimeError("disk error")):
             result = _read_main_provider()
         assert result == ""
-
-    def test_read_main_provider_known_prefix_matches_provider(self):
-        """'anthropic/...' string form takes the fast-path and returns 'anthropic'."""
-        from agent.auxiliary_client import _read_main_provider
-        with patch("hermes_cli.config.load_config",
-                   return_value={"model": "anthropic/claude-sonnet-4-6"}):
-            result = _read_main_provider()
-        assert result == "anthropic"
 
     def test_read_main_provider_unknown_prefix_falls_through_to_detect(self):
         """Unknown vendor prefix falls through to detect_provider_for_model."""

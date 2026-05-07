@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myah-hermes-plugin"
-version = "0.2.0"
+version = "0.3.0"
 description = "Myah platform connector for Hermes Agent"
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,8 +26,22 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 # with "no register() function".
 myah-platform = "myah_hermes_plugin.myah_platform"
 
+# Console script that materializes the myah-admin dashboard plugin's
+# filesystem-discovery hook at a Hermes-scanned location. Invoked from
+# agent/Dockerfile at image build time.
+[project.scripts]
+myah-hermes-plugin = "myah_hermes_plugin.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["myah_hermes_plugin", "myah_hermes_plugin.*"]
+
+# Ship manifest.json inside the wheel so the install CLI can copy it from
+# package data via ``importlib.resources.files``. The Python sub-router
+# source files (_common.py, _providers.py, etc.) are regular package
+# modules and are already included by ``packages.find`` — they do not
+# need a package-data entry.
+[tool.setuptools.package-data]
+"myah_hermes_plugin.myah_admin.dashboard" = ["manifest.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

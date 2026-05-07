@@ -1,19 +1,20 @@
 """Tests for the myah-admin plugin's SOUL/config/commands endpoints.
 
-Loads ``plugins/myah-admin/dashboard/_soul_and_config.py`` directly via
-``importlib.util.spec_from_file_location`` (the same path the dashboard
-plugin loader uses), then mounts the router on a fresh FastAPI app behind
-``TestClient``.
+Exercises ``myah_hermes_plugin.myah_admin.dashboard._soul_and_config``
+via FastAPI ``TestClient``.
 
-The module-level relative-style import (sibling ``_common.py``) runs at
-load time, so importing the module here exercises the same import path
-production uses.
+Phase 4e (2026-05-07): test was migrated from
+``agent/hermes/tests/plugins/`` to the pip-plugin's tests/ directory.
+The dashboard now lives inside the pip package as a proper Python
+package; the synthetic-module loading boilerplate (which used
+``spec_from_file_location`` to work around the hyphen in
+``plugins/myah-admin/``) is gone.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,25 +22,25 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = REPO_ROOT / "plugins" / "myah-admin" / "dashboard"
-
-
-# ── Module loader ───────────────────────────────────────────────────────────
+from myah_hermes_plugin.myah_admin.dashboard import _soul_and_config as _soul_and_config_module
 
 
 def _load_module():
-    """Import ``_soul_and_config.py`` the same way the dashboard does."""
-    api_path = PLUGIN_DIR / "_soul_and_config.py"
-    spec = importlib.util.spec_from_file_location(
-        "hermes_dashboard_plugin_myah-admin_soul_and_config",
-        api_path,
+    """Compatibility shim — returns the already-imported pip-package module
+    with ``_SOUL_DEFAULTS_PATH`` refreshed from the (possibly monkeypatched)
+    ``MYAH_SOUL_DEFAULTS`` env var.
+
+    The legacy test loaded the module fresh per call via
+    ``spec_from_file_location`` which re-read env vars at load time. The
+    pip-package layout imports once at collection time so the module-level
+    ``_SOUL_DEFAULTS_PATH = Path(os.environ.get(...))`` gets evaluated
+    before pytest fixtures monkeypatch the env var. Refreshing it here
+    preserves the original semantics without changing production code.
+    """
+    _soul_and_config_module._SOUL_DEFAULTS_PATH = Path(
+        os.environ.get('MYAH_SOUL_DEFAULTS', '/opt/myah/defaults/SOUL.md')
     )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return _soul_and_config_module
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────

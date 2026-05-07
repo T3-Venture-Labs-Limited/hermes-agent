@@ -1,6 +1,6 @@
 """Tests for the myah-admin sessions/lifecycle handlers.
 
-Covers ``plugins/myah-admin/dashboard/_sessions_and_lifecycle.py``:
+Covers ``myah_hermes_plugin.myah_admin.dashboard._sessions_and_lifecycle``:
 
   * POST /sessions/{id}/title — direct SessionDB write
   * POST /sessions/{id}/append — auto-creates session row
@@ -10,62 +10,31 @@ Covers ``plugins/myah-admin/dashboard/_sessions_and_lifecycle.py``:
 
 The gateway client is mocked throughout — these tests do NOT spin up the
 aiohttp gateway. Real end-to-end coverage of the gateway-side handlers
-lives in ``tests/gateway/test_myah_runtime_admin.py``.
+lives in ``tests/gateway/test_myah_runtime_admin.py`` (in the hermes
+repo).
+
+Phase 4e (2026-05-07): test was migrated from
+``agent/hermes/tests/plugins/`` to the pip-plugin's tests/ directory.
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-
-# ── Module loader ───────────────────────────────────────────────────────────
+from myah_hermes_plugin.myah_admin.dashboard import (
+    _common as _common_module,
+    _sessions_and_lifecycle as _lifecycle_module,
+)
 
 
 def _load_lifecycle_module():
-    """Import ``_sessions_and_lifecycle`` from ``plugins/myah-admin/dashboard``.
-
-    The plugin directory has a hyphen (``myah-admin``) which Python can't
-    use as a package name, so we load the file by path. We also
-    pre-register a fake ``_common`` module the handler imports so we
-    don't have to import the real one (which has its own httpx state).
-    """
-    repo_root = Path(__file__).resolve().parents[2]
-    plugin_dir = repo_root / "plugins" / "myah-admin" / "dashboard"
-
-    # Provide a synthetic package so relative imports inside the target
-    # module (``from ._common import ...``) resolve.
-    pkg_name = "_myah_admin_dashboard_under_test"
-    if pkg_name not in sys.modules:
-        pkg = importlib.util.module_from_spec(
-            importlib.util.spec_from_loader(pkg_name, loader=None)
-        )
-        pkg.__path__ = [str(plugin_dir)]
-        sys.modules[pkg_name] = pkg
-
-    common_path = plugin_dir / "_common.py"
-    common_spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}._common", common_path
-    )
-    common_mod = importlib.util.module_from_spec(common_spec)
-    sys.modules[f"{pkg_name}._common"] = common_mod
-    common_spec.loader.exec_module(common_mod)
-
-    target_path = plugin_dir / "_sessions_and_lifecycle.py"
-    spec = importlib.util.spec_from_file_location(
-        f"{pkg_name}._sessions_and_lifecycle", target_path
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[f"{pkg_name}._sessions_and_lifecycle"] = mod
-    spec.loader.exec_module(mod)
-    return mod, common_mod
+    """Compatibility shim — kept for the (mod, common_mod) tuple shape used by
+    fixtures below. Now returns the already-imported pip-package modules."""
+    return _lifecycle_module, _common_module
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────

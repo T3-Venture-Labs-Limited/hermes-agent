@@ -1874,6 +1874,34 @@ class BasePlatformAdapter(ABC):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes."""
 
+    # ── Cron delivery metadata enrichment hook ─────────────────────────────
+    # Subclasses override to enrich metadata for cron-job deliveries (e.g.
+    # MyahAdapter adds job_id/job_name/status/ran_at/origin so the platform's
+    # offline-webhook fallback can reconstruct the run-complete payload).
+    # cron.scheduler._deliver_result calls this polymorphically so no
+    # per-platform branches are needed in the scheduler. Default returns
+    # base_metadata unchanged (or an empty dict if base_metadata is None).
+    def build_delivery_metadata(
+        self,
+        job: Dict[str, Any],
+        status_hint: str = "ok",
+        base_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build the metadata kwarg for ``adapter.send()`` during cron delivery.
+
+        Args:
+            job: The cron job dict.
+            status_hint: ``'ok' | 'error'`` — run status forwarded by the
+                scheduler.
+            base_metadata: Pre-existing metadata (e.g. ``{"thread_id": ...}``).
+
+        Returns:
+            Default: a copy of ``base_metadata`` (or an empty dict if ``None``).
+            Subclasses: enriched dict for their adapter's ``send()`` to
+            consume.
+        """
+        return dict(base_metadata) if base_metadata else {}
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)

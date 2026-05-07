@@ -24,42 +24,19 @@ module so the plugin is self-contained (the plan calls for deleting
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
-import os
-import sys
 import uuid
-from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-# ── Sibling-module loader for _common ───────────────────────────────────────
-# The dashboard plugin loader (``hermes_cli/web_server.py:_mount_plugin_api_routes``)
-# uses ``importlib.util.spec_from_file_location`` without
-# ``submodule_search_locations``, so package-relative imports
-# (``from ._common import …``) raise ImportError at runtime. Try a normal
-# relative import first (works under tests that wrap the dashboard dir in a
-# synthetic package); fall back to absolute-path loading.
-try:
-    from ._common import require_session_token  # type: ignore[import-not-found]
-except ImportError:
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _common_module_name = "myah_admin_dashboard_common"
-    if _common_module_name in sys.modules:
-        _common_mod = sys.modules[_common_module_name]
-    else:
-        _common_path = os.path.join(_here, "_common.py")
-        _spec = importlib.util.spec_from_file_location(
-            _common_module_name, _common_path
-        )
-        if not _spec or not _spec.loader:  # pragma: no cover — defensive
-            raise
-        _common_mod = importlib.util.module_from_spec(_spec)
-        sys.modules[_common_module_name] = _common_mod
-        _spec.loader.exec_module(_common_mod)
-    require_session_token = _common_mod.require_session_token  # type: ignore[attr-defined]
+# Phase 4e: this module is now a proper package member, so a clean relative
+# import works in every load context. The ``/opt/myah/plugins/myah-admin/
+# dashboard/plugin_api.py`` shim materialized by ``myah-hermes-plugin install``
+# imports the real router from the pip package, so the dashboard loader's
+# ``spec_from_file_location`` path never touches this file directly.
+from ._common import require_session_token
 
 logger = logging.getLogger(__name__)
 

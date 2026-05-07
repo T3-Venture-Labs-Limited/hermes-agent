@@ -64,6 +64,12 @@ from gateway.platforms.base import (
 # Plugin-owned aiohttp runner (Tier 2A Task 2A.3).
 from myah_hermes_plugin.myah_platform.standalone_runner import MyahStandaloneRunner
 
+from ._runner_state import (
+    get_cached_agent_attribution_direct,
+    get_session_override_direct,
+    set_session_override_direct,
+)
+
 _MYAH_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Myah: per-attachment cap (defense-in-depth)
 _MYAH_PLATFORM_BASE_URL = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')  # Myah: platform URL
 _MYAH_PLATFORM_BEARER = _myah_os.environ.get('MYAH_PLATFORM_BEARER')      # Myah: shared bearer
@@ -276,9 +282,9 @@ class MyahAdapter(BasePlatformAdapter):
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
         # If the client supplies a 'model' field, apply it via
-        # runner.set_session_override(...) BEFORE dispatching the message
-        # so the gateway picks it up when constructing/resolving the agent.
-        # This is the inline equivalent of calling
+        # set_session_override_direct(runner, ...) BEFORE dispatching the
+        # message so the gateway picks it up when constructing/resolving
+        # the agent. This is the inline equivalent of calling
         # PUT /myah/api/sessions/{id}/model, useful for
         # "regenerate with different model" flows.
         _override_model = (body.get("model") or "").strip()
@@ -333,7 +339,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _current_provider = _mc.get("provider", "") or "openrouter"
                 _current_base_url = _mc.get("base_url", "") or ""
                 # Layer current session override on top if present
-                _existing_override = runner.get_session_override(session_key) or {}
+                _existing_override = get_session_override_direct(runner, session_key) or {}
                 if _existing_override:
                     _current_model = _existing_override.get('model', _current_model)
                     _current_provider = _existing_override.get('provider', _current_provider)
@@ -355,7 +361,7 @@ class MyahAdapter(BasePlatformAdapter):
                 )
                 if getattr(_result, "success", False):
                     # set_session_override evicts the cached agent atomically.
-                    runner.set_session_override(session_key, {
+                    set_session_override_direct(runner, session_key, {
                         "model": _result.new_model,
                         "provider": _result.target_provider,
                         "api_key": getattr(_result, "api_key", "") or "",
@@ -401,10 +407,14 @@ class MyahAdapter(BasePlatformAdapter):
                     logger.warning(
                         f"[myah] one-shot model override failed for session {session_key}: {_err_msg}"
                     )
-                    # Public API doesn't expose a clear method; pop directly from the
-                    # documented private dict (gateway/run.py:9442).
+                    # Direct-access pattern (Tier 2B.0): same defensive style as
+                    # _runner_state.py helpers. Pops from the upstream-native
+                    # _session_model_overrides dict; getattr guards against the
+                    # unlikely case of upstream renaming the attribute.
                     try:
-                        runner._session_model_overrides.pop(session_key, None)
+                        _overrides = getattr(runner, "_session_model_overrides", None)
+                        if _overrides is not None:
+                            _overrides.pop(session_key, None)
                     except Exception:
                         logger.debug(
                             "[myah] failed to clear session override for %s",
@@ -609,13 +619,13 @@ class MyahAdapter(BasePlatformAdapter):
                 try:
                     runner = self.gateway_runner
                     if runner is not None:
-                        attribution = runner.get_cached_agent_attribution(session_key)
+                        attribution = get_cached_agent_attribution_direct(runner, session_key)
                         if attribution is not None:
                             _attribution_model = attribution.get("model", "") or ""
                             _attribution_provider = attribution.get("provider", "") or ""
                         # Fallback to session override if cache was evicted mid-flight
                         if not _attribution_model:
-                            _override = runner.get_session_override(session_key) or {}
+                            _override = get_session_override_direct(runner, session_key) or {}
                             _attribution_model = _override.get("model", "")
                             _attribution_provider = _override.get("provider", "")
                 except Exception:
@@ -1488,7 +1498,9 @@ class MyahAdapter(BasePlatformAdapter):
         # state (session model overrides, cache eviction, busy-check, MCP
         # refresh). Everything else (file-system admin: SOUL, skills, plugins,
         # MCP CRUD, providers, reset) lives in the myah-admin DASHBOARD plugin
-        # at agent/hermes/plugins/myah-admin/dashboard/plugin_api.py.
+        # at myah_hermes_plugin/myah_admin/dashboard/plugin_api.py
+        # (materialized into /opt/myah/plugins/myah-admin/ at image build
+        # time by ``myah-hermes-plugin install --dashboard-only``).
         from .runtime_admin import register_runtime_admin_routes
         register_runtime_admin_routes(
             app,
@@ -1717,6 +1729,64 @@ class MyahAdapter(BasePlatformAdapter):
         )
         # ────────────────────────────────────────────────────
 
+    # ── Cron delivery metadata enrichment override ─────────
+    # Replaces the deleted ``cron/scheduler.py::_build_myah_send_metadata``
+    # helper. Overrides ``BasePlatformAdapter.build_delivery_metadata``
+    # (added to the fork in Tier 2B Task 2B.4 / Phase 4f Step 2; same
+    # diff queued as upstream PR U-CRON). Called polymorphically by
+    # ``cron.scheduler._deliver_result`` so the offline-webhook fallback
+    # at ``MyahAdapter._send_via_webhook`` receives the ``job_id``,
+    # ``job_name``, ``status``, ``ran_at``, and ``origin`` fields it
+    # needs to reconstruct the platform's ``/webhook/run-complete``
+    # payload.
+    def build_delivery_metadata(
+        self,
+        job: Dict[str, Any],
+        status_hint: str = "ok",
+        base_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Enrich cron-delivery metadata for the Myah platform's offline-webhook fallback.
+
+        Vendored from ``agent/hermes/cron/scheduler.py:_build_myah_send_metadata``
+        (deleted in the same Phase 4f refactor). Called polymorphically
+        by ``cron.scheduler._deliver_result`` for every cron delivery.
+
+        Args:
+            job: The cron job dict (must contain ``id``, ``name``, optionally ``origin``).
+            status_hint: ``'ok'`` | ``'error'`` — forwarded into the ``adapter.send``
+                metadata so the platform webhook receives the run status.
+            base_metadata: Pre-existing metadata (e.g. ``{"thread_id": ...}``).
+                Returned merged with the Myah-specific enrichment.
+
+        Returns:
+            A dict containing ``job_id``, ``job_name``, ``status``, ``ran_at``,
+            ``origin`` — merged into a copy of ``base_metadata``. Caller mutations
+            of the returned dict do not affect ``base_metadata`` (parity with
+            ``BasePlatformAdapter``'s default, which returns ``dict(base_metadata)``).
+        """
+        from datetime import datetime, timezone
+
+        merged: Dict[str, Any] = dict(base_metadata) if base_metadata else {}
+
+        # Resolve origin the same way upstream's ``cron._resolve_origin`` does:
+        # accept the dict only when it has both ``platform`` AND ``chat_id``;
+        # otherwise collapse to ``None``. The plugin version is slightly more
+        # defensive than upstream by checking ``isinstance(dict)`` first so a
+        # malformed ``origin`` field never raises.
+        origin = job.get("origin") or {}
+        if not (isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id")):
+            origin = None
+
+        merged.update({
+            "job_id": job.get("id", ""),
+            "job_name": job.get("name") or job.get("id", ""),
+            "status": status_hint,
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "origin": origin,
+        })
+        return merged
+    # ────────────────────────────────────────────────────────
+
     # ── Myah: Bug D v3 — webhook delivery helper ────────────
     async def _send_via_webhook(
         self,
@@ -1739,9 +1809,11 @@ class MyahAdapter(BasePlatformAdapter):
         cron-specific and rejects payloads without ``user_id`` and
         ``job_id``.  We detect cron callers by the presence of
         ``metadata.job_id`` (populated by
-        ``cron/scheduler.py::_build_myah_send_metadata``) and skip the
-        webhook for non-cron chat replies that happen to hit a closed
-        SSE stream — those should preserve the legacy
+        :meth:`MyahAdapter.build_delivery_metadata`, called polymorphically
+        by ``cron.scheduler._deliver_result`` — the legacy
+        ``_build_myah_send_metadata`` helper was deleted in Phase 4f) and
+        skip the webhook for non-cron chat replies that happen to hit a
+        closed SSE stream — those should preserve the legacy
         ``"No active stream"`` failure so the gateway's standalone-send
         retry path can take over.
         """

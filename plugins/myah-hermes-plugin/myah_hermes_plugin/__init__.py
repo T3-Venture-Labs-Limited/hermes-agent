@@ -9,4 +9,4 @@ The package is intentionally minimal at this stage. Phase 4c-4f populate it
 with code extracted from the hermes fork.
 """
 
-__version__ = "0.1.0"
+__version__ = '0.3.0'

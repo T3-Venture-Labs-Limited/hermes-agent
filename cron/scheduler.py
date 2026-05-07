@@ -78,7 +78,9 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao",
-    "myah",  # Myah: delivery platform
+    # Plugin-registered platforms (e.g. "myah") resolve via the gateway's
+    # platform_registry + Platform._missing_ at lookup time, not via this
+    # static set. See cron/scheduler.py callsite + gateway/config.py:79.
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -133,34 +135,6 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if platform and chat_id:
         return origin
     return None
-
-
-# ── Myah: Bug D v3 — adapter metadata enrichment for offline delivery ──
-def _build_myah_send_metadata(job: dict, status_hint: str = "ok") -> dict:
-    """Build the supplemental metadata ``MyahAdapter.send()`` needs for
-    its offline-delivery webhook fallback.
-
-    Upstream's ``_deliver_result`` only passes ``{"thread_id": ...}`` to
-    the adapter.  The MyahAdapter's webhook fallback needs richer data
-    (``job_id``, ``job_name``, ``status``, ``ran_at``, plus the original
-    ``origin`` dict so it can fall back to ``origin.chat_id`` when the
-    caller-supplied ``chat_id`` is empty).
-
-    Keeping this helper here — instead of inside the Myah adapter — lets
-    the cron scheduler stay the single owner of cron-execution context
-    while still routing all delivery code through the platform-agnostic
-    ``adapter.send(..., metadata=...)`` interface.  Other platforms see
-    no change because we only call this helper for ``myah`` targets in
-    ``_deliver_result``.
-    """
-    return {
-        "job_id": job.get("id", ""),
-        "job_name": job.get("name") or job.get("id", ""),
-        "status": status_hint,
-        "ran_at": _hermes_now().isoformat(),
-        "origin": _resolve_origin(job),
-    }
-# ──────────────────────────────────────────────────────────────────────
 
 
 def _get_home_target_chat_id(platform_name: str) -> str:
@@ -333,7 +307,7 @@ def _deliver_result(
     content: str,
     adapters=None,
     loop=None,
-    status_hint: str = "ok",  # Myah: forwarded to adapter.send metadata
+    status_hint: str = "ok",
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -343,10 +317,13 @@ def _deliver_result(
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    ``status_hint`` (Myah-only): forwarded into the adapter ``metadata`` so the
-    Myah offline-delivery webhook can stamp the platform's ``processes``
-    record correctly.  Defaults to ``"ok"``; ``_process_job`` overrides
-    with ``"error"`` when ``run_job`` returns ``success=False``.
+    ``status_hint`` (``'ok'`` or ``'error'``): forwarded into the adapter
+    ``metadata`` via the polymorphic ``adapter.build_delivery_metadata(...)``
+    hook on :class:`gateway.platforms.base.BasePlatformAdapter`. Adapters
+    with offline-delivery webhooks (e.g. ``MyahAdapter``) consume it to
+    stamp their run-completion records; the default base implementation
+    is a no-op. Defaults to ``"ok"``; ``_process_job`` overrides with
+    ``"error"`` when ``run_job`` returns ``success=False``.
 
     Returns None on success, or an error string on failure.
     """
@@ -381,14 +358,14 @@ def _deliver_result(
         "qqbot": Platform.QQBOT,
         "yuanbao": Platform.YUANBAO,
     }
-    # NOTE Phase 4d (2026-05-04): the ``"myah"`` entry was removed when the
-    # Myah platform adapter moved into ``myah-hermes-plugin``. ``Platform``'s
-    # ``_missing_`` accepts unknown platform values for plugin adapters, so
-    # cron jobs delivering to ``myah`` resolve via ``Platform("myah")`` below
-    # instead of via this static map. Phase 4f will move the cron->Myah
-    # offline-delivery integration (``_build_myah_send_metadata`` enrichment
-    # plus the ``status_hint`` plumbing in ``_deliver_result``) into the
-    # plugin so Myah-routed cron deliveries are restored end-to-end.
+    # NOTE Phase 4d/4f (2026-05-04 / 2026-05-07): the ``"myah"`` entry was
+    # removed when the Myah platform adapter moved into ``myah-hermes-plugin``.
+    # ``Platform``'s ``_missing_`` accepts unknown platform values for plugin
+    # adapters, so cron jobs delivering to ``myah`` resolve via
+    # ``Platform("myah")`` below instead of via this static map. Phase 4f
+    # finished the migration: the cron->Myah offline-delivery enrichment
+    # is now an override of ``BasePlatformAdapter.build_delivery_metadata``
+    # in the plugin's ``MyahAdapter`` (no fork-only branch in this scheduler).
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
@@ -470,18 +447,19 @@ def _deliver_result(
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
-            # ── Myah: enrich metadata so the offline-webhook fallback works ──
-            # See gateway/platforms/myah.py::_send_via_webhook — needs
-            # job_id/job_name/status/ran_at and the original origin to
-            # reconstruct the platform's /webhook/run-complete payload.
-            # Other platforms get no change (their adapters ignore the
-            # extra keys).
-            if platform_name.lower() == "myah":
-                if send_metadata is None:
-                    send_metadata = {}
-                send_metadata.update(_build_myah_send_metadata(job, status_hint=status_hint))
-            # ─────────────────────────────────────────────────────────────────
+            base_metadata = {"thread_id": thread_id} if thread_id else None
+            # Polymorphic delivery-metadata hook on BasePlatformAdapter (added
+            # in Tier 2B Task 2B.4 / Phase 4f; same diff queued as upstream
+            # PR U-CRON). Adapters that need to enrich metadata for cron
+            # delivery (e.g. MyahAdapter) override; the default returns
+            # base_metadata unchanged. Replaces the fork-only
+            # ``if platform_name.lower() == "myah":`` enrichment branch
+            # that used to live here.
+            send_metadata = runtime_adapter.build_delivery_metadata(
+                job=job,
+                status_hint=status_hint,
+                base_metadata=base_metadata,
+            )
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -1359,12 +1337,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
-                        # ── Myah: pass status_hint so adapter metadata is correct ─
+                        # status_hint flows through the adapter's polymorphic
+                        # build_delivery_metadata hook (see _deliver_result
+                        # docstring + gateway/platforms/base.py for the hook).
                         delivery_error = _deliver_result(
                             job, deliver_content, adapters=adapters, loop=loop,
                             status_hint="ok" if success else "error",
                         )
-                        # ──────────────────────────────────────────────────────────
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
