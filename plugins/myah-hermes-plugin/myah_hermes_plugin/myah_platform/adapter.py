@@ -1729,6 +1729,64 @@ class MyahAdapter(BasePlatformAdapter):
         )
         # ────────────────────────────────────────────────────
 
+    # ── Cron delivery metadata enrichment override ─────────
+    # Replaces the deleted ``cron/scheduler.py::_build_myah_send_metadata``
+    # helper. Overrides ``BasePlatformAdapter.build_delivery_metadata``
+    # (added to the fork in Tier 2B Task 2B.4 / Phase 4f Step 2; same
+    # diff queued as upstream PR U-CRON). Called polymorphically by
+    # ``cron.scheduler._deliver_result`` so the offline-webhook fallback
+    # at ``MyahAdapter._send_via_webhook`` receives the ``job_id``,
+    # ``job_name``, ``status``, ``ran_at``, and ``origin`` fields it
+    # needs to reconstruct the platform's ``/webhook/run-complete``
+    # payload.
+    def build_delivery_metadata(
+        self,
+        job: Dict[str, Any],
+        status_hint: str = "ok",
+        base_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Enrich cron-delivery metadata for the Myah platform's offline-webhook fallback.
+
+        Vendored from ``agent/hermes/cron/scheduler.py:_build_myah_send_metadata``
+        (deleted in the same Phase 4f refactor). Called polymorphically
+        by ``cron.scheduler._deliver_result`` for every cron delivery.
+
+        Args:
+            job: The cron job dict (must contain ``id``, ``name``, optionally ``origin``).
+            status_hint: ``'ok'`` | ``'error'`` — forwarded into the ``adapter.send``
+                metadata so the platform webhook receives the run status.
+            base_metadata: Pre-existing metadata (e.g. ``{"thread_id": ...}``).
+                Returned merged with the Myah-specific enrichment.
+
+        Returns:
+            A dict containing ``job_id``, ``job_name``, ``status``, ``ran_at``,
+            ``origin`` — merged into a copy of ``base_metadata``. Caller mutations
+            of the returned dict do not affect ``base_metadata`` (parity with
+            ``BasePlatformAdapter``'s default, which returns ``dict(base_metadata)``).
+        """
+        from datetime import datetime, timezone
+
+        merged: Dict[str, Any] = dict(base_metadata) if base_metadata else {}
+
+        # Resolve origin the same way upstream's ``cron._resolve_origin`` does:
+        # accept the dict only when it has both ``platform`` AND ``chat_id``;
+        # otherwise collapse to ``None``. The plugin version is slightly more
+        # defensive than upstream by checking ``isinstance(dict)`` first so a
+        # malformed ``origin`` field never raises.
+        origin = job.get("origin") or {}
+        if not (isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id")):
+            origin = None
+
+        merged.update({
+            "job_id": job.get("id", ""),
+            "job_name": job.get("name") or job.get("id", ""),
+            "status": status_hint,
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "origin": origin,
+        })
+        return merged
+    # ────────────────────────────────────────────────────────
+
     # ── Myah: Bug D v3 — webhook delivery helper ────────────
     async def _send_via_webhook(
         self,
@@ -1751,9 +1809,11 @@ class MyahAdapter(BasePlatformAdapter):
         cron-specific and rejects payloads without ``user_id`` and
         ``job_id``.  We detect cron callers by the presence of
         ``metadata.job_id`` (populated by
-        ``cron/scheduler.py::_build_myah_send_metadata``) and skip the
-        webhook for non-cron chat replies that happen to hit a closed
-        SSE stream — those should preserve the legacy
+        :meth:`MyahAdapter.build_delivery_metadata`, called polymorphically
+        by ``cron.scheduler._deliver_result`` — the legacy
+        ``_build_myah_send_metadata`` helper was deleted in Phase 4f) and
+        skip the webhook for non-cron chat replies that happen to hit a
+        closed SSE stream — those should preserve the legacy
         ``"No active stream"`` failure so the gateway's standalone-send
         retry path can take over.
         """
