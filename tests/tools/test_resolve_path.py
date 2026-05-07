@@ -7,10 +7,42 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture
+def isolated_resolve_state(monkeypatch):
+    """Clear the module-level state ``_resolve_path`` reads from.
+
+    ``_resolve_path_for_task`` consults ``_get_live_tracking_cwd(task_id)``
+    which reads ``tools.file_tools._file_ops_cache`` AND
+    ``tools.terminal_tool._active_environments``. Other tests in the suite
+    may have left a ``"default"`` entry in either store; without an
+    isolation barrier, this test sees a stale ``live_cwd`` instead of
+    falling through to ``TERMINAL_CWD``. Under pytest-xdist (-n 4) the
+    pollution is non-deterministic — depends on which tests share the
+    same worker.
+
+    Snapshot, clear, then restore via ``monkeypatch.setattr`` so other
+    workers / subsequent tests are unaffected.
+    """
+    from tools import file_tools
+
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+
+    try:
+        from tools import terminal_tool
+
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    except ImportError:  # pragma: no cover - terminal_tool is core
+        pass
+
+    yield
+
+
 class TestResolvePath:
     """Verify _resolve_path respects TERMINAL_CWD for worktree isolation."""
 
-    def test_relative_path_uses_terminal_cwd(self, monkeypatch, tmp_path):
+    def test_relative_path_uses_terminal_cwd(
+        self, monkeypatch, tmp_path, isolated_resolve_state
+    ):
         """Relative paths resolve against TERMINAL_CWD, not process CWD."""
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         from tools.file_tools import _resolve_path
@@ -44,7 +76,9 @@ class TestResolvePath:
         # After expanduser, ~/notes.txt becomes absolute → TERMINAL_CWD ignored
         assert result == Path.home() / "notes.txt"
 
-    def test_result_is_resolved(self, monkeypatch, tmp_path):
+    def test_result_is_resolved(
+        self, monkeypatch, tmp_path, isolated_resolve_state
+    ):
         """Output path has no '..' components."""
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         from tools.file_tools import _resolve_path
