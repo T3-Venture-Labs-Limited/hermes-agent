@@ -1,57 +1,36 @@
 """Tests for the myah-admin plugin's provider/credential routes.
 
-Exercises ``plugins/myah-admin/dashboard/_providers.py`` directly via
-FastAPI's ``TestClient``. The router is mounted on a bare FastAPI app so
-the dashboard process is not required.
+Exercises ``myah_hermes_plugin.myah_admin.dashboard._providers`` directly
+via FastAPI's ``TestClient``. The router is mounted on a bare FastAPI app
+so the dashboard process is not required.
 
 Auth is disabled by leaving ``HERMES_WEB_SESSION_TOKEN`` unset — the
 ``require_session_token`` dependency accepts all requests in that case
 (matches the legacy aiohttp behaviour).
+
+Phase 4e (2026-05-07): test was migrated from
+``agent/hermes/tests/plugins/`` to the pip-plugin's tests/ directory. The
+module-loading boilerplate that worked around the hyphen in
+``plugins/myah-admin/`` is gone — the dashboard now lives inside the pip
+package as a proper Python package and imports cleanly.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import types
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# ── Locate and import the plugin module ─────────────────────────────────────
-# The plugin lives at ``plugins/myah-admin/dashboard/_providers.py``. The
-# hyphen prevents a normal ``import`` so we use the same load-by-path trick
-# the other plugin tests do.
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_PLUGIN_DIR = _REPO_ROOT / "plugins" / "myah-admin" / "dashboard"
+from myah_hermes_plugin.myah_admin.dashboard import _providers as _providers_module
 
 
-def _load_module(name: str, filename: str) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        name,
-        _PLUGIN_DIR / filename,
-        submodule_search_locations=[str(_PLUGIN_DIR)],
-    )
-    assert spec and spec.loader, f"failed to load {filename}"
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture(scope='module')
 def providers_mod() -> types.ModuleType:
-    """Import _common first (relative parent for _providers), then _providers."""
-    pkg = types.ModuleType("myah_admin_dashboard_under_test")
-    pkg.__path__ = [str(_PLUGIN_DIR)]
-    sys.modules["myah_admin_dashboard_under_test"] = pkg
-
-    _load_module("myah_admin_dashboard_under_test._common", "_common.py")
-    return _load_module("myah_admin_dashboard_under_test._providers", "_providers.py")
+    """The migrated _providers module (clean package member)."""
+    return _providers_module
 
 
 @pytest.fixture

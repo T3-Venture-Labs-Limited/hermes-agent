@@ -25,38 +25,20 @@ would make it harder to keep their contracts and tests in sync.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
 import os
-import sys
 from typing import Any
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
 
-# ── Sibling-module loader for _common ───────────────────────────────────────
-# See _providers.py for the explanation. Same pattern: relative import first
-# (works in tests), absolute-path fallback for the production plugin loader.
-try:
-    from ._common import gateway_client, hermes_home, require_session_token  # type: ignore[import-not-found]
-except ImportError:
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _common_module_name = "myah_admin_dashboard_common"
-    if _common_module_name in sys.modules:
-        _common_mod = sys.modules[_common_module_name]
-    else:
-        _common_path = os.path.join(_here, "_common.py")
-        _spec = importlib.util.spec_from_file_location(
-            _common_module_name, _common_path
-        )
-        if not _spec or not _spec.loader:  # pragma: no cover — defensive
-            raise
-        _common_mod = importlib.util.module_from_spec(_spec)
-        sys.modules[_common_module_name] = _common_mod
-        _spec.loader.exec_module(_common_mod)
-    gateway_client = _common_mod.gateway_client  # type: ignore[attr-defined]
-    hermes_home = _common_mod.hermes_home  # type: ignore[attr-defined]
-    require_session_token = _common_mod.require_session_token  # type: ignore[attr-defined]
+# Phase 4e: clean relative import inside the pip-package layout. The
+# ``/opt/myah/plugins/myah-admin/dashboard/plugin_api.py`` shim materialized
+# by ``myah-hermes-plugin install`` imports the real router from the pip
+# package, so the dashboard loader's ``spec_from_file_location`` path never
+# touches this file directly.
+from ._common import gateway_client, hermes_home, require_session_token
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +107,6 @@ async def _async_subprocess(
 
 def _read_config_yaml() -> dict[str, Any]:
     """Read ``$HERMES_HOME/config.yaml`` or return an empty dict."""
-    import os
-
-    import yaml
-
     config_path = os.path.join(hermes_home(), "config.yaml")
     if not os.path.exists(config_path):
         return {}

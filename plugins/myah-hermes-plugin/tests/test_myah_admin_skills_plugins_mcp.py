@@ -1,19 +1,20 @@
 """Tests for the myah-admin plugin's skills/plugins/MCP/toolset routes.
 
-Exercises ``plugins/myah-admin/dashboard/_skills_plugins_mcp.py`` directly
-via FastAPI's ``TestClient``. The router is mounted on a bare FastAPI
-app so the dashboard process is not required.
+Exercises ``myah_hermes_plugin.myah_admin.dashboard._skills_plugins_mcp``
+directly via FastAPI's ``TestClient``. The router is mounted on a bare
+FastAPI app so the dashboard process is not required.
 
 Auth is disabled by leaving ``HERMES_WEB_SESSION_TOKEN`` unset — the
 ``require_session_token`` dependency accepts all requests in that case
 (matches the legacy aiohttp behaviour and the pattern used by
 ``test_myah_admin_providers.py``).
+
+Phase 4e (2026-05-07): test was migrated from
+``agent/hermes/tests/plugins/`` to the pip-plugin's tests/ directory.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -23,38 +24,13 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-
-# ── Locate and import the plugin module ─────────────────────────────────────
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_PLUGIN_DIR = _REPO_ROOT / "plugins" / "myah-admin" / "dashboard"
+from myah_hermes_plugin.myah_admin.dashboard import _skills_plugins_mcp
 
 
-def _load_module(name: str, filename: str) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        name,
-        _PLUGIN_DIR / filename,
-        submodule_search_locations=[str(_PLUGIN_DIR)],
-    )
-    assert spec and spec.loader, f"failed to load {filename}"
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture(scope='module')
 def spm_mod() -> types.ModuleType:
-    """Import the skills/plugins/MCP module under test."""
-    pkg = types.ModuleType("myah_admin_dashboard_under_test_spm")
-    pkg.__path__ = [str(_PLUGIN_DIR)]
-    sys.modules["myah_admin_dashboard_under_test_spm"] = pkg
-
-    _load_module("myah_admin_dashboard_under_test_spm._common", "_common.py")
-    return _load_module(
-        "myah_admin_dashboard_under_test_spm._skills_plugins_mcp",
-        "_skills_plugins_mcp.py",
-    )
+    """The migrated _skills_plugins_mcp module (clean package member)."""
+    return _skills_plugins_mcp
 
 
 @pytest.fixture

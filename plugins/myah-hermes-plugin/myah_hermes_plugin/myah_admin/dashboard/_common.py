@@ -28,6 +28,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -185,11 +186,15 @@ gateway_client = GatewayClient()
 
 
 def hermes_home() -> str:
-    """The active ``HERMES_HOME`` (profile-aware).
+    """The active ``HERMES_HOME`` (profile-aware) as a string.
 
     Wraps ``hermes_constants.get_hermes_home()`` so handlers don't have to
     import it themselves. Falls back to ``~/.hermes`` if the import fails (the
     plugin should still load even if Hermes internals shift).
+
+    Returns ``str`` to match ``hermes_constants.get_hermes_home`` callers
+    that print or join paths textually. For ``Path`` operations, prefer
+    :func:`hermes_home_path`.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -197,3 +202,13 @@ def hermes_home() -> str:
         return str(get_hermes_home())
     except Exception:  # pragma: no cover — defensive
         return os.path.expanduser("~/.hermes")
+
+
+def hermes_home_path() -> Path:
+    """The active ``HERMES_HOME`` as a :class:`~pathlib.Path`.
+
+    Convenience wrapper for sub-routers that build filesystem paths from
+    ``HERMES_HOME``. Multiple sub-routers used to roll their own
+    ``Path(hermes_home())`` shim — this consolidates them.
+    """
+    return Path(hermes_home())

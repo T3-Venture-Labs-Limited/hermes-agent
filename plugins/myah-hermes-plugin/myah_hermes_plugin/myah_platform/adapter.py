@@ -1498,7 +1498,9 @@ class MyahAdapter(BasePlatformAdapter):
         # state (session model overrides, cache eviction, busy-check, MCP
         # refresh). Everything else (file-system admin: SOUL, skills, plugins,
         # MCP CRUD, providers, reset) lives in the myah-admin DASHBOARD plugin
-        # at agent/hermes/plugins/myah-admin/dashboard/plugin_api.py.
+        # at myah_hermes_plugin/myah_admin/dashboard/plugin_api.py
+        # (materialized into /opt/myah/plugins/myah-admin/ at image build
+        # time by ``myah-hermes-plugin install --dashboard-only``).
         from .runtime_admin import register_runtime_admin_routes
         register_runtime_admin_routes(
             app,

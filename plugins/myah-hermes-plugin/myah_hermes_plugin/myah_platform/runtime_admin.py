@@ -4,8 +4,9 @@ This module exposes the small set of admin operations that **must** run in the
 gateway process because they touch the live ``GatewayRunner`` (session model
 overrides, agent cache eviction, busy-check). Everything else (file-system
 admin: SOUL, skills, plugins, MCP CRUD, providers, reset) lives in the
-``plugins/myah-admin/`` dashboard plugin which runs in the ``hermes dashboard``
-process.
+``myah_hermes_plugin.myah_admin.dashboard`` plugin which runs in the
+``hermes dashboard`` process. Phase 4e moved that dashboard out of the
+fork-side ``plugins/myah-admin/`` directory and into this pip package.
 
 Mounting:
     Routes are added under ``/myah/v1/admin/*`` via

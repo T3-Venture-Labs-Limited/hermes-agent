@@ -35,81 +35,32 @@ Cache-eviction semantics (verified against
                                    next message rebuilds the agent with
                                    the new toolset selection.
 
-Import strategy:
-    The dashboard plugin loader (``hermes_cli/web_server.py::
-    _mount_plugin_api_routes``) imports plugin api files via
-    ``importlib.util.spec_from_file_location``, which strips the parent
-    package context — so relative imports (``from ._common import ...``)
-    cannot work, and the package-qualified name
-    ``plugins.myah-admin.dashboard._common`` is not importable because
-    of the hyphen in ``myah-admin``.
-
-    We therefore load ``_common.py`` from disk via
-    ``spec_from_file_location`` ourselves. This mirrors how
-    ``plugin_api.py`` loads ``../myah_hook.py``. The cost is one extra
-    import-time stat call; the benefit is that the module is loadable
-    in three contexts: (1) the live dashboard process, (2) the test
-    suite when imported via the same file-based shim, and (3) directly
-    via ``importlib.util.spec_from_file_location`` for ad-hoc scripts.
+Phase 4e (2026-05-07): this module now lives inside the pip-installed
+``myah_hermes_plugin.myah_admin.dashboard`` package — see
+:mod:`myah_hermes_plugin.myah_admin.dashboard.plugin_api` for the
+complete rationale. Relative imports (``from ._common import ...``)
+work in every load context because the materialized
+``/opt/myah/plugins/myah-admin/dashboard/plugin_api.py`` is a shim that
+re-exports ``router`` from the pip package.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
-import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
 from typing import Any
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+# Phase 4e: clean relative import inside the pip-package layout.
+from ._common import gateway_client, hermes_home_path, require_session_token
+
 logger = logging.getLogger(__name__)
-
-
-# ── Import the sibling _common module without a package context ─────────────
-
-
-def _load_common():
-    """Load the sibling ``_common.py`` via file path.
-
-    The dashboard plugin loader registers our parent file as
-    ``hermes_dashboard_plugin_myah-admin`` in ``sys.modules`` but does
-    not establish a package, so ``from ._common import ...`` fails with
-    ``ImportError: attempted relative import with no known parent
-    package``. We resolve the file directly.
-    """
-    here = Path(__file__).resolve().parent
-    common_path = here / "_common.py"
-    spec = importlib.util.spec_from_file_location(
-        "myah_admin_dashboard_common", common_path,
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load {common_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_common = _load_common()
-require_session_token = _common.require_session_token
-gateway_client = _common.gateway_client
-hermes_home_str = _common.hermes_home
-
-
-def _hermes_home() -> Path:
-    """Return the active ``HERMES_HOME`` as a ``Path``.
-
-    ``_common.hermes_home`` returns a ``str`` to keep the type consistent
-    with ``hermes_constants.get_hermes_home`` callers that print it; we
-    want a ``Path`` for filesystem ops.
-    """
-    return Path(hermes_home_str())
 
 
 # ── Constants & helpers ─────────────────────────────────────────────────────
@@ -249,7 +200,7 @@ router = APIRouter(dependencies=[Depends(require_session_token)])
 async def get_skill(name: str) -> dict[str, Any]:
     """Return the full SKILL.md content for ``name``."""
     _validate_name(name)
-    skills_dir = _hermes_home() / 'skills'
+    skills_dir = hermes_home_path() / 'skills'
     if not skills_dir.exists():
         raise HTTPException(status_code=404, detail='Skill not found')
     for skill_md in skills_dir.rglob('SKILL.md'):
@@ -276,7 +227,7 @@ async def create_skill(body: CreateSkillBody) -> dict[str, Any]:
     if not body.content.strip():
         raise HTTPException(status_code=400, detail='content is required')
 
-    skill_dir = _hermes_home() / 'skills' / body.category / body.name
+    skill_dir = hermes_home_path() / 'skills' / body.category / body.name
     skill_path = skill_dir / 'SKILL.md'
     if skill_path.exists():
         raise HTTPException(status_code=409, detail='Skill already exists')
@@ -298,7 +249,7 @@ async def update_skill(name: str, body: UpdateSkillBody) -> dict[str, Any]:
     if not body.content.strip():
         raise HTTPException(status_code=400, detail='content is required')
 
-    skills_dir = _hermes_home() / 'skills'
+    skills_dir = hermes_home_path() / 'skills'
     if not skills_dir.exists():
         raise HTTPException(status_code=404, detail='Skill not found')
     for skill_md in skills_dir.rglob('SKILL.md'):
@@ -313,7 +264,7 @@ async def update_skill(name: str, body: UpdateSkillBody) -> dict[str, Any]:
 async def delete_skill(name: str) -> dict[str, Any]:
     """Delete a skill's directory tree."""
     _validate_name(name)
-    skills_dir = _hermes_home() / 'skills'
+    skills_dir = hermes_home_path() / 'skills'
     if not skills_dir.exists():
         raise HTTPException(status_code=404, detail='Skill not found')
     for skill_md in skills_dir.rglob('SKILL.md'):
@@ -330,7 +281,7 @@ async def delete_skill(name: str) -> dict[str, Any]:
 @router.get('/plugins')
 async def list_plugins() -> list[dict[str, Any]]:
     """List user plugins from ``$HERMES_HOME/plugins/*.py``."""
-    plugins_dir = _hermes_home() / 'plugins'
+    plugins_dir = hermes_home_path() / 'plugins'
     if not plugins_dir.exists():
         return []
 
@@ -369,7 +320,7 @@ async def create_plugin(body: CreatePluginBody) -> dict[str, Any]:
             status_code=422, detail=f'Python syntax error: {e}',
         ) from e
 
-    plugins_dir = _hermes_home() / 'plugins'
+    plugins_dir = hermes_home_path() / 'plugins'
     plugins_dir.mkdir(parents=True, exist_ok=True)
     plugin_path = plugins_dir / f'{body.name}.py'
     if plugin_path.exists():
@@ -399,7 +350,7 @@ async def update_plugin(name: str, body: UpdatePluginBody) -> dict[str, Any]:
             status_code=422, detail=f'Python syntax error: {e}',
         ) from e
 
-    plugin_path = _hermes_home() / 'plugins' / f'{name}.py'
+    plugin_path = hermes_home_path() / 'plugins' / f'{name}.py'
     if not plugin_path.exists():
         raise HTTPException(status_code=404, detail='Plugin not found')
 
@@ -413,7 +364,7 @@ async def update_plugin(name: str, body: UpdatePluginBody) -> dict[str, Any]:
 async def delete_plugin(name: str) -> dict[str, Any]:
     """Delete a plugin file. Schedules a gateway restart."""
     _validate_name(name)
-    plugin_path = _hermes_home() / 'plugins' / f'{name}.py'
+    plugin_path = hermes_home_path() / 'plugins' / f'{name}.py'
     if not plugin_path.exists():
         raise HTTPException(status_code=404, detail='Plugin not found')
 
@@ -429,7 +380,7 @@ async def delete_plugin(name: str) -> dict[str, Any]:
 @router.get('/mcp')
 async def list_mcp() -> list[dict[str, Any]]:
     """List MCP servers from ``$HERMES_HOME/config.yaml``."""
-    config_path = _hermes_home() / 'config.yaml'
+    config_path = hermes_home_path() / 'config.yaml'
     if not config_path.exists():
         return []
     cfg = yaml.safe_load(config_path.read_text()) or {}
@@ -465,7 +416,7 @@ async def add_mcp(body: AddMCPBody) -> dict[str, Any]:
 
     # Optional API key injection.
     if body.api_key:
-        env_path = _hermes_home() / '.env'
+        env_path = hermes_home_path() / '.env'
         env_key = f'MCP_{body.name.upper()}_API_KEY'
         existing = env_path.read_text() if env_path.exists() else ''
         lines = [
@@ -485,7 +436,7 @@ async def add_mcp(body: AddMCPBody) -> dict[str, Any]:
         if body.env:
             server_cfg['env'] = body.env
 
-    config_path = _hermes_home() / 'config.yaml'
+    config_path = hermes_home_path() / 'config.yaml'
     cfg = yaml.safe_load(config_path.read_text()) or {} if config_path.exists() else {}
     if 'mcp_servers' not in cfg or cfg['mcp_servers'] is None:
         cfg['mcp_servers'] = {}
@@ -522,7 +473,7 @@ async def remove_mcp(name: str) -> dict[str, Any]:
     """
     _validate_name(name)
 
-    config_path = _hermes_home() / 'config.yaml'
+    config_path = hermes_home_path() / 'config.yaml'
     cfg = yaml.safe_load(config_path.read_text()) or {} if config_path.exists() else {}
     servers = cfg.get('mcp_servers') or {}
     if name not in servers:

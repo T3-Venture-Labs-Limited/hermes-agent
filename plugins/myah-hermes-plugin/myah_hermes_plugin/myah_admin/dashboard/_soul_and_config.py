@@ -1,21 +1,11 @@
 """SOUL.md, config, commands, and reset endpoints for the myah-admin plugin.
 
-This module is loaded by the dashboard plugin loader at
-``hermes_cli/web_server.py:_mount_plugin_api_routes`` via
-``importlib.util.spec_from_file_location``. The loader does NOT set
-``submodule_search_locations`` and gives the module a synthetic name
-(``hermes_dashboard_plugin_myah-admin``) — so package-relative imports
-(``from . import _common``) raise ``ImportError: attempted relative import
-with no known parent package``.
-
-Import strategy:
-    The sibling ``_common.py`` is loaded by computing its absolute path from
-    ``__file__`` and using ``importlib.util.spec_from_file_location``. This is
-    the same fallback already used by ``plugin_api.py`` for ``myah_hook.py``
-    (see ``plugin_api.py`` lines 33-45). It is the only strategy that is
-    robust to both production (loaded under the synthetic
-    ``hermes_dashboard_plugin_myah-admin`` name) and tests (loaded with
-    arbitrary names).
+Phase 4e (2026-05-07): this module now lives inside the pip-installed
+``myah_hermes_plugin.myah_admin.dashboard`` package. The materialized
+``/opt/myah/plugins/myah-admin/dashboard/plugin_api.py`` shim imports
+the real router from the pip package, so the dashboard loader's
+``spec_from_file_location`` path never touches this file — clean
+relative imports work in every load context.
 
 Handlers:
     GET    /config/soul           — read SOUL.md (text/markdown + ETag)
@@ -33,7 +23,6 @@ Source: legacy aiohttp handlers in
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import logging
 import os
 import threading
@@ -54,21 +43,8 @@ from fastapi import (
     status,
 )
 
-# ── Sibling helper import (see module docstring for rationale) ──────────────
-_HERE = Path(__file__).resolve().parent
-_common_spec = importlib.util.spec_from_file_location(
-    "_myah_admin_common",
-    _HERE / "_common.py",
-)
-if _common_spec is None or _common_spec.loader is None:  # pragma: no cover
-    raise ImportError(f"Cannot load _common.py from {_HERE}")
-_common = importlib.util.module_from_spec(_common_spec)
-_common_spec.loader.exec_module(_common)
-
-require_session_token = _common.require_session_token
-gateway_client = _common.gateway_client
-hermes_home = _common.hermes_home
-# ────────────────────────────────────────────────────────────────────────────
+# Phase 4e: clean relative import inside the pip-package layout.
+from ._common import gateway_client, hermes_home_path, require_session_token
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +54,6 @@ router = APIRouter()
 # ── SOUL.md size limits (mirror legacy myah_management.py:67-69) ────────────
 SOUL_SOFT_WARN_CHARS = 8_192
 SOUL_HARD_CAP_CHARS = 32_768
-
-
-def _hermes_home_path() -> Path:
-    """Return the Hermes home directory as a Path."""
-    return Path(hermes_home())
 
 
 def _soul_etag(body: str) -> str:
@@ -95,7 +66,7 @@ def _soul_etag(body: str) -> str:
 @router.get("/config/soul")
 async def get_soul(_auth: None = Depends(require_session_token)) -> Response:
     """Read SOUL.md as text/markdown with ETag + size-limit hints in headers."""
-    soul_path = _hermes_home_path() / "SOUL.md"
+    soul_path = hermes_home_path() / "SOUL.md"
     if not soul_path.exists():
         raise HTTPException(status_code=404, detail="SOUL.md not found")
     body = soul_path.read_text(encoding="utf-8")
@@ -149,7 +120,7 @@ async def put_soul(
             },
         )
 
-    soul_path = _hermes_home_path() / "SOUL.md"
+    soul_path = hermes_home_path() / "SOUL.md"
     current_body = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
     current_etag = _soul_etag(current_body)
 
@@ -464,7 +435,7 @@ async def reset_section(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="image defaults not present (are you in a dev container?)",
             )
-        dst = _hermes_home_path() / "SOUL.md"
+        dst = hermes_home_path() / "SOUL.md"
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(_SOUL_DEFAULTS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
         return {"ok": True, "section": "soul"}
@@ -475,7 +446,7 @@ async def reset_section(
         except ImportError as exc:
             raise HTTPException(status_code=500, detail=f"set_config_value unavailable: {exc}") from exc
 
-        config_path = _hermes_home_path() / "config.yaml"
+        config_path = hermes_home_path() / "config.yaml"
         cfg = (yaml.safe_load(config_path.read_text()) or {}) if config_path.exists() else {}
         previous_names = list((cfg.get("mcp_servers") or {}).keys())
 
@@ -525,7 +496,7 @@ async def reset_section(
 
     if composite_resets:
         try:
-            config_path = _hermes_home_path() / "config.yaml"
+            config_path = hermes_home_path() / "config.yaml"
             cfg = (yaml.safe_load(config_path.read_text()) or {}) if config_path.exists() else {}
             for dotted_key, val in composite_resets.items():
                 parts = dotted_key.split(".")
@@ -565,7 +536,7 @@ async def get_last_reseed(
 
     Returns 204 with empty body if the breadcrumb is absent.
     """
-    marker = _hermes_home_path() / ".myah_last_reseed"
+    marker = hermes_home_path() / ".myah_last_reseed"
     if not marker.exists():
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
