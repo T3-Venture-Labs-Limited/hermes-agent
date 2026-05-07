@@ -1,5 +1,19 @@
 """
-Cron job management tools for Hermes Agent.
+Plugin-owned cron job management tool (shadows upstream tools/cronjob_tools.py).
+
+This module is a vendored copy of upstream's ``tools/cronjob_tools.py``
+with the single change of importing ``request_action_confirmation``
+from the plugin-vendored ``myah_hermes_plugin.cron_approval`` instead
+of upstream's ``tools.approval``.  Doing so keeps the entire approval
+chain inside the plugin so Tier 2A's "plugin works on stock upstream"
+goal holds.
+
+Tool registration uses the same ``cronjob`` name as upstream — the
+plugin's import order causes its ``registry.register`` call to land
+last, so the plugin's handler wins (last-writer-wins on tool name).
+
+Spec: docs/superpowers/specs/2026-05-06-myah-oss-completion-design.md
+§3 Task 2A.2.2.
 
 Expose a single compressed action-oriented tool to avoid schema/context bloat.
 Compatibility wrappers remain for direct Python callers and legacy tests.
@@ -31,7 +45,7 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
-from tools.approval import request_action_confirmation
+from myah_hermes_plugin.cron_approval import request_action_confirmation
 
 
 # ---------------------------------------------------------------------------

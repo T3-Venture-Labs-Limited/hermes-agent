@@ -3583,12 +3583,6 @@ class GatewayRunner:
 
         return "pair"
 
-    # ── Myah: adapter lookup helper ──────────────────────────────
-    def _get_adapter_for_platform(self, platform: 'Platform'):
-        """Return the active adapter instance for a given platform, or None."""
-        return self.adapters.get(platform)
-    # ────────────────────────────────────────────────────────────
-
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.

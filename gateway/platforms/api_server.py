@@ -73,19 +73,11 @@ def register_pre_setup_hook(hook):
     _pre_setup_hooks.append(hook)
 # ────────────────────────────────────────────────────────────────────
 
-# ── Myah: Sentry distributed tracing ──────────────────────────────
-try:
-    from logging_setup import setup_sentry
-    setup_sentry()
-except ImportError:
-    pass
-# ────────────────────────────────────────────────────────────────────
-
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -830,31 +822,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — health check; extended validation when MYAH_ADAPTER_ENABLED is set."""
-        # ── Myah: deeper credential validation (only when Myah adapter is active)
-        if os.getenv("MYAH_ADAPTER_ENABLED", "").lower() in ("true", "1", "yes"):
-            warnings = []
-            try:
-                from gateway.run import _resolve_gateway_model
-                model = _resolve_gateway_model() or os.getenv("HERMES_MODEL", "")
-                if not model:
-                    warnings.append("No model configured")
-            except Exception as e:
-                warnings.append(f"Model check failed: {e}")
-
-            try:
-                from hermes_state import SessionDB
-                db = SessionDB()
-                db.list_sessions_rich(limit=1)
-            except Exception as e:
-                warnings.append(f"SessionDB: {e}")
-
-            if warnings:
-                return web.json_response(
-                    {"status": "degraded", "platform": "hermes-agent", "warnings": warnings},
-                    status=200,
-                )
-        # ────────────────────────────────────────────────────────────
+        """GET /health — basic liveness check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -2614,15 +2582,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # ── Myah: per-request model override ─────────────────────────
         request_model = body.get("model") or None
-        # ────────────────────────────────────────────────────────────
-
-        # ── Myah: session env vars for context ───────────────────────
-        # TODO: os.environ is process-global — concurrent requests will
-        # overwrite each other's CHAT_ID. Migrate to contextvars in a
-        # follow-up (see set_current_session_key() for the pattern).
-        if session_id:
-            os.environ["HERMES_SESSION_PLATFORM"] = "myah"
-            os.environ["CHAT_ID"] = session_id
         # ────────────────────────────────────────────────────────────
 
         # ── Myah: reasoning token streaming ──────────────────────────

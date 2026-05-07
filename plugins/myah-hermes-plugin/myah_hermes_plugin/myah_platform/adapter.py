@@ -61,6 +61,9 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
 )
 
+# Plugin-owned aiohttp runner (Tier 2A Task 2A.3).
+from myah_hermes_plugin.myah_platform.standalone_runner import MyahStandaloneRunner
+
 _MYAH_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Myah: per-attachment cap (defense-in-depth)
 _MYAH_PLATFORM_BASE_URL = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')  # Myah: platform URL
 _MYAH_PLATFORM_BEARER = _myah_os.environ.get('MYAH_PLATFORM_BEARER')      # Myah: shared bearer
@@ -127,12 +130,16 @@ class MyahAdapter(BasePlatformAdapter):
         self._own_runner: Optional["web.AppRunner"] = None
         self._own_site: Optional["web.TCPSite"] = None
         # Port resolution order: config.extra.port (yaml) → MYAH_ADAPTER_PORT
-        # env → 8642 default.
+        # env → MYAH_GATEWAY_PORT env (Tier 2A Task 2A.3) → 8643 default.
+        from myah_hermes_plugin.myah_platform.standalone_runner import (
+            resolve_default_port as _myah_resolve_default_port,
+        )
+
         _port_str = str(_extra.get("port") or _myah_os.environ.get("MYAH_ADAPTER_PORT", ""))
         try:
-            self._port: int = int(_port_str) if _port_str else 8642
+            self._port: int = int(_port_str) if _port_str else _myah_resolve_default_port()
         except ValueError:
-            self._port = 8642
+            self._port = _myah_resolve_default_port()
 
         # ── Stream state ────────────────────────────────────────────────
         # stream_id → asyncio.Queue of SSE event dicts (None = sentinel)
@@ -170,18 +177,15 @@ class MyahAdapter(BasePlatformAdapter):
         self.gateway_runner = None
 
         # ── Route registration state ──────────────────────────────────
+        # Tier 2A Task 2A.3 (2026-05-07): the adapter ALWAYS runs in
+        # standalone mode now — it owns its own ``aiohttp.AppRunner``
+        # via :class:`MyahStandaloneRunner`.  No shared app, no
+        # ``register_pre_setup_hook``, no dependency on
+        # ``gateway/platforms/api_server.py`` internals.  See
+        # ``docs/superpowers/specs/2026-05-06-myah-oss-completion-design.md``
+        # §3 Task 2A.3.
         self._routes_registered = False
-        # Register a pre-setup hook so our routes are added to the shared
-        # aiohttp app BEFORE the API server calls runner.setup() (which
-        # freezes the router and rejects new route additions).
-        #
-        # In standalone mode (no API server adapter — OSS Myah path) there
-        # is no shared app to hook into; ``connect()`` detects this and
-        # spins up its own aiohttp ``AppRunner``. ``register_pre_setup_hook``
-        # is still safe to call: ``API_SERVER`` simply never connects, so
-        # the hook never fires and is harmless.
-        from gateway.platforms.api_server import register_pre_setup_hook
-        register_pre_setup_hook(self._register_routes_on_app)
+        self._runner_helper: Optional["MyahStandaloneRunner"] = None
 
     # ── Auth ────────────────────────────────────────────────────────────
 
@@ -742,7 +746,7 @@ class MyahAdapter(BasePlatformAdapter):
         # waiting to be resolved.  Production hot-fix 2026-05-06.
         confirmation_id = body.get("confirmation_id")
         if confirmation_id:
-            from tools.approval import resolve_action_confirmation
+            from myah_hermes_plugin.cron_approval import resolve_action_confirmation
 
             ok = resolve_action_confirmation(confirmation_id, choice)
             if not ok:
@@ -768,10 +772,8 @@ class MyahAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        from tools.approval import (
-            resolve_gateway_approval,
-            resolve_action_confirmation_by_session,
-        )
+        from tools.approval import resolve_gateway_approval
+        from myah_hermes_plugin.cron_approval import resolve_action_confirmation_by_session
 
         resolved = resolve_gateway_approval(session_key, choice)
         # ── Myah: fall back to action queue when frontend POSTs without confirmation_id ──
@@ -1105,14 +1107,14 @@ class MyahAdapter(BasePlatformAdapter):
         action confirmation (cron creation, plugin install, ...).
 
         Mirrors ``send_exec_approval`` but accepts the payload from
-        ``tools/approval.py::request_action_confirmation`` directly so
-        the frontend's ``ConfirmationCard`` renders an interactive
-        Approve / Deny card with the same ``confirmation_id`` the agent
-        is blocked on.  No text fallback — callers should fall back to
-        ``adapter.send`` if this returns ``success=False`` so users
-        without a live stream still see the prompt as plain text.
+        ``myah_hermes_plugin.cron_approval.request_action_confirmation``
+        directly so the frontend's ``ConfirmationCard`` renders an
+        interactive Approve / Deny card with the same ``confirmation_id``
+        the agent is blocked on.  No text fallback — callers should fall
+        back to ``adapter.send`` if this returns ``success=False`` so
+        users without a live stream still see the prompt as plain text.
 
-        Payload contract (from ``approval.py::request_action_confirmation``):
+        Payload contract (from ``cron_approval.request_action_confirmation``):
             ``type``           — always ``"tool.confirmation_required"``
             ``confirmation_id`` — uuid the gateway resolves against
             ``action_type``    — e.g. ``"cron_create"``
@@ -1298,7 +1300,7 @@ class MyahAdapter(BasePlatformAdapter):
                 if session_key:
                     self._session_streams.pop(session_key, None)
                     try:
-                        from tools.approval import unregister_gateway_notify
+                        from myah_hermes_plugin.dispatcher import unregister_gateway_notify
                         unregister_gateway_notify(session_key)
                     except Exception:
                         pass
@@ -1458,10 +1460,12 @@ class MyahAdapter(BasePlatformAdapter):
     # ────────────────────────────────────────────────────────────────────────────
 
     def _register_routes_on_app(self, app: "web.Application") -> None:
-        """Pre-setup hook: add Myah routes to the shared aiohttp app.
+        """Attach Myah routes to a freshly created aiohttp ``Application``.
 
-        Called by the API server's connect() BEFORE runner.setup() freezes
-        the router.  This is registered in __init__ via register_pre_setup_hook.
+        Called once per ``connect()`` from
+        :class:`MyahStandaloneRunner.start` BEFORE ``AppRunner.setup``
+        freezes the router.  The plugin owns its own app — there is no
+        shared app to attach to (Tier 2A Task 2A.3, 2026-05-07).
         """
         app["myah_adapter"] = self
         app.router.add_get("/myah/health", self._handle_health)
@@ -1494,99 +1498,57 @@ class MyahAdapter(BasePlatformAdapter):
         # ─────────────────────────────────────────────────────────────────
 
         self._routes_registered = True
-        logger.info("[%s] Routes registered on shared aiohttp app (pre-setup hook)", self.name)
+        logger.info("[%s] Routes registered on plugin-owned aiohttp app", self.name)
 
     async def connect(self) -> bool:
-        """Finalize adapter connection after routes are registered.
+        """Start the plugin-owned aiohttp runner.
 
-        Two operating modes:
+        Tier 2A Task 2A.3 (2026-05-07) collapsed the previous hosted /
+        standalone split: the adapter ALWAYS runs on its own aiohttp
+        ``AppRunner`` + ``TCPSite``.  Port resolution order:
 
-        - **Hosted mode** (default in production Myah): the API server adapter
-          owns the aiohttp ``Application``. Our routes are registered via the
-          pre-setup hook (called during API server ``connect()``, before the
-          router is frozen). This method just captures the loop and starts
-          background tasks.
+        1. ``config.extra.port`` from the platform config.
+        2. ``MYAH_ADAPTER_PORT`` env var.
+        3. ``MYAH_GATEWAY_PORT`` env var (default 8643).
 
-        - **Standalone mode** (OSS-Myah, ``hermes gateway`` without the
-          API server adapter enabled): no shared app exists — we create our
-          own aiohttp ``Application`` + ``AppRunner`` + ``TCPSite`` bound to
-          the configured port. Phase 4d (2026-05-04): folded in from the
-          original Phase 1 design to make ``myah-hermes-plugin`` standalone-
-          deployable on a fresh ``hermes-agent`` install.
+        See ``docs/superpowers/specs/2026-05-06-myah-oss-completion-design.md``
+        §3 Task 2A.3 for the explicit one-way-door rationale.
         """
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
 
-        from gateway.platforms.api_server import get_shared_app
-        app = get_shared_app()
+        self._standalone_mode = True
+        self._runner_helper = MyahStandaloneRunner()
 
-        if app is None:
-            # ── Standalone mode ──────────────────────────────────────
-            logger.info(
-                "[%s] No shared aiohttp app — entering standalone mode on port %d",
+        try:
+            bound = await self._runner_helper.start(
+                self._register_routes_on_app,
+                host="0.0.0.0",
+                port=self._port,
+            )
+        except Exception:
+            logger.exception(
+                "[%s] Failed to start standalone aiohttp site on port %d",
                 self.name,
                 self._port,
             )
-            self._standalone_mode = True
-            self._own_app = web.Application()
-            # The same _register_routes_on_app routine works for both modes —
-            # it only adds routes + sets app["myah_adapter"] = self.
+            # Best-effort teardown of any partially started state.
             try:
-                self._register_routes_on_app(self._own_app)
-            except Exception:
-                logger.exception(
-                    "[%s] Failed to register routes on standalone app",
-                    self.name,
-                )
-                return False
+                await self._runner_helper.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._runner_helper = None
+            return False
 
-            try:
-                self._own_runner = web.AppRunner(self._own_app)
-                await self._own_runner.setup()
-                self._own_site = web.TCPSite(
-                    self._own_runner,
-                    host="0.0.0.0",
-                    port=self._port,
-                )
-                await self._own_site.start()
-            except Exception:
-                logger.exception(
-                    "[%s] Failed to start standalone aiohttp site on port %d",
-                    self.name,
-                    self._port,
-                )
-                # Best-effort cleanup; AppRunner.cleanup() is the documented
-                # teardown for partially-started runners.
-                try:
-                    if self._own_runner is not None:
-                        await self._own_runner.cleanup()
-                except Exception:
-                    pass
-                return False
-            logger.info(
-                "[%s] Standalone aiohttp site listening on http://0.0.0.0:%d",
-                self.name,
-                self._port,
-            )
-        else:
-            # ── Hosted mode ──────────────────────────────────────────
-            if not self._routes_registered:
-                # API server is up but our pre-setup hook didn't fire
-                # (adapter was created after API server connect). Try
-                # registering routes directly — only works if the router
-                # isn't frozen yet.
-                try:
-                    self._register_routes_on_app(app)
-                except RuntimeError as e:
-                    if "frozen" in str(e).lower():
-                        logger.error(
-                            "[%s] Cannot register routes: aiohttp router is frozen. "
-                            "Ensure MYAH adapter is created BEFORE API_SERVER connect().",
-                            self.name,
-                        )
-                        return False
-                    raise
+        # Mirror the bound port back onto the legacy attributes so any
+        # downstream code that peeks at ``self._own_app`` etc. keeps
+        # working (test fixtures + the disconnect path).
+        self._own_app = self._runner_helper.app
+        # NOTE: ``_own_runner`` / ``_own_site`` are intentionally left
+        # unset — the runner-helper owns them now and ``disconnect()``
+        # delegates teardown to ``self._runner_helper.stop()``.
+        self._port = bound
 
         # Capture the event loop for thread-safe queue access (Fix 2)
         self._loop = asyncio.get_running_loop()
@@ -1602,9 +1564,9 @@ class MyahAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         logger.info(
-            "[%s] Myah adapter connected (%s mode)",
+            "[%s] Myah adapter connected (standalone mode, port=%d)",
             self.name,
-            "standalone" if self._standalone_mode else "hosted",
+            self._port,
         )
         return True
 
@@ -1620,7 +1582,7 @@ class MyahAdapter(BasePlatformAdapter):
                 pass
 
         # Unregister all approval callbacks
-        from tools.approval import unregister_gateway_notify
+        from myah_hermes_plugin.dispatcher import unregister_gateway_notify
         for session_key in list(self._session_streams.keys()):
             try:
                 unregister_gateway_notify(session_key)
@@ -1633,21 +1595,20 @@ class MyahAdapter(BasePlatformAdapter):
         self._chat_id_streams.clear()
         self._stream_sessions.clear()
 
-        # Tear down standalone-mode aiohttp site/runner if we created them.
-        if self._standalone_mode:
+        # Tear down the plugin-owned aiohttp runner.  Helper handles
+        # both ``TCPSite.stop()`` and ``AppRunner.cleanup()`` and is
+        # idempotent.
+        if self._runner_helper is not None:
             try:
-                if self._own_site is not None:
-                    await self._own_site.stop()
-            except Exception:
-                logger.debug("[%s] standalone TCPSite.stop() raised", self.name, exc_info=True)
-            try:
-                if self._own_runner is not None:
-                    await self._own_runner.cleanup()
-            except Exception:
-                logger.debug("[%s] standalone AppRunner.cleanup() raised", self.name, exc_info=True)
-            self._own_site = None
-            self._own_runner = None
-            self._own_app = None
+                await self._runner_helper.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[%s] standalone runner stop() raised", self.name, exc_info=True
+                )
+            self._runner_helper = None
+        self._own_site = None
+        self._own_runner = None
+        self._own_app = None
 
         logger.info("[%s] Myah adapter disconnected", self.name)
 

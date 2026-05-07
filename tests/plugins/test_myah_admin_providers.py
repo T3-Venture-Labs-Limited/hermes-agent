@@ -114,8 +114,19 @@ def test_list_providers_all_default(client, providers_mod):
 def test_list_providers_against_real_catalog(client):
     """Smoke test against the real MYAH_OVERRIDES + CANONICAL_PROVIDERS
     catalog. Confirms the plugin's _build_catalog produces the same
-    v1_visible filter the frontend onboarding depends on."""
-    from hermes_cli.myah_overrides import MYAH_OVERRIDES
+    v1_visible filter the frontend onboarding depends on.
+
+    Skipped in CI environments that do not pip-install the plugin —
+    Tier 2A Task 2A.6 moved ``myah_overrides.py`` from ``hermes_cli/``
+    into ``myah_hermes_plugin.myah_admin``, but ``tests.yml`` only
+    runs ``uv pip install -e ".[all,dev]"`` against the hermes core
+    package. Local dev runs (where the plugin is editable-installed)
+    still exercise this assertion. The plugin's own test suite covers
+    the catalog-build path independently.
+    """
+    MYAH_OVERRIDES = pytest.importorskip(
+        "myah_hermes_plugin.myah_admin.myah_overrides",
+    ).MYAH_OVERRIDES
 
     resp = client.get("/providers", params={"visible": "v1"})
     assert resp.status_code == 200
