@@ -17,6 +17,7 @@ from typing import Any
 
 from .. import sentry_init
 from ..myah_tools import secrets_tool
+from .pre_dispatch_hook import myah_pre_gateway_dispatch
 
 # Platform-hint string injected by ``agent.prompt_builder.get_platform_hint``
 # when the agent is running on the Myah platform. This text used to live
@@ -69,6 +70,14 @@ def register(ctx: Any) -> None:
     # registers the SentryHook adapter so Hermes runtime telemetry calls
     # (which only see agent.telemetry.TelemetryHook) route through it.
     sentry_init.setup_sentry()
+
+    # ── pre_gateway_dispatch hook (Tier 2A Task 2A.4) ──────────────────
+    # Replaces skip_user_authorization semantics that PR #20 removed.
+    # Currently a no-op-allow for Myah-platform messages; reserved as an
+    # extension point for future Myah-specific routing logic that must
+    # NOT live in upstream gateway/run.py.
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_gateway_dispatch", myah_pre_gateway_dispatch)
 
     # ── Secrets tool registration (Phase 4c) ───────────────────────────
     ctx.register_tool(
