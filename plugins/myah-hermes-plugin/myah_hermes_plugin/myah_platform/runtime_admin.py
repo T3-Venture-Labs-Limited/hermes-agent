@@ -47,6 +47,14 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore
 
+from ._runner_state import (
+    evict_session_agent_direct,
+    get_session_override_direct,
+    iter_cached_session_keys_direct,
+    iter_running_session_keys_direct,
+    set_session_override_direct,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,7 +89,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         if (resp := _check_auth(request, auth_key)) is not None:
             return resp
         session_key = request.match_info["session_key"]
-        override = runner.get_session_override(session_key)
+        override = get_session_override_direct(runner, session_key)
         return web.json_response({"override": override})
 
     async def put_session_override(request: "web.Request") -> "web.Response":
@@ -97,7 +105,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         # The override dict shape is whatever ``GatewayRunner.SessionOverride``
         # accepts — typically {model, provider, base_url?}. Pass through.
         try:
-            runner.set_session_override(session_key, body)  # type: ignore[arg-type]
+            set_session_override_direct(runner, session_key, body)
         except Exception as exc:  # pragma: no cover — defensive
             logger.exception("[myah-admin] set_session_override failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -110,7 +118,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         # No public API for "remove"; setting to empty dict is the closest we
         # can do without exposing internals. The convention is that an empty
         # override means "no override active".
-        runner.set_session_override(session_key, {})  # type: ignore[arg-type]
+        set_session_override_direct(runner, session_key, {})
         return web.json_response({"ok": True})
 
     async def get_active_sessions(request: "web.Request") -> "web.Response":
@@ -121,7 +129,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         """
         if (resp := _check_auth(request, auth_key)) is not None:
             return resp
-        keys = list(runner.iter_running_session_keys())
+        keys = iter_running_session_keys_direct(runner)
         return web.json_response({"active_session_keys": keys, "count": len(keys)})
 
     async def evict_all_caches(request: "web.Request") -> "web.Response":
@@ -133,8 +141,8 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         if (resp := _check_auth(request, auth_key)) is not None:
             return resp
         evicted = 0
-        for key in list(runner.iter_cached_session_keys()):
-            if runner.evict_session_agent(key):
+        for key in iter_cached_session_keys_direct(runner):
+            if evict_session_agent_direct(runner, key):
                 evicted += 1
         return web.json_response({"ok": True, "evicted": evicted})
 
@@ -142,7 +150,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         if (resp := _check_auth(request, auth_key)) is not None:
             return resp
         session_key = request.match_info["session_key"]
-        evicted = runner.evict_session_agent(session_key)
+        evicted = evict_session_agent_direct(runner, session_key)
         return web.json_response({"ok": True, "evicted": evicted})
 
     async def reload_mcp(request: "web.Request") -> "web.Response":
@@ -166,8 +174,8 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
             return web.json_response({"error": str(exc)}, status=500)
         # Evict caches so next message picks up the new toolset.
         evicted = 0
-        for key in list(runner.iter_cached_session_keys()):
-            if runner.evict_session_agent(key):
+        for key in iter_cached_session_keys_direct(runner):
+            if evict_session_agent_direct(runner, key):
                 evicted += 1
         return web.json_response({"ok": True, "evicted": evicted})
 
@@ -199,7 +207,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         """
         if (resp := _check_auth(request, auth_key)) is not None:
             return resp
-        active = list(runner.iter_running_session_keys())
+        active = iter_running_session_keys_direct(runner)
         if active:
             return web.json_response(
                 {

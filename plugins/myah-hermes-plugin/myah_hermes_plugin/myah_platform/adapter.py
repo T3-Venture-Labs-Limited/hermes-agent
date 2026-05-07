@@ -64,6 +64,12 @@ from gateway.platforms.base import (
 # Plugin-owned aiohttp runner (Tier 2A Task 2A.3).
 from myah_hermes_plugin.myah_platform.standalone_runner import MyahStandaloneRunner
 
+from ._runner_state import (
+    get_cached_agent_attribution_direct,
+    get_session_override_direct,
+    set_session_override_direct,
+)
+
 _MYAH_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # Myah: per-attachment cap (defense-in-depth)
 _MYAH_PLATFORM_BASE_URL = _myah_os.environ.get('MYAH_PLATFORM_BASE_URL')  # Myah: platform URL
 _MYAH_PLATFORM_BEARER = _myah_os.environ.get('MYAH_PLATFORM_BEARER')      # Myah: shared bearer
@@ -276,9 +282,9 @@ class MyahAdapter(BasePlatformAdapter):
 
         # ── Myah: one-shot session-scoped model override (T3-932) ────
         # If the client supplies a 'model' field, apply it via
-        # runner.set_session_override(...) BEFORE dispatching the message
-        # so the gateway picks it up when constructing/resolving the agent.
-        # This is the inline equivalent of calling
+        # set_session_override_direct(runner, ...) BEFORE dispatching the
+        # message so the gateway picks it up when constructing/resolving
+        # the agent. This is the inline equivalent of calling
         # PUT /myah/api/sessions/{id}/model, useful for
         # "regenerate with different model" flows.
         _override_model = (body.get("model") or "").strip()
@@ -333,7 +339,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _current_provider = _mc.get("provider", "") or "openrouter"
                 _current_base_url = _mc.get("base_url", "") or ""
                 # Layer current session override on top if present
-                _existing_override = runner.get_session_override(session_key) or {}
+                _existing_override = get_session_override_direct(runner, session_key) or {}
                 if _existing_override:
                     _current_model = _existing_override.get('model', _current_model)
                     _current_provider = _existing_override.get('provider', _current_provider)
@@ -355,7 +361,7 @@ class MyahAdapter(BasePlatformAdapter):
                 )
                 if getattr(_result, "success", False):
                     # set_session_override evicts the cached agent atomically.
-                    runner.set_session_override(session_key, {
+                    set_session_override_direct(runner, session_key, {
                         "model": _result.new_model,
                         "provider": _result.target_provider,
                         "api_key": getattr(_result, "api_key", "") or "",
@@ -401,10 +407,14 @@ class MyahAdapter(BasePlatformAdapter):
                     logger.warning(
                         f"[myah] one-shot model override failed for session {session_key}: {_err_msg}"
                     )
-                    # Public API doesn't expose a clear method; pop directly from the
-                    # documented private dict (gateway/run.py:9442).
+                    # Direct-access pattern (Tier 2B.0): same defensive style as
+                    # _runner_state.py helpers. Pops from the upstream-native
+                    # _session_model_overrides dict; getattr guards against the
+                    # unlikely case of upstream renaming the attribute.
                     try:
-                        runner._session_model_overrides.pop(session_key, None)
+                        _overrides = getattr(runner, "_session_model_overrides", None)
+                        if _overrides is not None:
+                            _overrides.pop(session_key, None)
                     except Exception:
                         logger.debug(
                             "[myah] failed to clear session override for %s",
@@ -609,13 +619,13 @@ class MyahAdapter(BasePlatformAdapter):
                 try:
                     runner = self.gateway_runner
                     if runner is not None:
-                        attribution = runner.get_cached_agent_attribution(session_key)
+                        attribution = get_cached_agent_attribution_direct(runner, session_key)
                         if attribution is not None:
                             _attribution_model = attribution.get("model", "") or ""
                             _attribution_provider = attribution.get("provider", "") or ""
                         # Fallback to session override if cache was evicted mid-flight
                         if not _attribution_model:
-                            _override = runner.get_session_override(session_key) or {}
+                            _override = get_session_override_direct(runner, session_key) or {}
                             _attribution_model = _override.get("model", "")
                             _attribution_provider = _override.get("provider", "")
                 except Exception:
