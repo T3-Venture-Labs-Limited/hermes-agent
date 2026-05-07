@@ -218,15 +218,14 @@ def test_plugin_cron_tool_imports_request_action_confirmation_from_plugin():
 
 
 def test_plugin_cron_tool_exports_callable():
-    """The plugin's cron_tool must register at least one cron-management
-    tool (``cron_create``/``schedule_cron_job``/etc.) via
-    ``tools.registry.registry``.
+    """The plugin's cron_tool must register the ``cronjob`` action tool
+    via ``tools.registry.registry`` so importing the plugin module
+    shadows upstream's tool of the same name (last-writer-wins).
     """
-    # Importing the module triggers @register_tool side-effects.
+    # Importing the module triggers registry.register side-effects.
     from myah_hermes_plugin.myah_tools import cron_tool  # noqa: F401
     from tools.registry import registry
 
-    cron_tool_names = {
-        name for name in registry.list_tools() if name.startswith("cron_")
-    }
-    assert cron_tool_names, "plugin's cron_tool registered no cron_* tools"
+    entry = registry.get_entry("cronjob")
+    assert entry is not None, "plugin's cron_tool did not register 'cronjob'"
+    assert callable(entry.handler), "registered cronjob handler is not callable"
