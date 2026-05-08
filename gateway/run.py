@@ -14294,29 +14294,27 @@ class GatewayRunner:
                 set_current_session_key,
                 unregister_gateway_notify,
             )
-            # ── Myah: secret capture imports ─────────────────────────
-            from tools.skills_tool import (
-                set_secret_capture_callback,
-                set_secret_session_key,
-                reset_secret_session_key,
-            )
+            # ── Myah: secret capture imports (Tier 2C: single-global API) ──
+            # Tier 2C Issue 4 (2026-05-08): F4 session-keyed semantics
+            # reverted to upstream's single-global _secret_capture_callback.
+            # See spec §2.2 F4 for the architectural trade-off (rare
+            # multi-tab cross-talk accepted in exchange for upstream-pristine
+            # tools/skills_tool.py).
+            from tools.skills_tool import set_secret_capture_callback
 
-            def _cleanup_secret_callbacks(
-                session_key,
-                skills_registered, skills_token,
-            ):
-                """Unregister skills_tool secret-capture callback for the session.
+            def _cleanup_secret_callbacks(skills_registered: bool) -> None:
+                """Unregister skills_tool secret-capture callback.
 
-                The secrets_tool callback used to be unregistered here too,
+                Single-global API — clears the upstream module-level
+                callback regardless of which session set it. The
+                secrets_tool callback used to be unregistered here too,
                 but secrets_tool moved out of core in Phase 4c; the
-                myah-hermes-plugin's platform adapter (Phase 4d) will own that
-                callback's lifecycle once it's wired up.
+                myah-hermes-plugin's platform adapter (Phase 4d) will own
+                that callback's lifecycle once it's wired up.
                 """
                 if skills_registered:
-                    set_secret_capture_callback(session_key, None)
-                    if skills_token is not None:
-                        reset_secret_session_key(skills_token)
-            # ────────────────────────────────────────────────────────
+                    set_secret_capture_callback(None)
+            # ─────────────────────────────────────────────────────────
 
             # ── Myah: Bug A — variadic notify, dispatch via module helper ──
             def _approval_notify_sync(*cb_args: Any, **cb_kwargs: Any) -> None:
@@ -14456,7 +14454,6 @@ class GatewayRunner:
             # plugin's platform adapter (Phase 4d) will re-register that
             # callback against the same SecretInputCard delivery path.
             _secret_cb_registered = False
-            _secret_session_token = None
             if _plat_adapter and hasattr(_plat_adapter, '_secret_capture_callback'):
                 _sid = _plat_adapter._session_streams.get(session_key) if hasattr(_plat_adapter, '_session_streams') else None
                 if _sid:
@@ -14464,8 +14461,7 @@ class GatewayRunner:
                         return _adapter._secret_capture_callback(
                             var_name, prompt, metadata, stream_id=_stream_id,
                         )
-                    _secret_session_token = set_secret_session_key(_approval_session_key)
-                    set_secret_capture_callback(_approval_session_key, _secret_cb)
+                    set_secret_capture_callback(_secret_cb)
                     _secret_cb_registered = True
             # ────────────────────────────────────────────────────────
 
@@ -14525,10 +14521,7 @@ class GatewayRunner:
                     finally:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
-                        _cleanup_secret_callbacks(
-                            _approval_session_key,
-                            _secret_cb_registered, _secret_session_token,
-                        )
+                        _cleanup_secret_callbacks(_secret_cb_registered)
                         if _sentry_tx:
                             try:
                                 _a = agent_holder[0]
@@ -14552,20 +14545,14 @@ class GatewayRunner:
                     finally:
                         unregister_gateway_notify(_approval_session_key)
                         reset_current_session_key(_approval_session_token)
-                        _cleanup_secret_callbacks(
-                            _approval_session_key,
-                            _secret_cb_registered, _secret_session_token,
-                        )
+                        _cleanup_secret_callbacks(_secret_cb_registered)
             else:
                 try:
                     result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
                 finally:
                     unregister_gateway_notify(_approval_session_key)
                     reset_current_session_key(_approval_session_token)
-                    _cleanup_secret_callbacks(
-                        _approval_session_key,
-                        _secret_cb_registered, _secret_session_token,
-                    )
+                    _cleanup_secret_callbacks(_secret_cb_registered)
             # ────────────────────────────────────────────────────────
             result_holder[0] = result
 

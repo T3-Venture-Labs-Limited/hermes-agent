@@ -17,14 +17,8 @@ from tools.skills_tool import (
     skill_matches_platform,
     skills_list,
     skill_view,
-    set_secret_capture_callback,
-    set_secret_session_key,
-    reset_secret_session_key,
     MAX_DESCRIPTION_LENGTH,
 )
-
-# Sentinel session key used in tests that exercise the secret capture API
-_TEST_SESSION_KEY = 'test-session-key'
 
 
 def _make_skill(
@@ -553,25 +547,26 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": False,
             }
 
-        token = set_secret_session_key(_TEST_SESSION_KEY)
-        set_secret_capture_callback(_TEST_SESSION_KEY, fake_secret_callback)
-        try:
-            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                _make_skill(
-                    tmp_path,
-                    "gif-search",
-                    frontmatter_extra=(
-                        "required_environment_variables:\n"
-                        "  - name: TENOR_API_KEY\n"
-                        "    prompt: Tenor API key\n"
-                        "    help: Get a key from https://developers.google.com/tenor\n"
-                        "    required_for: full functionality\n"
-                    ),
-                )
-                raw = skill_view("gif-search")
-        finally:
-            set_secret_capture_callback(_TEST_SESSION_KEY, None)
-            reset_secret_session_key(token)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "gif-search",
+                frontmatter_extra=(
+                    "required_environment_variables:\n"
+                    "  - name: TENOR_API_KEY\n"
+                    "    prompt: Tenor API key\n"
+                    "    help: Get a key from https://developers.google.com/tenor\n"
+                    "    required_for: full functionality\n"
+                ),
+            )
+            raw = skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -601,120 +596,29 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": True,
             }
 
-        token = set_secret_session_key(_TEST_SESSION_KEY)
-        set_secret_capture_callback(_TEST_SESSION_KEY, fake_secret_callback)
-        try:
-            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                _make_skill(
-                    tmp_path,
-                    "gif-search",
-                    frontmatter_extra=(
-                        "required_environment_variables:\n"
-                        "  - name: TENOR_API_KEY\n"
-                        "    prompt: Tenor API key\n"
-                    ),
-                )
-                raw = skill_view("gif-search")
-        finally:
-            set_secret_capture_callback(_TEST_SESSION_KEY, None)
-            reset_secret_session_key(token)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "gif-search",
+                frontmatter_extra=(
+                    "required_environment_variables:\n"
+                    "  - name: TENOR_API_KEY\n"
+                    "    prompt: Tenor API key\n"
+                ),
+            )
+            raw = skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_skipped"] is True
         assert result["content"].startswith("---")
-
-    # ── Myah: T3-947 secret-capture callback priority tests ──────────
-    def test_gateway_load_returns_guidance_without_secret_capture(
-        self,
-        tmp_path,
-        monkeypatch,
-    ):
-        """Gateway surface hint is returned only when no callback is registered.
-
-        When no session callback is registered, a gateway surface (e.g. Telegram)
-        should still get the gateway_setup_hint directing the user to the local CLI.
-        This verifies the elif branch in the reordered check.
-        """
-        monkeypatch.delenv("TENOR_API_KEY", raising=False)
-
-        # Ensure no callback is registered — default state, but be explicit.
-        # Do NOT set a session key so _secret_session_key.get() returns ''.
-        set_secret_capture_callback(_TEST_SESSION_KEY, None)
-
-        with patch.dict(
-            os.environ, {"HERMES_SESSION_PLATFORM": "telegram"}, clear=False
-        ):
-            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                _make_skill(
-                    tmp_path,
-                    "gif-search",
-                    frontmatter_extra=(
-                        "required_environment_variables:\n"
-                        "  - name: TENOR_API_KEY\n"
-                        "    prompt: Tenor API key\n"
-                    ),
-                )
-                raw = skill_view("gif-search")
-
-        result = json.loads(raw)
-        assert result["success"] is True
-        assert "local cli" in result["gateway_setup_hint"].lower()
-        assert result["content"].startswith("---")
-
-    def test_gateway_load_uses_callback_over_gateway_hint(
-        self,
-        tmp_path,
-        monkeypatch,
-    ):
-        """Callback takes priority over gateway surface check.
-
-        When a session callback is registered, it should fire even on a gateway
-        surface (e.g. Telegram).  No gateway_setup_hint should be returned;
-        the callback handles capture natively.
-        """
-        monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        called = {"value": False}
-
-        def fake_secret_callback(var_name, prompt, metadata=None):
-            called["value"] = True
-            os.environ[var_name] = "stored-by-callback"
-            return {
-                "success": True,
-                "stored_as": var_name,
-                "validated": False,
-                "skipped": False,
-            }
-
-        token = set_secret_session_key(_TEST_SESSION_KEY)
-        set_secret_capture_callback(_TEST_SESSION_KEY, fake_secret_callback)
-        try:
-            with patch.dict(
-                os.environ, {"HERMES_SESSION_PLATFORM": "telegram"}, clear=False
-            ):
-                with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                    _make_skill(
-                        tmp_path,
-                        "gif-search",
-                        frontmatter_extra=(
-                            "required_environment_variables:\n"
-                            "  - name: TENOR_API_KEY\n"
-                            "    prompt: Tenor API key\n"
-                        ),
-                    )
-                    raw = skill_view("gif-search")
-        finally:
-            set_secret_capture_callback(_TEST_SESSION_KEY, None)
-            reset_secret_session_key(token)
-
-        result = json.loads(raw)
-        assert result["success"] is True
-        assert called["value"] is True
-        assert result.get("gateway_setup_hint") is None
-        assert result["content"].startswith("---")
-    # ──────────────────────────────────────────────────────────────────
-
-
 
 # ---------------------------------------------------------------------------
 # skill_matches_platform
@@ -1047,23 +951,24 @@ class TestSkillViewPrerequisites:
                 "skipped": False,
             }
 
-        token = set_secret_session_key(_TEST_SESSION_KEY)
-        set_secret_capture_callback(_TEST_SESSION_KEY, fake_secret_callback)
-        try:
-            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                _make_skill(
-                    tmp_path,
-                    "gif-search",
-                    frontmatter_extra=(
-                        "required_environment_variables:\n"
-                        "  - name: TENOR_API_KEY\n"
-                        "    prompt: Tenor API key\n"
-                    ),
-                )
-                raw = skill_view("gif-search")
-        finally:
-            set_secret_capture_callback(_TEST_SESSION_KEY, None)
-            reset_secret_session_key(token)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "gif-search",
+                frontmatter_extra=(
+                    "required_environment_variables:\n"
+                    "  - name: TENOR_API_KEY\n"
+                    "    prompt: Tenor API key\n"
+                ),
+            )
+            raw = skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
@@ -1144,26 +1049,27 @@ Do the legacy thing.
                 "skipped": False,
             }
 
-        token = set_secret_session_key(_TEST_SESSION_KEY)
-        set_secret_capture_callback(_TEST_SESSION_KEY, fake_secret_callback)
-        try:
-            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-                _make_skill(
-                    tmp_path,
-                    "gif-search",
-                    frontmatter_extra=(
-                        "required_environment_variables:\n"
-                        "  - name: TENOR_API_KEY\n"
-                        "    prompt: Tenor API key\n"
-                    ),
-                )
-                from hermes_cli.config import save_env_value
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
 
-                save_env_value("TENOR_API_KEY", "")
-                raw = skill_view("gif-search")
-        finally:
-            set_secret_capture_callback(_TEST_SESSION_KEY, None)
-            reset_secret_session_key(token)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "gif-search",
+                frontmatter_extra=(
+                    "required_environment_variables:\n"
+                    "  - name: TENOR_API_KEY\n"
+                    "    prompt: Tenor API key\n"
+                ),
+            )
+            from hermes_cli.config import save_env_value
+
+            save_env_value("TENOR_API_KEY", "")
+            raw = skill_view("gif-search")
 
         result = json.loads(raw)
         assert result["success"] is True
