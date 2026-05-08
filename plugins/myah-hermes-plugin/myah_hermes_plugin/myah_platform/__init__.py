@@ -114,3 +114,28 @@ def register(ctx: Any) -> None:
         allow_all_env="MYAH_ALLOW_ALL_USERS",
         platform_hint=_MYAH_PLATFORM_HINT,
     )
+
+    # ── PLATFORMS bridge (Tier 2C Issue 2 — workaround) ──────────────────
+    # Phase 4d moved the Myah platform out of upstream's static
+    # hermes_cli/platforms.py registry. Code paths in upstream's
+    # hermes_cli/tools_config.py do `PLATFORMS["myah"]` direct lookup or
+    # iterate `PLATFORMS.values()` — those don't see plugin-registered
+    # platforms.
+    #
+    # WORKAROUND: mutate tools_config.PLATFORMS at register time so direct
+    # lookups succeed. This is fragile (relies on tools_config.PLATFORMS
+    # being a plain dict; if upstream changes it to a derived view, this
+    # silently stops working). Long-term fix is U-PLAT upstream PR
+    # (deferred per spec §5). Sentinel test in
+    # plugins/myah-hermes-plugin/tests/test_myah_platform_bridge.py
+    # catches the dict-type change.
+    try:
+        import hermes_cli.tools_config as _tc
+        _tc.PLATFORMS["myah"] = {
+            "label": "Myah",
+            "default_toolset": "hermes-myah",
+        }
+    except ImportError:
+        # tools_config is CLI-only; in pure-gateway runtime, skip silently.
+        pass
+    # ────────────────────────────────────────────────────────────────────
