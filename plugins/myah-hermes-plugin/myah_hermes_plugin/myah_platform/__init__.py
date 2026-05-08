@@ -113,6 +113,12 @@ def register(ctx: Any) -> None:
         allowed_users_env="MYAH_ALLOWED_USERS",
         allow_all_env="MYAH_ALLOW_ALL_USERS",
         platform_hint=_MYAH_PLATFORM_HINT,
+        # Tier 2C Issue 3: opt myah into plugin-aware cron delivery
+        # validation. cron/scheduler.py:_is_known_delivery_platform()
+        # consults the platform registry for plugin platforms with this
+        # field set. Without this, the JOBS API rejects 'myah' origin
+        # with HTTP 400.
+        cron_deliver_env_var="MYAH_HOME_CHAT",
     )
 
     # ── PLATFORMS bridge (Tier 2C Issue 2 — workaround) ──────────────────

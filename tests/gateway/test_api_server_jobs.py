@@ -258,7 +258,7 @@ class TestCreateJobOrigin:
         """Valid origin propagates as a kwarg to create_job."""
         app = _create_app(adapter)
         mock_create = MagicMock(return_value={**SAMPLE_JOB, "origin": {
-            "platform": "myah",
+            "platform": "telegram",
             "chat_id": "abc-123",
             "chat_name": "My Chat",
             "thread_id": None,
@@ -275,7 +275,7 @@ class TestCreateJobOrigin:
                     "prompt": "do something",
                     "deliver": "origin",
                     "origin": {
-                        "platform": "myah",
+                        "platform": "telegram",
                         "chat_id": "abc-123",
                         "chat_name": "My Chat",
                         "thread_id": None,
@@ -286,7 +286,7 @@ class TestCreateJobOrigin:
                 kwargs = mock_create.call_args[1]
                 assert kwargs["deliver"] == "origin"
                 assert kwargs["origin"] == {
-                    "platform": "myah",
+                    "platform": "telegram",
                     "chat_id": "abc-123",
                     "chat_name": "My Chat",
                     "thread_id": None,
@@ -376,7 +376,7 @@ class TestCreateJobOrigin:
                     "prompt": "do something",
                     "deliver": "origin",
                     "origin": {
-                        "platform": "myah",
+                        "platform": "telegram",
                         "chat_id": "abc",
                         "future_field": "preserved",
                     },
@@ -404,6 +404,63 @@ class TestCreateJobOrigin:
                 kwargs = mock_create.call_args[1]
                 # No origin should be passed when none was supplied
                 assert "origin" not in kwargs or kwargs.get("origin") is None
+
+    @pytest.mark.asyncio
+    async def test_create_job_accepts_plugin_registered_platform(self, adapter):
+        """Plugin-registered platforms with cron_deliver_env_var pass validation.
+
+        Tier 2C Issue 3 (2026-05-08): the validator at api_server.py uses
+        cron.scheduler._is_known_delivery_platform(), which falls through
+        to platform_registry for plugin platforms with cron_deliver_env_var
+        set. This test registers a fake plugin platform at fixture scope
+        and asserts the validator accepts it.
+
+        Without this test, gateway tests would only exercise the built-in
+        platforms (_KNOWN_DELIVERY_PLATFORMS frozenset), leaving the
+        plugin-aware code path uncovered at the gateway-test level.
+        """
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        # Register a fake plugin platform with cron_deliver_env_var.
+        # Using a unique name avoids any conflict with potentially-loaded
+        # real plugins (irc, google_chat, teams) and any test-local fixtures.
+        fake_name = "tier2c_test_platform"
+        platform_registry.register(
+            PlatformEntry(
+                name=fake_name,
+                label="Tier 2C Test",
+                adapter_factory=lambda cfg: None,
+                check_fn=lambda: True,
+                cron_deliver_env_var="TIER2C_TEST_HOME",
+                source="plugin",
+            )
+        )
+        try:
+            app = _create_app(adapter)
+            mock_create = MagicMock(return_value=SAMPLE_JOB)
+            async with TestClient(TestServer(app)) as cli:
+                with patch(
+                    f"{_MOD}._CRON_AVAILABLE", True
+                ), patch(
+                    f"{_MOD}._cron_create", mock_create
+                ):
+                    resp = await cli.post("/api/jobs", json={
+                        "name": "test-job",
+                        "schedule": "*/5 * * * *",
+                        "prompt": "do something",
+                        "deliver": "origin",
+                        "origin": {
+                            "platform": fake_name,
+                            "chat_id": "channel-42",
+                        },
+                    })
+                    assert resp.status == 200, await resp.text()
+                    mock_create.assert_called_once()
+                    kwargs = mock_create.call_args[1]
+                    assert kwargs["origin"]["platform"] == fake_name
+                    assert kwargs["origin"]["chat_id"] == "channel-42"
+        finally:
+            platform_registry.unregister(fake_name)
 # ────────────────────────────────────────────────────────────
 
 

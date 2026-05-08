@@ -2460,10 +2460,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=400,
                     )
                 # Late import — avoids touching scheduler import order at
-                # module load time, and matches the pattern used by
-                # _resolve_single_delivery_target in cron/scheduler.py.
-                from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
-                if origin_platform.lower() not in _KNOWN_DELIVERY_PLATFORMS:
+                # module load time. Use plugin-aware helper so plugin
+                # platforms (registered via ctx.register_platform with
+                # cron_deliver_env_var) pass validation alongside
+                # built-ins.
+                from cron.scheduler import _is_known_delivery_platform
+                if not _is_known_delivery_platform(origin_platform):
                     return web.json_response(
                         {"error": f"origin.platform '{origin_platform}' is not a known delivery platform"},
                         status=400,
