@@ -661,7 +661,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
-        self._run_sessions: Dict[str, str] = {}  # run_id -> session_key (Myah approval)
+        self._run_sessions: Dict[str, str] = {}  # Myah: run_id -> session_key for approval flow
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:

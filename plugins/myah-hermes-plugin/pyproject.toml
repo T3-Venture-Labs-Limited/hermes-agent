@@ -4,13 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myah-hermes-plugin"
-version = "0.3.0"
+version = "1.0.0"
 description = "Myah platform connector for Hermes Agent"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+# Tier 2C §12 — version compatibility window.
+#
+# Pinning rationale: the plugin imports from gateway.run, gateway.platform_registry,
+# tools.approval, and similar paths that upstream considers internal — refactors
+# between hermes-agent minor versions can break the plugin silently. Pinning to a
+# single hermes minor version means a hermes 0.11 → 0.12 release does NOT silently
+# change plugin behavior; users see a pip resolver error and can either upgrade
+# the plugin or stay on the matching hermes version.
+#
+# When hermes-agent ships to PyPI, the dep below switches from undeclared
+# (Path B — git+https install in agent/Dockerfile.stock) to a strict semver
+# pin (Path A — `hermes-agent>=0.11,<0.12`). The plugin is 1.0.x as of
+# 2026-05-08; first release verified by Mode D against upstream commit
+# faa13e49f81480771ceeb55991bb0c27edf1a5fb (Hermes-Agent v0.11-track).
+#
+# OSS users today install via:
+#   pip install git+https://github.com/NousResearch/Hermes-Agent@<HERMES_SHA>
+#   pip install <plugin-source>
+# See CHANGELOG.md for the SHA verified against this plugin version.
 dependencies = [
-    "hermes-agent",
+    # hermes-agent is not yet on PyPI as of plugin v1.0.0. When it ships,
+    # this becomes "hermes-agent>=0.11,<0.12" matching the verified
+    # version. Until then, callers install hermes-agent themselves
+    # (see CHANGELOG.md and agent/Dockerfile.stock for the canonical
+    # SHA-pin pattern).
     "aiohttp>=3.9,<4",
 ]
 
