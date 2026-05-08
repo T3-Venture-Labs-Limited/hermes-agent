@@ -419,7 +419,7 @@ TOOLSETS = {
     "hermes-myah": {
         "description": "Myah web platform toolset",
         "tools": [t for t in _HERMES_CORE_TOOLS if t not in ("clarify", "send_message", "text_to_speech")],
-        "includes": [],
+        "includes": ["secrets"],  # Myah: secrets tool registered via plugin (Phase 4c) — Tier 2C Issue 1
     },
     # ────────────────────────────────────────────────────────
 

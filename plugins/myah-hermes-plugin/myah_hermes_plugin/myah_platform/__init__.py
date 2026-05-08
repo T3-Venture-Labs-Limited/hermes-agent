@@ -82,7 +82,7 @@ def register(ctx: Any) -> None:
     # ── Secrets tool registration (Phase 4c) ───────────────────────────
     ctx.register_tool(
         name="secrets",
-        toolset="hermes-myah",
+        toolset="secrets",
         schema=secrets_tool.SCHEMA,
         handler=secrets_tool.handle,
         emoji="🔐",
