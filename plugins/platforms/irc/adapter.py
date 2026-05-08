@@ -71,7 +71,11 @@ def _parse_irc_message(raw: str) -> dict:
     trailing = ""
 
     if raw.startswith(":"):
-        prefix, raw = raw[1:].split(" ", 1)
+        try:
+            prefix, raw = raw[1:].split(" ", 1)
+        except ValueError:
+            prefix = raw[1:]
+            raw = ""
 
     if " :" in raw:
         raw, trailing = raw.split(" :", 1)
@@ -122,9 +126,20 @@ class IRCAdapter(BasePlatformAdapter):
 
         # Auth
         self.allowed_users: list = extra.get("allowed_users", [])
+        # IRC nicks are case-insensitive — normalise for lookups
+        self._allowed_users_lower: set = {u.lower() for u in self.allowed_users if isinstance(u, str)}
 
         # IRC limits
-        self.max_message_length = int(extra.get("max_message_length", 450))
+        max_msg = extra.get("max_message_length")
+        if max_msg is None:
+            try:
+                from gateway.platform_registry import platform_registry
+                entry = platform_registry.get("irc")
+                if entry and entry.max_message_length:
+                    max_msg = entry.max_message_length
+            except Exception:
+                pass
+        self.max_message_length = int(max_msg or 450)
 
         # Runtime state
         self._reader: Optional[asyncio.StreamReader] = None
@@ -150,6 +165,18 @@ class IRCAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
+
+        # Prevent two profiles from using the same IRC identity
+        try:
+            from gateway.status import acquire_scoped_lock, release_scoped_lock
+            lock_key = f"{self.server}:{self.nickname}"
+            if not acquire_scoped_lock("irc", lock_key):
+                logger.error("IRC: %s@%s already in use by another profile", self.nickname, self.server)
+                self._set_fatal_error("lock_conflict", "IRC identity in use by another profile", retryable=False)
+                return False
+            self._lock_key = lock_key
+        except ImportError:
+            self._lock_key = None  # status module not available (e.g. tests)
 
         try:
             ssl_ctx = None
@@ -197,6 +224,13 @@ class IRCAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Quit and close the connection."""
+        # Release the scoped lock so another profile can use this identity
+        if getattr(self, "_lock_key", None):
+            try:
+                from gateway.status import release_scoped_lock
+                release_scoped_lock("irc", self._lock_key)
+            except Exception:
+                pass
         self._mark_disconnected()
         if self._writer and not self._writer.is_closing():
             try:
@@ -271,21 +305,36 @@ class IRCAdapter(BasePlatformAdapter):
 
         overhead = len(f"PRIVMSG {target} :".encode("utf-8")) + 2  # +2 for \r\n
         max_bytes = 510 - overhead
-        max_chars = min(self.max_message_length, max_bytes)
+        user_limit = self.max_message_length
 
         lines: List[str] = []
         for paragraph in content.split("\n"):
             if not paragraph.strip():
                 continue
-            while len(paragraph) > max_chars:
-                # Find a space to break at
-                split_at = paragraph.rfind(" ", 0, max_chars)
-                if split_at < max_chars // 3:
-                    split_at = max_chars
-                lines.append(paragraph[:split_at])
+            while True:
+                para_bytes = paragraph.encode("utf-8")
+                limit = min(user_limit, max_bytes)
+                if len(para_bytes) <= limit:
+                    if paragraph.strip():
+                        lines.append(paragraph)
+                    break
+                # Binary search for a safe character boundary <= limit
+                low, high = 1, len(paragraph)
+                best = 0
+                while low <= high:
+                    mid = (low + high) // 2
+                    if len(paragraph[:mid].encode("utf-8")) <= limit:
+                        best = mid
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+                split_at = best
+                # Prefer a space boundary
+                space = paragraph.rfind(" ", 0, split_at)
+                if space > split_at // 3:
+                    split_at = space
+                lines.append(paragraph[:split_at].rstrip())
                 paragraph = paragraph[split_at:].lstrip()
-            if paragraph.strip():
-                lines.append(paragraph)
 
         return lines if lines else [""]
 
@@ -367,7 +416,16 @@ class IRCAdapter(BasePlatformAdapter):
 
         # ERR_NICKNAMEINUSE (433) — nick collision during registration
         if command == "433":
-            self._current_nick = self.nickname + "_"
+            # Retry with incrementing suffix: hermes_, hermes_1, hermes_2...
+            base = self.nickname.rstrip("_0123456789")
+            suffix_match = re.search(r"_(\d+)$", self._current_nick)
+            if suffix_match:
+                next_num = int(suffix_match.group(1)) + 1
+                self._current_nick = f"{base}_{next_num}"
+            elif self._current_nick == self.nickname:
+                self._current_nick = self.nickname + "_"
+            else:
+                self._current_nick = self.nickname + "_1"
             await self._send_raw(f"NICK {self._current_nick}")
             return
 
@@ -406,8 +464,8 @@ class IRCAdapter(BasePlatformAdapter):
                 if not addressed:
                     return  # Ignore unaddressed channel messages
 
-            # Auth check
-            if self.allowed_users and sender_nick not in self.allowed_users:
+            # Auth check (case-insensitive)
+            if self._allowed_users_lower and sender_nick.lower() not in self._allowed_users_lower:
                 logger.debug("IRC: ignoring message from unauthorized user %s", sender_nick)
                 return
 
@@ -480,6 +538,172 @@ def validate_config(config) -> bool:
     return bool(server and channel)
 
 
+def interactive_setup() -> None:
+    """Interactive `hermes gateway setup` flow for the IRC platform.
+
+    Lazy-imports ``hermes_cli.setup`` helpers so the plugin stays importable
+    in non-CLI contexts (gateway runtime, tests).
+    """
+    from hermes_cli.setup import (
+        prompt,
+        prompt_yes_no,
+        save_env_value,
+        get_env_value,
+        print_header,
+        print_info,
+        print_warning,
+        print_success,
+    )
+
+    print_header("IRC")
+    existing_server = get_env_value("IRC_SERVER")
+    if existing_server:
+        print_info(f"IRC: already configured (server: {existing_server})")
+        if not prompt_yes_no("Reconfigure IRC?", False):
+            return
+
+    print_info("Connect Hermes to an IRC network. Uses Python stdlib — no extra packages needed.")
+    print_info("   Works with Libera.Chat, OFTC, your own ZNC/InspIRCd, etc.")
+    print()
+
+    server = prompt("IRC server hostname (e.g. irc.libera.chat)", default=existing_server or "")
+    if not server:
+        print_warning("Server is required — skipping IRC setup")
+        return
+    save_env_value("IRC_SERVER", server.strip())
+
+    use_tls = prompt_yes_no("Use TLS (recommended)?", True)
+    save_env_value("IRC_USE_TLS", "true" if use_tls else "false")
+
+    default_port = "6697" if use_tls else "6667"
+    port = prompt(f"Port (default {default_port})", default=get_env_value("IRC_PORT") or "")
+    if port:
+        try:
+            save_env_value("IRC_PORT", str(int(port)))
+        except ValueError:
+            print_warning(f"Invalid port — using default {default_port}")
+    elif get_env_value("IRC_PORT"):
+        # User cleared the prompt; drop the override so the default applies.
+        save_env_value("IRC_PORT", "")
+
+    nickname = prompt(
+        "Bot nickname (e.g. hermes-bot)",
+        default=get_env_value("IRC_NICKNAME") or "",
+    )
+    if not nickname:
+        print_warning("Nickname is required — skipping IRC setup")
+        return
+    save_env_value("IRC_NICKNAME", nickname.strip())
+
+    channel = prompt(
+        "Channel to join (e.g. #hermes — comma-separate for multiple)",
+        default=get_env_value("IRC_CHANNEL") or "",
+    )
+    if not channel:
+        print_warning("Channel is required — skipping IRC setup")
+        return
+    save_env_value("IRC_CHANNEL", channel.strip())
+
+    print()
+    print_info("🔑 Optional authentication")
+    print_info("   Leave blank to skip.")
+    if prompt_yes_no("Configure a server password (PASS command)?", False):
+        server_password = prompt("Server password", password=True)
+        if server_password:
+            save_env_value("IRC_SERVER_PASSWORD", server_password)
+
+    if prompt_yes_no("Identify with NickServ on connect?", False):
+        nickserv = prompt("NickServ password", password=True)
+        if nickserv:
+            save_env_value("IRC_NICKSERV_PASSWORD", nickserv)
+
+    print()
+    print_info("🔒 Access control: restrict who can message the bot")
+    print_info("   IRC nicks are not authenticated — anyone can claim any nick.")
+    print_info("   For public channels, pair with NickServ-only mode on your network")
+    print_info("   if you want stronger identity guarantees.")
+    allow_all = prompt_yes_no("Allow all users in the channel to talk to the bot?", False)
+    if allow_all:
+        save_env_value("IRC_ALLOW_ALL_USERS", "true")
+        save_env_value("IRC_ALLOWED_USERS", "")
+        print_warning("⚠️  Open access — any nick in the channel can command the bot.")
+    else:
+        save_env_value("IRC_ALLOW_ALL_USERS", "false")
+        allowed = prompt(
+            "Allowed nicks (comma-separated, leave empty to deny everyone)",
+            default=get_env_value("IRC_ALLOWED_USERS") or "",
+        )
+        if allowed:
+            save_env_value("IRC_ALLOWED_USERS", allowed.replace(" ", ""))
+            print_success("Allowlist configured")
+        else:
+            save_env_value("IRC_ALLOWED_USERS", "")
+            print_info("No nicks allowed — the bot will ignore all messages until you add nicks.")
+
+    print()
+    print_success("IRC configuration saved to ~/.hermes/.env")
+    print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+
+
+def is_connected(config) -> bool:
+    """Check whether IRC is configured (env or config.yaml)."""
+    extra = getattr(config, "extra", {}) or {}
+    server = os.getenv("IRC_SERVER") or extra.get("server", "")
+    channel = os.getenv("IRC_CHANNEL") or extra.get("channel", "")
+    return bool(server and channel)
+
+
+def _env_enablement() -> dict | None:
+    """Seed ``PlatformConfig.extra`` from env vars during gateway config load.
+
+    Called by the platform registry's env-enablement hook (landed in the
+    generic-plugin-interface migration) BEFORE adapter construction, so
+    ``gateway status`` and ``get_connected_platforms()`` reflect env-only
+    configuration without instantiating the IRC client.  Returns ``None``
+    when IRC isn't minimally configured; the caller skips auto-enabling.
+
+    The special ``home_channel`` key in the returned dict is handled by
+    the core hook — it becomes a proper ``HomeChannel`` dataclass on the
+    ``PlatformConfig`` rather than being merged into ``extra``.
+    """
+    server = os.getenv("IRC_SERVER", "").strip()
+    channel = os.getenv("IRC_CHANNEL", "").strip()
+    if not (server and channel):
+        return None
+    seed: dict = {
+        "server": server,
+        "channel": channel,
+    }
+    port = os.getenv("IRC_PORT", "").strip()
+    if port:
+        try:
+            seed["port"] = int(port)
+        except ValueError:
+            pass
+    nickname = os.getenv("IRC_NICKNAME", "").strip()
+    if nickname:
+        seed["nickname"] = nickname
+    use_tls = os.getenv("IRC_USE_TLS", "").strip().lower()
+    if use_tls:
+        seed["use_tls"] = use_tls in ("1", "true", "yes")
+    # Passwords live in PlatformConfig.extra as well for back-compat with
+    # existing config.yaml users; env-reads at construct time still win.
+    if os.getenv("IRC_SERVER_PASSWORD"):
+        seed["server_password"] = os.getenv("IRC_SERVER_PASSWORD")
+    if os.getenv("IRC_NICKSERV_PASSWORD"):
+        seed["nickserv_password"] = os.getenv("IRC_NICKSERV_PASSWORD")
+    # Optional home-channel (usually the same as IRC_CHANNEL, but can be a
+    # dedicated reports channel).  Defaults to IRC_CHANNEL so cron jobs
+    # with ``deliver=irc`` have a sensible target without extra config.
+    home = os.getenv("IRC_HOME_CHANNEL") or channel
+    if home:
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("IRC_HOME_CHANNEL_NAME", home),
+        }
+    return seed
+
+
 def register(ctx):
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -488,6 +712,34 @@ def register(ctx):
         adapter_factory=lambda cfg: IRCAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
+        is_connected=is_connected,
         required_env=["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"],
         install_hint="No extra packages needed (stdlib only)",
+        setup_fn=interactive_setup,
+        # Env-driven auto-configuration — seeds PlatformConfig.extra with
+        # server/channel/port/tls + home_channel so env-only setups show
+        # up in gateway status without instantiating the adapter.
+        env_enablement_fn=_env_enablement,
+        # Cron home-channel delivery support.  IRC_HOME_CHANNEL defaults to
+        # IRC_CHANNEL (see _env_enablement), so cron jobs with
+        # deliver=irc route to the joined channel by default.
+        cron_deliver_env_var="IRC_HOME_CHANNEL",
+        # Auth env vars for _is_user_authorized() integration
+        allowed_users_env="IRC_ALLOWED_USERS",
+        allow_all_env="IRC_ALLOW_ALL_USERS",
+        # IRC line limit after protocol overhead
+        max_message_length=450,
+        # Display
+        emoji="💬",
+        # IRC doesn't have phone numbers to redact
+        pii_safe=False,
+        allow_update_command=True,
+        # LLM guidance
+        platform_hint=(
+            "You are chatting via IRC. IRC does not support markdown formatting "
+            "— use plain text only. Messages are limited to ~450 characters per "
+            "line (long messages are automatically split). In channels, users "
+            "address you by prefixing your nick. Keep responses concise and "
+            "conversational."
+        ),
     )

@@ -38,9 +38,28 @@ class TestPlatformEnumDynamic:
         assert a.value == "irc"
 
     def test_dynamic_member_with_hyphens(self):
-        p = Platform("my-platform")
-        assert p.value == "my-platform"
-        assert p.name == "MY_PLATFORM"
+        """Registered plugin platforms with hyphens work once registered."""
+        from gateway.platform_registry import platform_registry as _reg
+
+        entry = PlatformEntry(
+            name="my-platform",
+            label="My Platform",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        _reg.register(entry)
+        try:
+            p = Platform("my-platform")
+            assert p.value == "my-platform"
+            assert p.name == "MY_PLATFORM"
+        finally:
+            _reg.unregister("my-platform")
+
+    def test_dynamic_member_rejects_unregistered(self):
+        """Arbitrary strings are rejected to prevent enum pollution."""
+        with pytest.raises(ValueError):
+            Platform("totally-fake-platform")
 
     def test_dynamic_member_rejects_non_string(self):
         with pytest.raises(ValueError):
@@ -265,3 +284,113 @@ class TestGatewayConfigPluginPlatform:
             assert "badconfig" not in connected_values
         finally:
             _reg.unregister("badconfig")
+
+
+# ── Extended PlatformEntry fields ─────────────────────────────────────
+
+
+class TestPlatformEntryExtendedFields:
+    """Test the auth, message length, and display fields on PlatformEntry."""
+
+    def test_default_field_values(self):
+        entry = PlatformEntry(
+            name="test",
+            label="Test",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+        )
+        assert entry.allowed_users_env == ""
+        assert entry.allow_all_env == ""
+        assert entry.max_message_length == 0
+        assert entry.pii_safe is False
+        assert entry.emoji == "🔌"
+        assert entry.allow_update_command is True
+
+    def test_custom_auth_fields(self):
+        entry = PlatformEntry(
+            name="irc",
+            label="IRC",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            allowed_users_env="IRC_ALLOWED_USERS",
+            allow_all_env="IRC_ALLOW_ALL_USERS",
+            max_message_length=450,
+            pii_safe=False,
+            emoji="💬",
+        )
+        assert entry.allowed_users_env == "IRC_ALLOWED_USERS"
+        assert entry.allow_all_env == "IRC_ALLOW_ALL_USERS"
+        assert entry.max_message_length == 450
+        assert entry.emoji == "💬"
+
+
+# ── Cron platform resolution ─────────────────────────────────────────
+
+
+class TestCronPlatformResolution:
+    """Test that cron delivery accepts plugin platform names."""
+
+    def test_builtin_platform_resolves(self):
+        """Built-in platform names resolve via Platform() call."""
+        p = Platform("telegram")
+        assert p is Platform.TELEGRAM
+
+    def test_plugin_platform_resolves(self):
+        """Plugin platform names create dynamic enum members."""
+        p = Platform("irc")
+        assert p.value == "irc"
+
+    def test_invalid_platform_type_rejected(self):
+        """Non-string values are still rejected."""
+        with pytest.raises(ValueError):
+            Platform(None)
+
+
+# ── platforms.py integration ──────────────────────────────────────────
+
+
+class TestPlatformsMerge:
+    """Test get_all_platforms() merges with registry."""
+
+    def test_get_all_platforms_includes_builtins(self):
+        from hermes_cli.platforms import get_all_platforms, PLATFORMS
+        merged = get_all_platforms()
+        for key in PLATFORMS:
+            assert key in merged
+
+    def test_get_all_platforms_includes_plugin(self):
+        from hermes_cli.platforms import get_all_platforms
+        from gateway.platform_registry import platform_registry as _reg
+
+        _reg.register(PlatformEntry(
+            name="testmerge",
+            label="TestMerge",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            source="plugin",
+            emoji="🧪",
+        ))
+        try:
+            merged = get_all_platforms()
+            assert "testmerge" in merged
+            assert "TestMerge" in merged["testmerge"].label
+        finally:
+            _reg.unregister("testmerge")
+
+    def test_platform_label_plugin_fallback(self):
+        from hermes_cli.platforms import platform_label
+        from gateway.platform_registry import platform_registry as _reg
+
+        _reg.register(PlatformEntry(
+            name="labeltest",
+            label="LabelTest",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            source="plugin",
+            emoji="🏷️",
+        ))
+        try:
+            label = platform_label("labeltest")
+            assert "LabelTest" in label
+        finally:
+            _reg.unregister("labeltest")

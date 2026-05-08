@@ -82,7 +82,7 @@ def register(ctx: Any) -> None:
     # ── Secrets tool registration (Phase 4c) ───────────────────────────
     ctx.register_tool(
         name="secrets",
-        toolset="hermes-myah",
+        toolset="secrets",
         schema=secrets_tool.SCHEMA,
         handler=secrets_tool.handle,
         emoji="🔐",
@@ -113,4 +113,35 @@ def register(ctx: Any) -> None:
         allowed_users_env="MYAH_ALLOWED_USERS",
         allow_all_env="MYAH_ALLOW_ALL_USERS",
         platform_hint=_MYAH_PLATFORM_HINT,
+        # Tier 2C Issue 3: opt myah into plugin-aware cron delivery
+        # validation. cron/scheduler.py:_is_known_delivery_platform()
+        # consults the platform registry for plugin platforms with this
+        # field set. Without this, the JOBS API rejects 'myah' origin
+        # with HTTP 400.
+        cron_deliver_env_var="MYAH_HOME_CHAT",
     )
+
+    # ── PLATFORMS bridge (Tier 2C Issue 2 — workaround) ──────────────────
+    # Phase 4d moved the Myah platform out of upstream's static
+    # hermes_cli/platforms.py registry. Code paths in upstream's
+    # hermes_cli/tools_config.py do `PLATFORMS["myah"]` direct lookup or
+    # iterate `PLATFORMS.values()` — those don't see plugin-registered
+    # platforms.
+    #
+    # WORKAROUND: mutate tools_config.PLATFORMS at register time so direct
+    # lookups succeed. This is fragile (relies on tools_config.PLATFORMS
+    # being a plain dict; if upstream changes it to a derived view, this
+    # silently stops working). Long-term fix is U-PLAT upstream PR
+    # (deferred per spec §5). Sentinel test in
+    # plugins/myah-hermes-plugin/tests/test_myah_platform_bridge.py
+    # catches the dict-type change.
+    try:
+        import hermes_cli.tools_config as _tc
+        _tc.PLATFORMS["myah"] = {
+            "label": "Myah",
+            "default_toolset": "hermes-myah",
+        }
+    except ImportError:
+        # tools_config is CLI-only; in pure-gateway runtime, skip silently.
+        pass
+    # ────────────────────────────────────────────────────────────────────

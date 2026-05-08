@@ -48,8 +48,20 @@ class TestMyahPlatformSecrets:
         assert "secrets" in enabled
 
     def test_secrets_excluded_when_explicitly_omitted(self) -> None:
-        """Explicit config without secrets — must be excluded (user opt-out)."""
-        config = {"platform_toolsets": {"myah": ["terminal"]}}
+        """Explicit opt-out: user previously had secrets enabled (recorded in
+        known_plugin_toolsets), now removes it from platform_toolsets — must
+        be excluded.
+
+        Tier 2C Issue 1 (2026-05-08): secrets is plugin-derived, so the
+        opt-out path requires known_plugin_toolsets to mark the platform as
+        having previously seen the toolset. Without that hint, plugin
+        toolsets are 'default-on for new platforms' and the explicit
+        platform_toolsets list is treated as additive, not authoritative.
+        """
+        config = {
+            "platform_toolsets": {"myah": ["terminal"]},
+            "known_plugin_toolsets": {"myah": ["secrets"]},
+        }
         enabled = _get_platform_tools(config, "myah")
         assert "secrets" not in enabled
         assert "terminal" in enabled
