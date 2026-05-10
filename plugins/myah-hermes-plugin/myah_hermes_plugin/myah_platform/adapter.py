@@ -437,20 +437,12 @@ class MyahAdapter(BasePlatformAdapter):
                     # ────────────────────────────────────────────────────────────────────
                 else:
                     # ── Myah: clear stale override + surface failure (Bug B follow-up) ──
-                    # Previously this branch only logged a warning, leaving any prior
-                    # session override in place. Subsequent turns would reuse the stale
-                    # model, producing "wrong model" 400s that only resolved by switching
-                    # away and back. Now we clear the override so the next turn falls
-                    # back to agent defaults, AND we return 400 to the platform so the
-                    # frontend can surface the failure to the user.
                     _err_msg = getattr(_result, "error_message", "unknown")
                     logger.warning(
                         f"[myah] one-shot model override failed for session {session_key}: {_err_msg}"
                     )
                     # Direct-access pattern (Tier 2B.0): same defensive style as
-                    # _runner_state.py helpers. Pops from the upstream-native
-                    # _session_model_overrides dict; getattr guards against the
-                    # unlikely case of upstream renaming the attribute.
+                    # _runner_state.py helpers.
                     try:
                         _overrides = getattr(runner, "_session_model_overrides", None)
                         if _overrides is not None:
@@ -461,14 +453,34 @@ class MyahAdapter(BasePlatformAdapter):
                             session_key,
                             exc_info=True,
                         )
-                    # Clean up the stream queue we created above (lines 290-293).
-                    self._streams.pop(stream_id, None)
-                    self._streams_created.pop(stream_id, None)
-                    return web.json_response(
-                        {"error": f"Failed to switch to model {_override_model}: {_err_msg}"},
-                        status=400,
-                    )
-                    # ────────────────────────────────────────────────────────────────────
+
+                    # ── OSS Issue #2: graceful fallback ──
+                    # In OSS mode the platform's user.default_model can be a
+                    # model name hermes can't resolve (e.g. openai/gpt-4o-mini
+                    # when the user only has openrouter+opencode-go pool).
+                    # Returning 400 fails the entire chat turn, which is too
+                    # strict — the user just wants their message answered by
+                    # whatever default the agent has. Fall through and let
+                    # the agent run with its existing default (override has
+                    # been cleared above so this is safe).
+                    import os as _os
+                    _is_oss = _os.environ.get("MYAH_DEPLOYMENT_MODE", "").strip().lower() == "oss"
+                    if _is_oss:
+                        logger.info(
+                            "[myah] OSS mode: falling back to agent default after "
+                            "unresolvable model %r (error: %s)",
+                            _override_model, _err_msg,
+                        )
+                        # Don't return — fall through to dispatch
+                    else:
+                        # Hosted: preserve strict 400-on-failure behaviour
+                        self._streams.pop(stream_id, None)
+                        self._streams_created.pop(stream_id, None)
+                        return web.json_response(
+                            {"error": f"Failed to switch to model {_override_model}: {_err_msg}"},
+                            status=400,
+                        )
+                    # ────────────────────────────────────────
             except Exception:
                 logger.exception("[myah] one-shot model override error")
         # ────────────────────────────────────────────────────────────
