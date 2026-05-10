@@ -23,6 +23,33 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   cron job at `@reboot` (or equivalent) that runs `hermes` with the
   preamble as the prompt; or contribute the upstream PR.
 
+- **F6 — Cron→Myah delivery enrichment on stock vanilla**: vanilla
+  `cron/scheduler.py:_deliver_result` does NOT call the polymorphic
+  `runtime_adapter.build_delivery_metadata()` hook the fork carries
+  (Tier 2B Task 2B.4). Result: cron jobs fire on stock vanilla, the
+  agent runs and writes output to `~/.hermes/cron/output/`, but the
+  plugin's adapter does not receive the enriched metadata
+  (`job_id`, `job_name`, `status`, `ran_at`) needed to route the
+  result through the platform's `/api/v1/processes/webhook/run-complete`
+  handler.
+
+  **Impact on OSS users:** cron jobs run successfully and persist
+  their output to disk, but they do not appear back in the Myah chat
+  history automatically. Users can read cron output via
+  `hermes cron list` and the dashboard's cron pane.
+
+  **Two paths to resolution (not shipped in v1.1.0 — needs design
+  approval):**
+  1. **Upstream PR** adding the polymorphic call to vanilla
+     `cron/scheduler.py:_deliver_result` (queued as `U-CRON` in the
+     spec; same diff as Tier 2B Task 2B.4).
+  2. **Plugin-side cron output watcher** that polls
+     `~/.hermes/cron/output/` and posts to the platform webhook
+     directly. ~150 LOC, no monkey-patch, no upstream PR required.
+
+  The hosted Myah deployment uses the fork build with Tier 2B's
+  polymorphic hook, so cron deliveries land in chat normally there.
+
 - **OSS multi-tenant**: the plugin assumes single-tenant per process.
   The OSS `/api/v1/myah/whoami` endpoint resolves to the FIRST
   registered user. Multi-user OSS deployments require additional auth
