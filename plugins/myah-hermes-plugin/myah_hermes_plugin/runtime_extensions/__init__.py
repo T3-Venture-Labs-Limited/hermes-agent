@@ -25,12 +25,21 @@ same pattern; this package collects the few remaining cases.
 
 Modules:
 
+- :mod:`cron_watcher` — F6 cron→chat output delivery on stock vanilla.
+  Observes vanilla's stable on-disk output convention
+  (``cron.jobs.save_job_output()`` writes
+  ``OUTPUT_DIR/{job_id}/{timestamp}.md``) and POSTs to the platform's
+  webhook. Defense-in-depth — redundant on the fork (which has the
+  ``build_delivery_metadata`` polymorphic hook), essential for
+  pip-installed vanilla users.
+
 - :mod:`mcp_disconnect` — F7 per-server MCP teardown without
   bouncing the whole gateway. Direct access to
   ``tools.mcp_tool._servers`` / ``_lock`` / ``_run_on_mcp_loop``.
 """
 
+from . import cron_watcher  # noqa: F401
 from . import mcp_disconnect  # noqa: F401  (re-exported as `from runtime_extensions import mcp_disconnect`)
 
 
-__all__ = ["mcp_disconnect"]
+__all__ = ["cron_watcher", "mcp_disconnect"]

@@ -281,6 +281,25 @@ def register(ctx: Any) -> None:
     # if missing. Idempotent: no-op if MYAH_USER_ID is already set.
     _bootstrap_user_id()
 
+    # ── F6 cron→chat delivery on stock vanilla (Phase E) ───────────
+    # Vanilla cron/scheduler.py doesn't call build_delivery_metadata,
+    # so MyahAdapter never sees job_id and never routes cron output to
+    # the platform webhook. The watcher observes the on-disk output
+    # convention as a workaround. The watcher start is wired as a
+    # pre_gateway_dispatch hook (lazy start) to avoid the
+    # asyncio.get_event_loop() deprecation in Python 3.12+ — the
+    # gateway's event loop is guaranteed running by the time any
+    # dispatch fires. Idempotent — silent no-op if
+    # MYAH_PLATFORM_BASE_URL is unset.
+    try:
+        from myah_hermes_plugin.runtime_extensions.cron_watcher import (
+            register_cron_watcher,
+        )
+        register_cron_watcher(ctx)
+    except Exception:
+        log.exception("Failed to register cron output watcher hook")
+    # ───────────────────────────────────────────────────────────────
+
     # ── Secret-capture global callback (Phase 5.1 — F4 vanilla support) ─
     # Vanilla upstream's tools/skills_tool exposes
     # set_secret_capture_callback(fn) — a single global registration
