@@ -300,6 +300,22 @@ def register(ctx: Any) -> None:
         log.exception("Failed to register cron output watcher hook")
     # ───────────────────────────────────────────────────────────────
 
+    # ── Phase F: structured streaming workaround for stock vanilla ─
+    # Vanilla _run_agent doesn't have the polymorphic
+    # get_structured_callbacks dispatch the fork carries, so MyahAdapter's
+    # structured streaming callbacks never wire up by default. The
+    # pre_llm_call hook below mutates AIAgent callbacks just-in-time
+    # before each LLM call to install them. Removable when upstream
+    # U-CB PR lands.
+    try:
+        from myah_hermes_plugin.runtime_extensions.streaming_callbacks import (
+            register_streaming_hook,
+        )
+        register_streaming_hook(ctx)
+    except Exception:
+        log.exception("Failed to register Phase F streaming hook")
+    # ───────────────────────────────────────────────────────────────
+
     # ── Secret-capture global callback (Phase 5.1 — F4 vanilla support) ─
     # Vanilla upstream's tools/skills_tool exposes
     # set_secret_capture_callback(fn) — a single global registration

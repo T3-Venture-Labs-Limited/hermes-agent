@@ -1775,6 +1775,28 @@ class MyahAdapter(BasePlatformAdapter):
             return await self._send_via_webhook(chat_id, content, metadata)
         # ────────────────────────────────────────────────────────
 
+        # ── Phase F: native-streaming dedup ────────────────────────
+        # When our pre_llm_call hook installed structured callbacks for
+        # this session (Phase F), the SSE stream already delivered
+        # tokens during the agent run. Vanilla's gateway calls
+        # adapter.send(chat_id, full_response) after streaming
+        # completes — that call would duplicate the assistant message.
+        # The fork's _native_streaming_used flag in _run_agent would
+        # have suppressed it; on vanilla we suppress it here.
+        session_key = self._chat_id_session_keys.get(chat_id)
+        if session_key and session_key in self._native_streaming_used:
+            self._native_streaming_used.discard(session_key)
+            logger.debug(
+                "Phase F: suppressed gateway final send for native-streamed "
+                "session=%s (chat_id=%s)",
+                session_key, chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id="suppressed-native-streaming",
+            )
+        # ──────────────────────────────────────────────────────────
+
         # ── Live chat replies: SSE-first ────────────────────
         stream_id = self._chat_id_streams.get(chat_id) if chat_id else None
         if stream_id:

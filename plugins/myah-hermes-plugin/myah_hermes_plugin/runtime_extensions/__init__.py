@@ -33,6 +33,12 @@ Modules:
   ``build_delivery_metadata`` polymorphic hook), essential for
   pip-installed vanilla users.
 
+- :mod:`streaming_callbacks` — Phase F structured-streaming workaround
+  for stock vanilla. Plugin-side replacement for the fork's
+  ``get_structured_callbacks`` polymorphic dispatch. Mutates AIAgent
+  callbacks via the ``pre_llm_call`` plugin hook. Removable when
+  upstream U-CB PR lands.
+
 - :mod:`mcp_disconnect` — F7 per-server MCP teardown without
   bouncing the whole gateway. Direct access to
   ``tools.mcp_tool._servers`` / ``_lock`` / ``_run_on_mcp_loop``.
@@ -40,6 +46,7 @@ Modules:
 
 from . import cron_watcher  # noqa: F401
 from . import mcp_disconnect  # noqa: F401  (re-exported as `from runtime_extensions import mcp_disconnect`)
+from . import streaming_callbacks  # noqa: F401
 
 
-__all__ = ["cron_watcher", "mcp_disconnect"]
+__all__ = ["cron_watcher", "mcp_disconnect", "streaming_callbacks"]
