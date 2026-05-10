@@ -199,6 +199,16 @@ class MyahAdapter(BasePlatformAdapter):
         # like ``MyahAdapter(config)`` don't trip on AttributeError.
         self.gateway_runner = None
 
+        # ── Phase F: plugin-side structured-streaming workaround ─────
+        # Reverse mapping populated in _handle_message_endpoint so the
+        # pre_llm_call hook can resolve session_key from chat_id.
+        self._chat_id_session_keys: Dict[str, str] = {}
+        # Set of session_keys for which our pre_llm_call hook installed
+        # structured streaming callbacks. send() consults this set to
+        # suppress the gateway's final "send full response" duplicate.
+        self._native_streaming_used: set[str] = set()
+        # ─────────────────────────────────────────────────────────────
+
         # ── Route registration state ──────────────────────────────────
         # Tier 2A Task 2A.3 (2026-05-07): the adapter ALWAYS runs in
         # standalone mode now — it owns its own ``aiohttp.AppRunner``
@@ -335,6 +345,9 @@ class MyahAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+        # Phase F: stash chat_id → session_key for the pre_llm_call hook
+        self._chat_id_session_keys[session_id] = session_key
 
         # ── Myah: apply one-shot model override if present ───────────
         runner = self.gateway_runner
@@ -476,6 +489,9 @@ class MyahAdapter(BasePlatformAdapter):
                         # Hosted: preserve strict 400-on-failure behaviour
                         self._streams.pop(stream_id, None)
                         self._streams_created.pop(stream_id, None)
+                        # Phase F: dispatch never spawns, so finally cleanup
+                        # never fires; pop the session-key map entry here.
+                        self._chat_id_session_keys.pop(session_id, None)
                         return web.json_response(
                             {"error": f"Failed to switch to model {_override_model}: {_err_msg}"},
                             status=400,
@@ -706,6 +722,10 @@ class MyahAdapter(BasePlatformAdapter):
             self._chat_id_streams.pop(chat_id, None)
             self._session_streams.pop(session_key, None)
             self._stream_sessions.pop(stream_id, None)
+
+            # Phase F: clean up streaming workaround state
+            self._chat_id_session_keys.pop(chat_id, None)
+            self._native_streaming_used.discard(session_key)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
