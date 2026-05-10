@@ -98,6 +98,49 @@ def _bootstrap_user_id() -> None:
     if user_id:
         os.environ["MYAH_USER_ID"] = user_id
         log.info("Discovered MYAH_USER_ID=%s via /whoami", user_id)
+
+        # ── OSS Issue #5: write hermes default-model to platform user ─
+        # If /whoami returned a default_model and the platform's
+        # user.default_model is the open-webui default (gpt-4o-mini),
+        # POST an update so the model picker pre-selects the user's
+        # hermes-configured default. Best-effort; non-fatal on failure.
+        #
+        # Verified endpoint (platform users.py:680):
+        #   POST /api/v1/users/user/default-model
+        #   body: {"model_id": "<model>"}
+        #   auth: caller's session (bearer-authenticated user) — uses
+        #         get_verified_user under the hood.
+        hermes_default = (data.get("default_model") or "").strip() if isinstance(data, dict) else ""
+        if hermes_default:
+            update_url = f"{base_url}/api/v1/users/user/default-model"
+            try:
+                update_req = urllib.request.Request(
+                    update_url,
+                    data=json.dumps({"model_id": hermes_default}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {bearer}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(update_req, timeout=5) as resp:
+                    if 200 <= resp.status < 300:
+                        log.info(
+                            "Synced hermes default_model=%s to platform user %s",
+                            hermes_default,
+                            user_id,
+                        )
+                    else:
+                        log.warning(
+                            "default_model sync: HTTP %s from %s",
+                            resp.status,
+                            update_url,
+                        )
+            except Exception as exc:
+                log.warning(
+                    "Could not sync hermes default_model to platform: %s", exc
+                )
+        # ──────────────────────────────────────────────────────────
     else:
         log.warning(
             "MYAH_USER_ID bootstrap: /whoami returned no user_id; "
