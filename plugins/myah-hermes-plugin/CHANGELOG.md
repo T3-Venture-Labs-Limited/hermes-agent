@@ -5,6 +5,60 @@ All notable changes to `myah-hermes-plugin` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Known limitations (all releases)
+
+- **F5 — BOOT.md startup hook**: not supported on stock vanilla upstream.
+  Vanilla's `hermes_cli/plugins.py:VALID_HOOKS` does not expose a
+  `gateway:startup` event. The fork-only `gateway/builtin_hooks/boot_md.py`
+  registers for that event to run a one-shot agent with `BOOT.md` as
+  the prompt. There is no semantically equivalent vanilla hook (the
+  closest, `on_session_start`, fires per-session not at-boot — that
+  would re-inject the preamble every chat, breaking prompt cache).
+  OSS users on stock-vanilla + plugin do **NOT** get BOOT.md. The
+  hosted deployment carries it via the fork-bundled `boot_md.py`.
+  This will return once upstream merges a `register_gateway_event_hook`
+  surface (tracked as upstream PR `U-HOOK`).
+
+  **Workaround for OSS users who need BOOT.md today:** schedule a
+  cron job at `@reboot` (or equivalent) that runs `hermes` with the
+  preamble as the prompt; or contribute the upstream PR.
+
+- **OSS multi-tenant**: the plugin assumes single-tenant per process.
+  The OSS `/api/v1/myah/whoami` endpoint resolves to the FIRST
+  registered user. Multi-user OSS deployments require additional auth
+  wiring not shipped in v1.
+
+## [1.1.0] — 2026-05-10
+
+### Added
+
+- **OSS user_id bootstrap (Phase 8.2)**: `register(ctx)` now calls
+  the platform's `/api/v1/myah/whoami` to auto-discover its own
+  `MYAH_USER_ID` if not set. Removes the manual "copy your user_id
+  from the platform UI to ~/.hermes/.env" friction for OSS deployers.
+  Hosted Myah unchanged (spawner still injects `MYAH_USER_ID`
+  per-container).
+- **F4 secret-capture global wiring (Phase 5.1)**: `register(ctx)`
+  now calls `tools.skills_tool.set_secret_capture_callback(...)` with
+  a wrapper that routes to the active `MyahAdapter._secret_capture_callback`
+  via the `_LATEST_ADAPTER` module pointer + the
+  `tools.approval.get_current_session_key()` contextvar. Without this,
+  secret prompts silently auto-skipped on stock vanilla because no
+  callback was wired (the fork's session-keyed wiring lived in
+  `_run_agent`'s closure).
+- **F7 MCP per-server disconnect (Phase 5.2)**:
+  `myah_hermes_plugin.runtime_extensions.mcp_disconnect.disconnect_mcp_server(name)`.
+  Direct access to upstream's `tools.mcp_tool._servers` /
+  `_lock` (`threading.Lock`, sync) / `_run_on_mcp_loop` to tear down a
+  single MCP server without restarting the gateway. Two CI guards
+  catch upstream rename of any of those private attrs.
+
+### Test gates
+
+- 23 new tests across `test_user_id_bootstrap.py`,
+  `test_secret_capture_wiring.py`, `test_mcp_disconnect.py`.
+- All 333 plugin tests pass (310 prior + 23 new).
+
 ## [1.0.0] — 2026-05-08
 
 First OSS-launch-eligible release. Tier 2C of the Myah OSS Completion epic.
