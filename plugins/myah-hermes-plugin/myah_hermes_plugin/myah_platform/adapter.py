@@ -101,6 +101,13 @@ def _myah_ext(mime: str, filename: str, default: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# Late-bound pointer to the most-recently-constructed MyahAdapter. Used
+# by the plugin's global secret-capture wrapper to dispatch into the
+# active adapter — see myah_platform/__init__._wire_secret_capture_callback
+# for the contract. Set in MyahAdapter.__init__; never cleared.
+_LATEST_ADAPTER: Optional["MyahAdapter"] = None
+
+
 class MyahAdapter(BasePlatformAdapter):
     """
     Gateway platform adapter for the Myah web frontend.
@@ -121,6 +128,16 @@ class MyahAdapter(BasePlatformAdapter):
         # ``_missing_`` hook to a cached pseudo-member with value="myah",
         # mirroring how ``IRCAdapter`` constructs its platform identifier.
         super().__init__(config, Platform("myah"))
+        # Late-bound module-level pointer used by the plugin's global
+        # secret-capture wrapper (myah_platform/__init__._wire_secret_capture_callback)
+        # to dispatch tools/skills_tool.set_secret_capture_callback's
+        # vanilla-shaped (name, prompt, metadata) call into this
+        # adapter's per-stream _secret_capture_callback. Single-adapter
+        # / single-process assumption — fine for hosted Myah's per-user
+        # container model and fine for OSS single-tenant; multi-tenant
+        # in-process would need a contextvar-keyed lookup instead.
+        global _LATEST_ADAPTER
+        _LATEST_ADAPTER = self
         # Auth key resolution order: config.extra.auth_key (yaml) →
         # MYAH_ADAPTER_AUTH_KEY env (legacy hosted-mode path that used to
         # be wired up by the deleted ``_apply_env_overrides`` block in

@@ -127,6 +127,82 @@ def _validate_myah_config(config: Any) -> bool:
     return True
 
 
+def _wire_secret_capture_callback() -> None:
+    """Register a global secret-capture callback with vanilla upstream.
+
+    Vanilla ``tools/skills_tool.set_secret_capture_callback`` accepts a
+    single-arg callable invoked with ``(name, prompt, metadata)``. The
+    plugin's adapter handles secrets per-stream via
+    ``MyahAdapter._secret_capture_callback`` — but that's a bound method
+    needing ``stream_id`` and an adapter instance.
+
+    This wrapper looks up the active adapter via the late-bound
+    ``adapter._LATEST_ADAPTER`` module attribute (set by
+    :meth:`MyahAdapter.start`) and routes to the right stream by
+    consulting the adapter's ``_session_streams`` mapping with the
+    contextvar-recorded session key. Single-adapter / single-process
+    assumption documented in :func:`register`.
+
+    Silent no-op if upstream's ``tools.skills_tool`` is unavailable
+    (e.g. older Hermes builds) — secrets simply won't prompt, which
+    matches the pre-Phase-5.1 behavior.
+    """
+    try:
+        from tools.skills_tool import set_secret_capture_callback
+    except ImportError:
+        log.debug(
+            "tools.skills_tool.set_secret_capture_callback unavailable; "
+            "secret prompts will not fire"
+        )
+        return
+
+    from . import adapter as _adapter_module
+
+    def _global_secret_callback(name: str, prompt: str, metadata: Any = None) -> dict:
+        """Vanilla-shaped wrapper. Routes to the active adapter+stream."""
+        adapter_inst = getattr(_adapter_module, "_LATEST_ADAPTER", None)
+        if adapter_inst is None:
+            log.warning(
+                "secret_capture_callback fired but no MyahAdapter is active; "
+                "auto-skipping secret %r", name
+            )
+            return {
+                "success": True,
+                "skipped": True,
+                "stored_as": name,
+                "validated": False,
+                "message": "No active Myah adapter to prompt for secret.",
+            }
+
+        # Resolve stream_id from the active session_key contextvar that
+        # vanilla approvals set inside the agent worker thread. Falls
+        # back to the most recently activated stream if multiple are
+        # tracked.
+        try:
+            from tools.approval import get_current_session_key
+        except ImportError:
+            session_key = ""
+        else:
+            session_key = get_current_session_key() or ""
+
+        stream_id = (
+            adapter_inst._session_streams.get(session_key, "")
+            if session_key
+            else ""
+        )
+        if not stream_id and adapter_inst._session_streams:
+            # Fallback: pick any active stream. Single-tenant assumption
+            # makes this safe; in multi-tenant we'd misroute.
+            stream_id = next(iter(adapter_inst._session_streams.values()))
+
+        return adapter_inst._secret_capture_callback(
+            name, prompt, metadata=metadata, stream_id=stream_id
+        )
+
+    set_secret_capture_callback(_global_secret_callback)
+    log.info("Myah plugin: registered secret_capture_callback with tools.skills_tool")
+
+
 def register(ctx: Any) -> None:
     """Register Myah platform extensions with the Hermes runtime.
 
@@ -161,6 +237,21 @@ def register(ctx: Any) -> None:
     # otherwise need to paste it manually. Auto-discover via /whoami
     # if missing. Idempotent: no-op if MYAH_USER_ID is already set.
     _bootstrap_user_id()
+
+    # ── Secret-capture global callback (Phase 5.1 — F4 vanilla support) ─
+    # Vanilla upstream's tools/skills_tool exposes
+    # set_secret_capture_callback(fn) — a single global registration
+    # point invoked when a tool needs the user to provide a secret.
+    # Without registering here, the agent silently auto-skips secret
+    # prompts because no callback is wired.
+    #
+    # Single-adapter assumption: the plugin runs at most one MyahAdapter
+    # per process (single-user agent container in hosted Myah; single-
+    # tenant in OSS). The wrapper below dispatches to the active
+    # adapter via _LATEST_ADAPTER which is set in MyahAdapter.start().
+    # If we ever ship multi-tenant in-process, replace this with a
+    # contextvar-keyed lookup.
+    _wire_secret_capture_callback()
 
     # ── pre_gateway_dispatch hook (Tier 2A Task 2A.4) ──────────────────
     # Replaces skip_user_authorization semantics that PR #20 removed.
