@@ -362,6 +362,13 @@ class MyahAdapter(BasePlatformAdapter):
                     _current_provider = _existing_override.get('provider', _current_provider)
                     _current_base_url = _existing_override.get('base_url', _current_base_url)
 
+                logger.info(
+                    "[myah-modelswitch] requesting switch session=%s "
+                    "raw_input=%r explicit_provider=%r current_provider=%r "
+                    "current_model=%r",
+                    session_key, _override_model, _override_provider,
+                    _current_provider, _current_model,
+                )
                 _result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: switch_model(
@@ -376,6 +383,17 @@ class MyahAdapter(BasePlatformAdapter):
                         custom_providers=_cfg.get("custom_providers"),
                     ),
                 )
+                logger.info(
+                    "[myah-modelswitch] switch_model result session=%s "
+                    "success=%s new_model=%r target_provider=%r api_mode=%r "
+                    "error=%r",
+                    session_key,
+                    getattr(_result, "success", None),
+                    getattr(_result, "new_model", None),
+                    getattr(_result, "target_provider", None),
+                    getattr(_result, "api_mode", None),
+                    getattr(_result, "error_message", None),
+                )
                 if getattr(_result, "success", False):
                     # set_session_override evicts the cached agent atomically.
                     set_session_override_direct(runner, session_key, {
@@ -385,6 +403,11 @@ class MyahAdapter(BasePlatformAdapter):
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
                     })
+                    logger.info(
+                        "[myah-modelswitch] override written session=%s "
+                        "model=%s provider=%s",
+                        session_key, _result.new_model, _result.target_provider,
+                    )
                     # ── Myah: heal auth.json + .env via vanilla-style provider sync ────
                     # Synchronously updating auth.json:active_provider (and writing
                     # OPENROUTER_API_KEY to .env when applicable) whenever the user
