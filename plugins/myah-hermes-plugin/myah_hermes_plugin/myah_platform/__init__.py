@@ -13,11 +13,96 @@ plugin. Earlier phases (4b/4c) bootstrapped the package skeleton and the
 secrets tool. Phase 4f will follow with cron/status_hint/boot_md hooks.
 """
 
+import json
+import logging
+import os
+import urllib.error
+import urllib.request
 from typing import Any
 
 from .. import sentry_init
 from ..myah_tools import secrets_tool
 from .pre_dispatch_hook import myah_pre_gateway_dispatch
+
+log = logging.getLogger(__name__)
+
+
+def _bootstrap_user_id() -> None:
+    """Discover ``MYAH_USER_ID`` via the platform's ``/whoami`` endpoint.
+
+    Idempotent: a no-op if ``MYAH_USER_ID`` is already set (hosted Myah
+    injects it per-container at spawn time, so this branch is the OSS
+    self-hosted case where the user runs ``hermes gateway start`` on
+    their host without container spawning).
+
+    Without ``MYAH_USER_ID`` the cron→Myah webhook payload's ``user_id``
+    field is empty, which the platform's ``/api/v1/processes/webhook/run-complete``
+    handler rejects with HTTP 400. Auto-discovering it removes the manual
+    "copy your user_id from the platform UI to ~/.hermes/.env" friction.
+
+    Auth: uses ``MYAH_AGENT_BEARER_TOKEN`` (or its alias
+    ``MYAH_AGENT_TOKEN``). The OSS user pastes this once into both
+    ``platform/.env`` and ``~/.hermes/.env`` — same secret, two consumers.
+
+    Failure modes (all silent + logged):
+    - ``MYAH_PLATFORM_BASE_URL`` unset → cannot reach platform at all.
+    - Bearer token unset → platform refuses with 503.
+    - Network error → platform may be starting up; retry next plugin load.
+    - ``/whoami`` 404 → no users registered yet; user signs up first.
+    """
+    if os.environ.get("MYAH_USER_ID"):
+        return
+
+    base_url = os.environ.get("MYAH_PLATFORM_BASE_URL", "").strip().rstrip("/")
+    bearer = (
+        os.environ.get("MYAH_PLATFORM_BEARER")
+        or os.environ.get("MYAH_AGENT_BEARER_TOKEN")
+        or os.environ.get("MYAH_AGENT_TOKEN")
+        or ""
+    ).strip()
+
+    if not base_url:
+        log.info(
+            "MYAH_USER_ID unset and MYAH_PLATFORM_BASE_URL not configured; "
+            "cron webhook will be skipped until both are set"
+        )
+        return
+    if not bearer:
+        log.info(
+            "MYAH_USER_ID unset and no platform bearer token in env "
+            "(MYAH_AGENT_BEARER_TOKEN); /whoami bootstrap skipped"
+        )
+        return
+
+    url = f"{base_url}/api/v1/myah/whoami"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {bearer}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        log.warning(
+            "MYAH_USER_ID bootstrap: /whoami returned HTTP %s — "
+            "set MYAH_USER_ID manually if cron deliveries are needed",
+            exc.code,
+        )
+        return
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        log.warning("MYAH_USER_ID bootstrap: could not reach %s: %s", url, exc)
+        return
+
+    user_id = (data.get("user_id") or "").strip() if isinstance(data, dict) else ""
+    if user_id:
+        os.environ["MYAH_USER_ID"] = user_id
+        log.info("Discovered MYAH_USER_ID=%s via /whoami", user_id)
+    else:
+        log.warning(
+            "MYAH_USER_ID bootstrap: /whoami returned no user_id; "
+            "the platform may have no registered users yet"
+        )
 
 # Platform-hint string injected by ``agent.prompt_builder.get_platform_hint``
 # when the agent is running on the Myah platform. This text used to live
@@ -70,6 +155,12 @@ def register(ctx: Any) -> None:
     # registers the SentryHook adapter so Hermes runtime telemetry calls
     # (which only see agent.telemetry.TelemetryHook) route through it.
     sentry_init.setup_sentry()
+
+    # ── MYAH_USER_ID bootstrap (Phase 8.2 OSS) ──────────────────────────
+    # Hosted Myah injects MYAH_USER_ID per-container; OSS users would
+    # otherwise need to paste it manually. Auto-discover via /whoami
+    # if missing. Idempotent: no-op if MYAH_USER_ID is already set.
+    _bootstrap_user_id()
 
     # ── pre_gateway_dispatch hook (Tier 2A Task 2A.4) ──────────────────
     # Replaces skip_user_authorization semantics that PR #20 removed.
