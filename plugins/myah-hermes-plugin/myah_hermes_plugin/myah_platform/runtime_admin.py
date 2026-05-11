@@ -185,11 +185,25 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
             return resp
         name = request.match_info["name"]
         try:
-            from agent.mcp_registry import disconnect_mcp_server
+            # Phase 5 (B1 follow-up): the original import targeted
+            # ``agent.mcp_registry`` — a module that does not exist anywhere
+            # in the repo. Every request hit this fallback returning 500
+            # "MCP registry module not available", and the dashboard's
+            # ``DELETE /mcp/<name>`` chain silently failed to actually
+            # disconnect the server from ``tools.mcp_tool._servers``.
+            #
+            # The real plugin-side helper lives at
+            # ``myah_hermes_plugin.runtime_extensions.mcp_disconnect`` and
+            # has been shipped since PR #106 (Phase E). It uses the upstream
+            # ``tools.mcp_tool`` private state + ``_run_on_mcp_loop`` bridge
+            # exactly as the upstream "shutdown all servers" code does.
+            from myah_hermes_plugin.runtime_extensions.mcp_disconnect import (
+                disconnect_mcp_server,
+            )
         except Exception:  # pragma: no cover
             logger.exception("[myah-admin] failed to import disconnect_mcp_server")
             return web.json_response(
-                {"error": "MCP registry module not available"}, status=500
+                {"error": "MCP disconnect helper not available"}, status=500
             )
         try:
             disconnect_mcp_server(name)
