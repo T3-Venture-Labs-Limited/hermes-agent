@@ -165,6 +165,129 @@ def test_hook_falls_back_to_gateway_runner_attr_when_resolve_missing():
     assert fake_agent.stream_delta_callback is structured["stream_delta"]
 
 
+# ── post_llm_call hook (gateway suppression bug workaround) ─────────
+
+
+def test_post_llm_call_emits_response_when_stream_did_not_fire():
+    """If stream_delta never fired but post_llm_call has assistant_response,
+    the hook must emit the response via _push_event_sync so the user sees
+    it (instead of 'Thinking...' forever from the gateway's suppression
+    bug at gateway/run.py:14701 dropping failed=True).
+    """
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:chat-1:user-1"
+    adapter, _ = _make_fake_adapter(session_key=sk)
+    adapter._session_streams = {sk: "stream-abc"}
+    adapter._stream_delta_invoked = set()  # stream NEVER fired
+    pushed = []
+    adapter._push_event_sync = lambda sid, ev: pushed.append((sid, ev))
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ):
+        result = streaming_callbacks.myah_post_llm_call(
+            session_id="chat-1",
+            platform="myah",
+            assistant_response="API call failed after 3 retries: Insufficient credits",
+        )
+
+    assert result is None
+    assert len(pushed) == 1, "expected exactly one synthetic delta to be pushed"
+    sid, event = pushed[0]
+    assert sid == "stream-abc"
+    assert event["event"] == "message.delta"
+    assert "Insufficient credits" in event["delta"]
+    # And mark stream_delta_invoked so subsequent adapter.send dedup doesn't
+    # cause confusion if the gateway somehow also calls send().
+    assert sk in adapter._stream_delta_invoked
+
+
+def test_post_llm_call_no_op_when_stream_fired():
+    """If stream_delta already fired (normal streaming path), the hook
+    must NOT emit a duplicate response."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:chat-1:user-1"
+    adapter, _ = _make_fake_adapter(session_key=sk)
+    adapter._session_streams = {sk: "stream-abc"}
+    adapter._stream_delta_invoked = {sk}  # stream DID fire
+    pushed = []
+    adapter._push_event_sync = lambda sid, ev: pushed.append((sid, ev))
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ):
+        result = streaming_callbacks.myah_post_llm_call(
+            session_id="chat-1",
+            platform="myah",
+            assistant_response="The answer is 42.",
+        )
+
+    assert result is None
+    assert pushed == [], "must not emit duplicate response when stream already fired"
+
+
+def test_post_llm_call_ignores_non_myah_platform():
+    """Non-myah platforms (telegram, discord) must not trigger this hook."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    result = streaming_callbacks.myah_post_llm_call(
+        session_id="chat-1",
+        platform="telegram",
+        assistant_response="something",
+    )
+    assert result is None
+
+
+def test_post_llm_call_ignores_empty_response():
+    """Empty assistant_response → no-op (no content to surface)."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:chat-1:user-1"
+    adapter, _ = _make_fake_adapter(session_key=sk)
+    adapter._session_streams = {sk: "stream-abc"}
+    adapter._stream_delta_invoked = set()
+    pushed = []
+    adapter._push_event_sync = lambda sid, ev: pushed.append((sid, ev))
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ):
+        result = streaming_callbacks.myah_post_llm_call(
+            session_id="chat-1",
+            platform="myah",
+            assistant_response="",
+        )
+
+    assert result is None
+    assert pushed == []
+
+
+def test_post_llm_call_no_op_when_no_active_stream():
+    """No active stream for session → log warning, no-op."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:chat-1:user-1"
+    adapter, _ = _make_fake_adapter(session_key=sk)
+    adapter._session_streams = {}  # No active stream
+    adapter._stream_delta_invoked = set()
+    pushed = []
+    adapter._push_event_sync = lambda sid, ev: pushed.append((sid, ev))
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ):
+        result = streaming_callbacks.myah_post_llm_call(
+            session_id="chat-1",
+            platform="myah",
+            assistant_response="response with no stream",
+        )
+
+    assert result is None
+    assert pushed == [], "no active stream → no emission"
+
+
 # ── CI guards ────────────────────────────────────────────────────────
 
 
@@ -173,6 +296,16 @@ def test_pre_llm_call_is_in_valid_hooks():
     from hermes_cli.plugins import VALID_HOOKS
     assert "pre_llm_call" in VALID_HOOKS, (
         "Upstream removed pre_llm_call hook — Phase F workaround broken"
+    )
+
+
+def test_post_llm_call_is_in_valid_hooks():
+    """If upstream renames or removes post_llm_call, the gateway-
+    suppression-bug workaround in myah_post_llm_call breaks."""
+    from hermes_cli.plugins import VALID_HOOKS
+    assert "post_llm_call" in VALID_HOOKS, (
+        "Upstream removed post_llm_call hook — gateway-suppression "
+        "workaround broken"
     )
 
 

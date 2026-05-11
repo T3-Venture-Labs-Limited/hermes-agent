@@ -183,6 +183,13 @@ def myah_pre_llm_call(
     # duplicate the assistant message.
     adapter._native_streaming_used.add(session_key)
 
+    # Track that we've installed callbacks but haven't seen any stream yet.
+    # Used by the post_llm_call hook below to detect the
+    # "gateway suppressed the response" bug — see myah_post_llm_call docstring.
+    _stream_invoked = getattr(adapter, "_stream_delta_invoked", None)
+    if _stream_invoked is None:
+        adapter._stream_delta_invoked = set()
+
     logger.info(
         "[myah-streaming] structured callbacks installed for session=%s",
         session_key,
@@ -190,12 +197,143 @@ def myah_pre_llm_call(
     return None
 
 
+def myah_post_llm_call(
+    *,
+    session_id: str = "",
+    platform: str = "",
+    assistant_response: str = "",
+    **kwargs: Any,
+) -> Optional[dict]:
+    """Surface the assistant response when the gateway's suppression bug fires.
+
+    Fires from ``AIAgent.run_conversation`` (run_agent.py:14307) AFTER the
+    tool-calling loop completes and ``final_response`` is non-empty. Hook
+    contract::
+
+        invoke_hook(
+            "post_llm_call",
+            session_id=...,
+            user_message=...,
+            assistant_response=final_response,
+            conversation_history=...,
+            model=...,
+            platform=...,
+        )
+
+    Why this exists
+    ---------------
+
+    Gateway ``_run_agent`` (gateway/run.py:14081) sets
+    ``_native_streaming_used[0] = True`` *optimistically* — as soon as our
+    ``get_structured_callbacks`` returns a non-None ``stream_delta``,
+    regardless of whether any token actually streams. When the LLM call
+    fails (e.g. provider 402 / fallback exhausted), the agent returns a
+    response dict with ``failed=True`` and ``final_response="API call
+    failed after N retries: ..."``.
+
+    But the gateway's response-dict reconstruction at gateway/run.py:14701
+    DOES NOT preserve the ``failed`` field. Downstream, the suppression
+    check at gateway/run.py:15326 reads ``response.get("failed")`` → ``None``
+    → treats the run as successful → sees ``native_streamed=True`` → sets
+    ``already_sent=True`` → ``_process_message_background`` skips
+    ``adapter.send(chat_id, response)`` entirely.
+
+    Result: user sees "Thinking..." forever; no token streamed, no error
+    message rendered, no indication anything happened.
+
+    Plugin-side fix
+    ---------------
+
+    On ``post_llm_call``, check if the plugin's structured stream actually
+    fired for this session (via ``adapter._stream_delta_invoked``). If
+    NOT, the gateway is about to suppress the response — beat it to the
+    punch and emit ``assistant_response`` as a single ``message.delta``
+    event via the adapter's SSE pump. This makes the user see the error
+    message inline (even if it's just "API call failed after 3 retries:
+    Insufficient credits..."), instead of an empty Thinking spinner.
+
+    On the happy path (streaming worked), this is a no-op — the response
+    has already been delivered token-by-token.
+
+    Returns None so this hook never affects ``final_response``.
+    """
+    if platform != "myah":
+        return None
+    if not assistant_response:
+        return None
+
+    adapter = _get_latest_adapter()
+    if adapter is None:
+        return None
+
+    chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}
+    session_key = chat_session_keys.get(session_id)
+    if not session_key:
+        return None
+
+    stream_invoked = getattr(adapter, "_stream_delta_invoked", None)
+    if stream_invoked is None:
+        # _stream_delta_invoked not initialized — likely a partially
+        # upgraded plugin. Skip the surface-response logic; existing
+        # streaming behavior unchanged.
+        return None
+
+    if session_key in stream_invoked:
+        # Streaming actually fired — the user has already seen the
+        # response token-by-token. Nothing to do.
+        return None
+
+    # No streaming happened. The gateway is about to suppress the
+    # final send. Surface the response ourselves so the user sees
+    # SOMETHING (typically an error message).
+    stream_id = adapter._session_streams.get(session_key)
+    if not stream_id:
+        # No active stream for this session — possibly already torn
+        # down. Log for diagnostics; nothing more to do.
+        logger.warning(
+            "[myah-streaming] post_llm_call: no active stream for session=%s "
+            "but stream_delta never fired (response would be lost). "
+            "Response: %s",
+            session_key, assistant_response[:200],
+        )
+        return None
+
+    try:
+        import uuid as _uuid
+        adapter._push_event_sync(stream_id, {
+            "event": "message.delta",
+            "run_id": stream_id,
+            "ts": __import__("time").time(),
+            "delta": assistant_response,
+            "message_id": _uuid.uuid4().hex[:12],
+        })
+        logger.info(
+            "[myah-streaming] post_llm_call: emitted suppressed response "
+            "for session=%s (%d chars)",
+            session_key, len(assistant_response),
+        )
+        # Mark stream_invoked so the duplicate-send check in adapter.send()
+        # doesn't fire if the gateway somehow does also call send().
+        stream_invoked.add(session_key)
+    except Exception:
+        logger.exception(
+            "[myah-streaming] post_llm_call: failed to emit suppressed "
+            "response for session=%s",
+            session_key,
+        )
+
+    return None
+
+
 def register_streaming_hook(ctx: Any) -> None:
-    """Register the pre_llm_call hook with the plugin context.
+    """Register the pre/post_llm_call hooks with the plugin context.
 
     Idempotent if ctx supports double-registration; a no-op if
     ctx.register_hook is unavailable (e.g. older Hermes builds).
     """
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("pre_llm_call", myah_pre_llm_call)
-        logger.info("Myah plugin: registered pre_llm_call streaming hook")
+        ctx.register_hook("post_llm_call", myah_post_llm_call)
+        logger.info(
+            "Myah plugin: registered pre_llm_call + post_llm_call streaming hooks"
+        )

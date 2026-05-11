@@ -219,6 +219,16 @@ class MyahAdapter(BasePlatformAdapter):
         # structured streaming callbacks. send() consults this set to
         # suppress the gateway's final "send full response" duplicate.
         self._native_streaming_used: set[str] = set()
+        # Set of session_keys for which stream_delta callback actually
+        # fired (i.e. tokens were streamed). The post_llm_call hook in
+        # streaming_callbacks.py reads this to detect the gateway's
+        # response-suppression bug (gateway/run.py:14701 drops the
+        # agent's failed=True flag → gateway/run.py:15326 suppresses
+        # send-final → user sees "Thinking..." forever). When stream
+        # never fired but post_llm_call has a final response, the hook
+        # emits the response as a synthetic message.delta event so the
+        # user sees the error message inline.
+        self._stream_delta_invoked: set[str] = set()
         # ─────────────────────────────────────────────────────────────
 
         # ── Route registration state ──────────────────────────────────
@@ -746,6 +756,50 @@ class MyahAdapter(BasePlatformAdapter):
                 except Exception:
                     logger.debug("[myah] model attribution lookup failed", exc_info=True)
                 # ────────────────────────────────────────────────
+
+                # ── Phase F follow-up: gateway-suppression-bug workaround ──
+                # If the agent's LLM call failed (e.g. provider 402, fallback
+                # exhausted), the agent returns a response dict with
+                # ``failed=True`` and ``final_response="API call failed ..."``.
+                # But gateway/run.py:14701 constructs a new response dict
+                # WITHOUT preserving the ``failed`` field, so the suppression
+                # check at gateway/run.py:15326 sees failed=None → treats run
+                # as successful → sees native_streamed=True (set
+                # optimistically when our structured callbacks were wired) →
+                # sets already_sent=True → _process_message_background skips
+                # adapter.send entirely. User sees "Thinking..." forever.
+                #
+                # We detect this from the plugin side: if stream_delta never
+                # fired for this session, no content was actually delivered,
+                # but the agent has run to completion. Emit a synthetic
+                # message.delta with a generic explanation so the user knows
+                # something went wrong (rather than staring at empty space).
+                #
+                # On the happy path stream_delta fired, this block is a
+                # no-op.
+                if session_key not in self._stream_delta_invoked:
+                    logger.warning(
+                        "[myah] gateway-suppression workaround firing for "
+                        "session %s: stream_delta never invoked, response "
+                        "would have been swallowed",
+                        session_key,
+                    )
+                    self._push_event_sync(stream_id, {
+                        "event": "message.delta",
+                        "stream_id": stream_id,
+                        "run_id": stream_id,
+                        "timestamp": time.time(),
+                        "delta": (
+                            "⚠️ The agent's LLM call did not produce a "
+                            "response. This usually means the configured "
+                            "provider returned an error (rate limit, "
+                            "insufficient credits, authentication failure, "
+                            "etc.). Check `~/.hermes/logs/agent.log` for "
+                            "the specific provider error."
+                        ),
+                    })
+                # ──────────────────────────────────────────────────────────
+
                 self._push_event_sync(stream_id, {
                     "event": "run.completed",
                     "stream_id": stream_id,
@@ -773,6 +827,7 @@ class MyahAdapter(BasePlatformAdapter):
             # Phase F: clean up streaming workaround state
             self._chat_id_session_keys.pop(chat_id, None)
             self._native_streaming_used.discard(session_key)
+            self._stream_delta_invoked.discard(session_key)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
@@ -1301,9 +1356,26 @@ class MyahAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass  # Loop closed
 
+        # Track that streaming actually fired for this session. The
+        # post_llm_call hook (streaming_callbacks.py) reads this set —
+        # if stream_delta never fired but post_llm_call has an
+        # assistant_response, the gateway's suppression bug
+        # (gateway/run.py:14701 drops the agent's failed=True flag, then
+        # gateway/run.py:15326 suppresses send-final because failed is
+        # falsy) is about to swallow the response. The hook then emits
+        # the response as a synthetic message.delta so the user sees
+        # the error instead of "Thinking..." forever.
+        _captured_session_key = session_key
+
         def _stream_delta(text):
             if text is None:
                 return  # Tool boundary signal — ignore for SSE
+            # Mark this session as "stream actually fired" so the
+            # post_llm_call hook knows the response was streamed normally
+            # and doesn't need to be re-emitted.
+            _invoked = getattr(self, "_stream_delta_invoked", None)
+            if _invoked is not None:
+                _invoked.add(_captured_session_key)
             _put({
                 "event": "message.delta",
                 "stream_id": stream_id,
