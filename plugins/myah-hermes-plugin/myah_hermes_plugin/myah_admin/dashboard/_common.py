@@ -94,7 +94,25 @@ class GatewayClient:
     """
 
     def __init__(self, *, timeout: float = 15.0) -> None:
-        self._port = int(os.environ.get("API_SERVER_PORT", "8642"))
+        # The runtime-control routes (``/myah/v1/admin/*``) live on the
+        # MyahStandaloneRunner's aiohttp app, NOT the FastAPI api_server.
+        # Tier 2A Task 2A.3 (2026-05-07) moved them off ``API_SERVER_PORT``
+        # (8642 — chat-completions only) onto a dedicated standalone port
+        # (8643 default, ``MYAH_GATEWAY_PORT`` env override). Reading
+        # API_SERVER_PORT here was the 2026-05-11 B2 regression: every
+        # session-model override / cache-evict / mcp-reload / busy-check
+        # call hit the wrong port and returned 404 silently — including
+        # the model-picker click that triggered the user-visible
+        # "Could not switch model for this chat" toast.
+        #
+        # Single source of truth: ``standalone_runner.resolve_default_port``
+        # owns the env-var contract (parse + fallback + warning). Importing
+        # it here keeps both ends in lockstep — if the runner ever changes
+        # which env var or default it uses, the GatewayClient follows.
+        from myah_hermes_plugin.myah_platform.standalone_runner import (
+            resolve_default_port,
+        )
+        self._port = resolve_default_port()
         # Auth key resolution order:
         #   1. MYAH_ADAPTER_AUTH_KEY — the canonical name the gateway config
         #      uses (gateway/config.py:1279). Set when the operator passes

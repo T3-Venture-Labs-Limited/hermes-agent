@@ -17,9 +17,14 @@ Mounting:
 Auth:
     Same Bearer-token model as the rest of the Myah adapter. The platform
     backend forwards every request with ``Authorization: Bearer <MYAH_ADAPTER_AUTH_KEY>``.
-    The ``myah-admin`` dashboard plugin reaches this surface via
-    ``http://localhost:8642`` (same container) using the same key — read from
-    ``MYAH_ADAPTER_AUTH_KEY`` env var inside the container.
+    The ``myah-admin`` dashboard plugin reaches this surface via the
+    MyahStandaloneRunner's port (``MYAH_GATEWAY_PORT`` env, default 8643)
+    using the same key — read from ``MYAH_ADAPTER_AUTH_KEY`` env var
+    inside the container. NOTE: this is NOT the FastAPI ``api_server``
+    port (``API_SERVER_PORT``, default 8642), which hosts ``/v1/*`` chat
+    completions only. Tier 2A Task 2A.3 (2026-05-07) split these two
+    surfaces; targeting the api_server for ``/myah/v1/admin/*`` returns
+    404 (B2 production regression, 2026-05-11).
 
 Why a separate module:
     Keeps the adapter focused on chat I/O. Phase 4d (2026-05-04) moved this
