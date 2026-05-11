@@ -93,6 +93,35 @@ class TestPluginRegistersMyahPlatform:
         result = check_fn()
         assert isinstance(result, bool)
 
+    def test_cron_deliver_env_var_is_myah_home_chat(
+        self, captured_registration: _RecordingContext
+    ) -> None:
+        """B1 regression — pin the env var name that suppresses the gateway warning.
+
+        Upstream's gateway/run.py:6802 (at submodule SHA 87b22d309) calls
+        _home_target_env_var('myah'), which goes through
+        cron/scheduler.py:_resolve_home_env_var() → looks up the plugin's
+        PlatformEntry and returns its cron_deliver_env_var. The platform side
+        of the warning suppression (containers.py per-user container env +
+        entrypoint.sh's seed of /data/.hermes/.env) sets MYAH_HOME_CHAT=disabled,
+        which only works if cron_deliver_env_var stays equal to "MYAH_HOME_CHAT".
+
+        If this assertion ever fails, the platform-side companion test
+        test_container_env_includes_myah_home_chat_disabled in
+        platform/backend/open_webui/test/apps/webui/routers/test_containers.py
+        must be updated in lockstep, otherwise the "📬 No home channel is set"
+        warning will resurface on every fresh chat in production.
+        """
+        entry = next(p for p in captured_registration.platforms if p.get("name") == "myah")
+        assert entry.get("cron_deliver_env_var") == "MYAH_HOME_CHAT", (
+            "PlatformEntry.cron_deliver_env_var for 'myah' must stay "
+            "'MYAH_HOME_CHAT' — this is the env var name the gateway warning "
+            "check resolves to via _resolve_home_env_var(). The platform "
+            "(containers.py + entrypoint.sh) sets MYAH_HOME_CHAT=disabled "
+            "to suppress the warning; changing the name here without "
+            "updating the platform companions resurrects the B1 bug."
+        )
+
     def test_adapter_factory_constructible(
         self, captured_registration: _RecordingContext
     ) -> None:
