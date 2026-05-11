@@ -229,6 +229,15 @@ class MyahAdapter(BasePlatformAdapter):
         # emits the response as a synthetic message.delta event so the
         # user sees the error message inline.
         self._stream_delta_invoked: set[str] = set()
+        # Set of stream_ids that received AT LEAST ONE message.delta
+        # event via any delivery path — stream_delta callback, slash
+        # command response via adapter.send, agent reply via send,
+        # cron live-preview, etc. Tracked at _push_event_sync time so
+        # all paths get unified accounting. The gateway-suppression
+        # workaround in _dispatch_message finally reads this instead
+        # of _stream_delta_invoked (which only covers the LLM streaming
+        # path and would false-positive on slash commands).
+        self._stream_had_content: set[str] = set()
         # ─────────────────────────────────────────────────────────────
 
         # ── Route registration state ──────────────────────────────────
@@ -318,6 +327,16 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        # Track that a user-visible content event was delivered for this
+        # stream so the suppression-bug workaround in _dispatch_message's
+        # finally can distinguish "real failure with no output" from
+        # "slash command response delivered via adapter.send()". Without
+        # this tracking, slash commands like /model would falsely trigger
+        # the gateway-suppression warning because their response is
+        # emitted via send() → _push_event_sync directly, bypassing the
+        # stream_delta_callback path that _stream_delta_invoked tracks.
+        if event.get("event") == "message.delta":
+            self._stream_had_content.add(stream_id)
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
@@ -769,20 +788,28 @@ class MyahAdapter(BasePlatformAdapter):
                 # sets already_sent=True → _process_message_background skips
                 # adapter.send entirely. User sees "Thinking..." forever.
                 #
-                # We detect this from the plugin side: if stream_delta never
-                # fired for this session, no content was actually delivered,
-                # but the agent has run to completion. Emit a synthetic
-                # message.delta with a generic explanation so the user knows
-                # something went wrong (rather than staring at empty space).
+                # Detect this by checking ``_stream_had_content`` — a set of
+                # stream_ids that received at least one ``message.delta``
+                # via any delivery path (stream_delta callback, adapter.send
+                # for slash commands, agent reply via send, cron preview).
+                # If the stream got NO content events, the response was
+                # swallowed by the gateway bug — emit a generic warning so
+                # the user sees something instead of an empty Thinking
+                # spinner.
                 #
-                # On the happy path stream_delta fired, this block is a
-                # no-op.
-                if session_key not in self._stream_delta_invoked:
+                # Critical: we check ``_stream_had_content``, NOT just
+                # ``_stream_delta_invoked``. The latter only covers the
+                # LLM streaming path. Slash commands like /model deliver
+                # via adapter.send → _push_event_sync directly (no
+                # stream_delta callback), so checking only
+                # _stream_delta_invoked would false-positive on slash
+                # commands and append the warning to /model's response.
+                if stream_id not in self._stream_had_content:
                     logger.warning(
                         "[myah] gateway-suppression workaround firing for "
-                        "session %s: stream_delta never invoked, response "
-                        "would have been swallowed",
-                        session_key,
+                        "session %s (stream %s): no message.delta event "
+                        "was emitted, response would have been swallowed",
+                        session_key, stream_id,
                     )
                     self._push_event_sync(stream_id, {
                         "event": "message.delta",
@@ -828,6 +855,7 @@ class MyahAdapter(BasePlatformAdapter):
             self._chat_id_session_keys.pop(chat_id, None)
             self._native_streaming_used.discard(session_key)
             self._stream_delta_invoked.discard(session_key)
+            self._stream_had_content.discard(stream_id)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
