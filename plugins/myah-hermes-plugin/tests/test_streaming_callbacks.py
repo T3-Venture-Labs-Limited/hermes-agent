@@ -70,7 +70,12 @@ def test_hook_noop_when_session_key_unknown():
 
     adapter, _ = _make_fake_adapter(session_key="agent:main:myah:dm:chat-1:user-1")
     adapter._chat_id_session_keys = {}  # platform sent unknown chat_id
-    adapter.gateway_runner = MagicMock()
+    runner_mock = MagicMock()
+    adapter.gateway_runner = runner_mock
+    # _resolve_runner is the canonical runner accessor — wire the mock to
+    # return the same runner so the test exercises both the legacy attribute
+    # read AND the new lazy resolver path.
+    adapter._resolve_runner.return_value = runner_mock
 
     with patch.object(
         streaming_callbacks, "_get_latest_adapter", return_value=adapter
@@ -92,6 +97,7 @@ def test_hook_installs_callbacks_and_marks_native_streaming():
     runner = MagicMock()
     runner._agent_cache = {sk: (fake_agent, "sig")}
     adapter.gateway_runner = runner
+    adapter._resolve_runner.return_value = runner
 
     with patch.object(
         streaming_callbacks, "_get_latest_adapter", return_value=adapter
@@ -119,6 +125,7 @@ def test_hook_handles_dict_cache_entry():
     runner = MagicMock()
     runner._agent_cache = {sk: fake_agent}  # not a tuple
     adapter.gateway_runner = runner
+    adapter._resolve_runner.return_value = runner
 
     with patch.object(
         streaming_callbacks, "_get_latest_adapter", return_value=adapter
@@ -128,6 +135,34 @@ def test_hook_handles_dict_cache_entry():
         )
 
     assert fake_agent.stream_delta_callback is not None
+
+
+def test_hook_falls_back_to_gateway_runner_attr_when_resolve_missing():
+    """If MyahAdapter is older and lacks _resolve_runner, the hook must still
+    work by reading the legacy ``gateway_runner`` attribute directly."""
+    from myah_hermes_plugin.runtime_extensions import streaming_callbacks
+
+    sk = "agent:main:myah:dm:chat-1:user-1"
+    adapter, structured = _make_fake_adapter(session_key=sk)
+
+    fake_agent = _make_fake_agent()
+    runner = MagicMock()
+    runner._agent_cache = {sk: (fake_agent, "sig")}
+    adapter.gateway_runner = runner
+    # Simulate an older plugin by deleting _resolve_runner from the mock:
+    # use ``spec`` to constrain the mock so missing attrs raise AttributeError
+    # rather than auto-mocking.
+    del adapter._resolve_runner  # MagicMock supports deletion; subsequent access raises
+
+    with patch.object(
+        streaming_callbacks, "_get_latest_adapter", return_value=adapter
+    ):
+        result = streaming_callbacks.myah_pre_llm_call(
+            session_id="chat-1", platform="myah"
+        )
+
+    assert result is None
+    assert fake_agent.stream_delta_callback is structured["stream_delta"]
 
 
 # ── CI guards ────────────────────────────────────────────────────────

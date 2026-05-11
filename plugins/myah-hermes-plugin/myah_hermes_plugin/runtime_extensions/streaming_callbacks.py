@@ -117,9 +117,23 @@ def myah_pre_llm_call(
         )
         return None
 
-    runner = getattr(adapter, "gateway_runner", None)
+    # Use the adapter's lazy runner self-discovery instead of reading
+    # ``adapter.gateway_runner`` directly. On stock hermes (upstream and this
+    # branch) plugin-registered platforms never get ``gateway_runner`` set;
+    # ``_resolve_runner`` falls back to ``gateway.run._gateway_runner_ref``.
+    runner = None
+    _resolve = getattr(adapter, "_resolve_runner", None)
+    if callable(_resolve):
+        try:
+            runner = _resolve()
+        except Exception:
+            runner = None
+    else:
+        # Older MyahAdapter without _resolve_runner — fall back to attr read
+        # so a partially upgraded plugin still degrades gracefully.
+        runner = getattr(adapter, "gateway_runner", None)
     if runner is None:
-        logger.debug("[myah-streaming] adapter has no gateway_runner reference")
+        logger.debug("[myah-streaming] no GatewayRunner available")
         return None
 
     chat_session_keys = getattr(adapter, "_chat_id_session_keys", None) or {}

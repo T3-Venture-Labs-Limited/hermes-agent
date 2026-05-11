@@ -193,10 +193,22 @@ class MyahAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── GatewayRunner backref ─────────────────────────────────────
-        # The ``GatewayRunner._create_adapter`` path sets this attribute on
-        # plugin-registered adapters after instantiation (Phase 4d). Initialise
-        # to None so unit tests that bypass the runner factory and direct calls
-        # like ``MyahAdapter(config)`` don't trip on AttributeError.
+        # ``GatewayRunner._create_adapter`` sets this for *built-in* adapters
+        # (Discord, Webhook) but NOT for plugin-registered platforms — see
+        # ``gateway/run.py:4592-4594`` where ``platform_registry.create_adapter()``
+        # is returned directly without ``adapter.gateway_runner = self``. As a
+        # result, on stock hermes (both this branch and upstream pip-installed)
+        # the attribute stays ``None`` indefinitely, silently disabling:
+        #   - Phase B model override (``_handle_message_endpoint`` line ~354)
+        #   - per-message model attribution (``_dispatch_message`` finally)
+        #   - Phase F ``pre_llm_call`` hook (streaming_callbacks.py)
+        #
+        # The plugin self-discovers the runner via the module-level weakref
+        # ``gateway.run._gateway_runner_ref`` upstream exposes (lines 1109/1206
+        # of run.py). Same direct-access pattern Tier 2B established for
+        # ``_session_model_overrides`` / ``_agent_cache``. Removable when
+        # upstream sets ``gateway_runner`` on plugin adapters too — then
+        # ``self.gateway_runner`` becomes the cached fast-path.
         self.gateway_runner = None
 
         # ── Phase F: plugin-side structured-streaming workaround ─────
@@ -219,6 +231,41 @@ class MyahAdapter(BasePlatformAdapter):
         # §3 Task 2A.3.
         self._routes_registered = False
         self._runner_helper: Optional["MyahStandaloneRunner"] = None
+
+    # ── Runner self-discovery ───────────────────────────────────────────
+
+    def _resolve_runner(self):
+        """Return the active ``GatewayRunner`` or ``None``.
+
+        Fast path: ``self.gateway_runner`` was set externally (built-in
+        adapters get this from ``_create_adapter``; future hermes versions
+        may set it for plugin adapters too).
+
+        Fallback: read ``gateway.run._gateway_runner_ref`` — a module-level
+        weakref upstream populates at ``gateway/run.py:1206`` whenever the
+        ``GatewayRunner.__init__`` runs. Once resolved, cache the ref on
+        ``self.gateway_runner`` so subsequent calls take the fast path.
+
+        Returns ``None`` if no gateway is running (e.g. plugin imported in
+        isolation by a unit test). Callers must handle ``None`` gracefully
+        — same contract as the original ``self.gateway_runner`` attribute.
+        """
+        if self.gateway_runner is not None:
+            return self.gateway_runner
+        try:
+            from gateway.run import _gateway_runner_ref as _ref
+        except ImportError:
+            return None
+        try:
+            runner = _ref()
+        except Exception:
+            return None
+        if runner is not None:
+            # Cache so the next call short-circuits — same lifecycle as the
+            # GatewayRunner instance (a new runner replaces _gateway_runner_ref
+            # before this adapter could be re-used in the same process).
+            self.gateway_runner = runner
+        return runner
 
     # ── Auth ────────────────────────────────────────────────────────────
 
@@ -350,7 +397,7 @@ class MyahAdapter(BasePlatformAdapter):
         self._chat_id_session_keys[session_id] = session_key
 
         # ── Myah: apply one-shot model override if present ───────────
-        runner = self.gateway_runner
+        runner = self._resolve_runner()
         if _override_model and runner is not None:
             try:
                 from hermes_cli.model_switch import switch_model
@@ -685,7 +732,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _attribution_model = ""
                 _attribution_provider = ""
                 try:
-                    runner = self.gateway_runner
+                    runner = self._resolve_runner()
                     if runner is not None:
                         attribution = get_cached_agent_attribution_direct(runner, session_key)
                         if attribution is not None:
@@ -1576,7 +1623,11 @@ class MyahAdapter(BasePlatformAdapter):
         from .runtime_admin import register_runtime_admin_routes
         register_runtime_admin_routes(
             app,
-            runner=self.gateway_runner,
+            # _resolve_runner discovers the runner lazily so plugin-platform
+            # adapters (where gateway_runner is never set by upstream) still
+            # get full admin functionality. None is acceptable too — admin
+            # routes that need it check defensively.
+            runner=self._resolve_runner(),
             auth_key=self._auth_key,
         )
         # ─────────────────────────────────────────────────────────────────
