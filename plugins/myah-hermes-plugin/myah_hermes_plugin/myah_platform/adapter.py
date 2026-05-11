@@ -1378,7 +1378,25 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams[stream_id]
 
         def _put(event_data: dict):
-            """Thread-safe push from agent worker thread."""
+            """Thread-safe push from agent worker thread.
+
+            Mirrors ``_push_event_sync``'s ``_stream_had_content`` tracking
+            (BONUS-2 contract). The LLM streaming path emits message.delta
+            events through this closure — bypassing ``_push_event_sync``
+            entirely — so the content tracker was empty even on
+            fully-successful streams. The ``_dispatch_message`` finally
+            block at line 807 then saw an empty set and falsely appended
+            the gateway-suppression warning ("did not produce a response")
+            to every streamed reply.
+
+            Marking here keeps the BONUS-2 design intact: any path that
+            actually delivers a message.delta to the SSE stream marks
+            the stream as having had content, regardless of whether the
+            push went through the sync helper or the threadsafe queue
+            primitive.
+            """
+            if event_data.get("event") == "message.delta":
+                self._stream_had_content.add(stream_id)
             try:
                 self._loop.call_soon_threadsafe(q.put_nowait, event_data)
             except RuntimeError:

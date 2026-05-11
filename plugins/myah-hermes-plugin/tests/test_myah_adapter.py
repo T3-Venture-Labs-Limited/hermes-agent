@@ -555,3 +555,90 @@ class TestStreamHadContent:
             })
         # set behavior — only one entry per stream_id
         assert adapter._stream_had_content == {stream_id}
+
+
+# ── Streaming-callback content tracking (gateway-suppression false-positive) ─
+
+
+class TestStreamDeltaCallbackMarksContent:
+    """The LLM streaming path emits ``message.delta`` events through the
+    ``_stream_delta`` closure inside ``get_structured_callbacks``, which
+    pushes onto the asyncio queue via ``call_soon_threadsafe``. Until the
+    2026-05-11 fix, that path did NOT mark ``_stream_had_content`` — only
+    the synchronous ``_push_event_sync`` did. Result: every successful
+    streamed response triggered the gateway-suppression workaround at
+    ``adapter._dispatch_message`` finally:
+
+        "⚠️ The agent's LLM call did not produce a response..."
+
+    appended to the actually-delivered reply.
+
+    These tests pin the contract: ANY ``message.delta`` event reaching
+    a stream — sync OR threadsafe-async — marks ``_stream_had_content``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_delta_callback_marks_stream_had_content(self):
+        """End-to-end: build callbacks via ``get_structured_callbacks``,
+        invoke the returned ``stream_delta`` (the closure the agent's
+        ``stream_delta_callback`` is set to), then verify the stream's
+        ID is in ``_stream_had_content``."""
+        adapter = _make_adapter()
+        session_key = "agent:main:myah:dm:session-1:user-1"
+        stream_id = "stream-abc"
+
+        # Wire the adapter's internal state the way _handle_message_endpoint
+        # does just before _dispatch_message runs.
+        adapter._loop = asyncio.get_running_loop()
+        adapter._streams[stream_id] = asyncio.Queue()
+        adapter._session_streams[session_key] = stream_id
+
+        cbs = adapter.get_structured_callbacks(session_key)
+        assert cbs is not None, (
+            "get_structured_callbacks returned None despite a live stream — "
+            "test setup is wrong, not the production code."
+        )
+
+        # Drive a token through the closure exactly the way AIAgent would.
+        cbs["stream_delta"]("hello world")
+
+        # Allow the queued coroutine to run so the threadsafe push lands.
+        await asyncio.sleep(0)
+
+        assert stream_id in adapter._stream_had_content, (
+            "stream_delta callback did NOT mark _stream_had_content. "
+            "The streaming path bypasses _push_event_sync via the local "
+            "_put closure, so the BONUS-2 fix at _push_event_sync:338 "
+            "never fires for streamed responses. Result: every successful "
+            "stream triggers the suppression-bug warning in finally."
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_delta_streaming_events_do_not_mark_content(self):
+        """``reasoning`` / ``status`` / ``tool_progress`` callbacks emit
+        non-delta events. They MUST NOT mark ``_stream_had_content`` —
+        otherwise the user-visible-content check would false-positive on
+        runs that only emitted reasoning/tool activity with no real
+        assistant message."""
+        adapter = _make_adapter()
+        session_key = "agent:main:myah:dm:session-2:user-2"
+        stream_id = "stream-def"
+
+        adapter._loop = asyncio.get_running_loop()
+        adapter._streams[stream_id] = asyncio.Queue()
+        adapter._session_streams[session_key] = stream_id
+
+        cbs = adapter.get_structured_callbacks(session_key)
+        assert cbs is not None
+
+        cbs["reasoning"]("CoT token")
+        cbs["status"]("working")
+        cbs["tool_progress"]("tool.started", "bash", "ls -la", {"cmd": "ls"})
+
+        await asyncio.sleep(0)
+
+        assert stream_id not in adapter._stream_had_content, (
+            "Non-message.delta events were tracked as user-visible content. "
+            "The suppression-bug check expects _stream_had_content to mean "
+            "'a real assistant message was delivered'."
+        )
