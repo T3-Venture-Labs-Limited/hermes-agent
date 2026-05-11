@@ -55,6 +55,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   registered user. Multi-user OSS deployments require additional auth
   wiring not shipped in v1.
 
+## Upstream private-API dependencies
+
+The plugin reads several private (underscore-prefixed) attributes from
+upstream `hermes-agent` modules. Each is wrapped in a defensive `getattr`
+chain and covered by a CI guard test that fails loudly at plugin-CI time
+if upstream drops the attribute. The guards are the canary — if one
+goes red on a submodule bump, investigate before merging.
+
+| Upstream symbol | Module | Used by | CI guard |
+|---|---|---|---|
+| `_gateway_runner_ref` (`weakref.ref`) | `gateway/run.py` | `MyahAdapter._resolve_runner` (lazy runner self-discovery for plugin-registered platforms); Phase F `myah_pre_llm_call` (resolves the active `GatewayRunner` from outside `_run_agent`'s closure). | `tests/test_streaming_callbacks.py::test_gateway_runner_ref_is_module_level_weakref` |
+| `_agent_cache` (`Dict[session_key, (AIAgent, sig)]`) | `gateway.run.GatewayRunner` | Phase F `myah_pre_llm_call` (looks up the cached agent to swap its callback attributes before the LLM call). | `tests/test_streaming_callbacks.py::test_runner_agent_cache_attr_exists` |
+| `_session_model_overrides` (`Dict[session_key, dict]`) | `gateway.run.GatewayRunner` | `runtime_extensions/_runner_state.py` (Tier 2B established pattern for per-session model/provider override). | Covered by `tests/test_runner_state.py`. |
+| `_servers` / `_lock` / `_run_on_mcp_loop` | `tools/mcp_tool` | `runtime_extensions/mcp_disconnect.disconnect_mcp_server` (per-server MCP teardown — vanilla only exposes "shutdown all"). | `tests/test_mcp_disconnect.py::test_upstream_state_present` |
+
+**Why this is necessary:** vanilla upstream `gateway/run.py:_create_adapter`
+only sets `adapter.gateway_runner` for built-in (fork-bundled) platforms,
+NOT for plugin-registered platforms. With no public way for a plugin
+adapter to reach the live runner, every Myah feature that needs the
+runner — Phase B model overrides, per-message attribution, Phase F
+structured streaming — silently degrades unless the plugin self-resolves
+via the upstream-exposed module-level weakref.
+
+**Removal path:** the listed features are eligible for removal once
+upstream exposes equivalent public APIs (tracked as U-RUNNER in the
+spec). The CI guards make the swap auditable — when a public surface
+lands, delete the corresponding private access path and its guard test
+in the same PR.
+
 ## [1.1.0] — 2026-05-10
 
 ### Added
