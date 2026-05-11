@@ -39,6 +39,21 @@ def setup_sentry() -> None:
         from sentry_sdk.integrations.openai import OpenAIIntegration
         from sentry_sdk.integrations.anthropic import AnthropicIntegration
 
+        # AsyncioIntegration auto-spans every ``asyncio.create_task`` /
+        # ``asyncio.gather`` call. Without it, async exceptions raised
+        # inside spawned tasks lose their parent span context and Sentry
+        # treats them as bare crashes instead of trace children. The agent
+        # runtime is heavily async (gateway adapter loop, cron scheduler,
+        # the SSE event queue), so this captures the bulk of background
+        # work. Optional integration — silently no-ops if ``asyncio`` is
+        # unavailable, which can't happen on supported Python versions
+        # but keeps the call defensive.
+        try:
+            from sentry_sdk.integrations.asyncio import AsyncioIntegration
+            _asyncio_integration = [AsyncioIntegration()]
+        except ImportError:  # pragma: no cover — sentry-sdk should always ship this
+            _asyncio_integration = []
+
         sentry_sdk.init(
             dsn=dsn,
             environment=os.environ.get('ENV', 'production'),
@@ -57,6 +72,7 @@ def setup_sentry() -> None:
                 # conversation content alongside token counts and latency.
                 OpenAIIntegration(include_prompts=True),
                 AnthropicIntegration(include_prompts=True),
+                *_asyncio_integration,
             ],
         )
         sentry_sdk.set_tag('user_id', os.environ.get('MYAH_USER_ID', 'unknown'))

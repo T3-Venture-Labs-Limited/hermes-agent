@@ -238,6 +238,22 @@ def register(ctx: Any) -> None:
     # (which only see agent.telemetry.TelemetryHook) route through it.
     sentry_init.setup_sentry()
 
+    # ── Sentry observability hooks (Phase 2) ───────────────────────────
+    # Register pre/post_api_request + pre/post_tool_call hooks that emit
+    # Myah-context breadcrumbs alongside the OpenAIIntegration's raw
+    # HTTP capture. The breadcrumbs are no-ops when SENTRY_DSN_AGENT is
+    # unset (sentry_sdk.add_breadcrumb on an uninitialized SDK is a
+    # silent return), so OSS-mode incurs zero cost. Best-effort import
+    # — older plugin builds without the observability/ package degrade
+    # to no-op rather than break the rest of register().
+    try:
+        from myah_hermes_plugin.observability import register_sentry_hooks
+
+        register_sentry_hooks(ctx)
+    except Exception:
+        log.exception("Failed to register Sentry observability hooks")
+    # ───────────────────────────────────────────────────────────────────
+
     # ── MYAH_USER_ID bootstrap (Phase 8.2 OSS) ──────────────────────────
     # Hosted Myah injects MYAH_USER_ID per-container; OSS users would
     # otherwise need to paste it manually. Auto-discover via /whoami
