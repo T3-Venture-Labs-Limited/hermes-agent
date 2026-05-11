@@ -198,6 +198,168 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response({"ok": True, "name": name})
 
+    async def get_provider_catalog(request: "web.Request") -> "web.Response":
+        """Return the merged provider catalog with credential status.
+
+        Same shape as the dashboard's ``/api/plugins/myah-admin/providers``
+        endpoint but enriched with a ``has_credential`` field, and
+        reachable on the gateway adapter port using the standard adapter
+        auth (no separate dashboard session token needed).
+
+        Used by the platform's ``fetch_hermes_provider_catalog`` to
+        auto-import providers into the user's ``UserProviderStatuses``
+        rows at /whoami time (ISSUE-003 follow-up). On stock hermes
+        ``has_credential`` is determined by:
+        - ``api_key`` providers: env var named ``env_var`` is set
+        - ``oauth_*`` providers: auth.json has an entry for the provider
+
+        Response shape (a list — platform's helper expects this):
+
+            [
+              {"id": "openrouter", "display_name": "OpenRouter",
+               "auth_type": "api_key", "env_var": "OPENROUTER_API_KEY",
+               "has_credential": true, "v1_visible": true, ...},
+              ...
+            ]
+        """
+        if (resp := _check_auth(request, auth_key)) is not None:
+            return resp
+        try:
+            from myah_hermes_plugin.myah_admin.dashboard._providers import (
+                _build_catalog,
+            )
+        except Exception:
+            logger.exception(
+                "[myah-admin] providers endpoint: failed to import _build_catalog"
+            )
+            return web.json_response({"providers": []}, status=200)
+
+        try:
+            catalog = await _build_catalog()
+        except Exception:
+            logger.exception(
+                "[myah-admin] providers endpoint: _build_catalog() raised"
+            )
+            return web.json_response({"providers": []}, status=200)
+
+        # Enrich with has_credential — check env vars, auth.json
+        # ``providers`` (per-provider OAuth tokens), and
+        # ``credential_pool`` (the pool of all configured credentials
+        # the user has registered via ``hermes auth`` / setup wizard).
+        # The credential_pool is the canonical source of "user has this
+        # provider configured" — it includes both API-key and OAuth
+        # providers, populated whenever the user runs setup or adds a
+        # credential. The legacy ``providers`` key only carries OAuth
+        # tokens; the env-var heuristic still applies for api_key types.
+        import os as _os
+        import json as _json
+        _auth_providers: set[str] = set()
+        _auth_pool: set[str] = set()
+        try:
+            from hermes_constants import get_hermes_home
+            _auth_path = get_hermes_home() / "auth.json"
+            if _auth_path.exists():
+                with open(_auth_path, encoding="utf-8") as f:
+                    _auth = _json.load(f) or {}
+                if isinstance(_auth, dict):
+                    _providers_dict = _auth.get("providers") or {}
+                    if isinstance(_providers_dict, dict):
+                        _auth_providers = set(_providers_dict.keys())
+                    _pool_dict = _auth.get("credential_pool") or {}
+                    if isinstance(_pool_dict, dict):
+                        _auth_pool = set(_pool_dict.keys())
+        except Exception:
+            pass
+
+        providers_list = []
+        for slug, entry in (catalog.items() if isinstance(catalog, dict) else []):
+            if not isinstance(entry, dict):
+                continue
+            auth_type = entry.get("auth_type") or ""
+            env_var = entry.get("env_var") or ""
+            has_credential = False
+            # credential_pool is the canonical "configured" signal — covers
+            # both API-key and OAuth providers that the user explicitly
+            # set up via `hermes auth` or the setup wizard.
+            if slug in _auth_pool:
+                has_credential = True
+            # Legacy OAuth path: top-level `providers` entry
+            elif auth_type.startswith("oauth") and slug in _auth_providers:
+                has_credential = True
+            # API-key fallback: env var is set in the process environment
+            elif auth_type == "api_key" and env_var and _os.environ.get(env_var):
+                has_credential = True
+
+            providers_list.append({
+                "id": slug,
+                "display_name": entry.get("display_name", slug),
+                "label": entry.get("display_name", slug),  # alias for compat
+                "description": entry.get("description", ""),
+                "auth_type": auth_type,
+                "env_var": env_var,
+                "inference_base_url": entry.get("inference_base_url", ""),
+                "v1_visible": bool(entry.get("v1_visible", False)),
+                "has_credential": has_credential,
+                "models": entry.get("curated_models", []),
+            })
+
+        return web.json_response({"providers": providers_list})
+
+    async def get_hermes_config(request: "web.Request") -> "web.Response":
+        """Return the hermes ``config.yaml`` model block.
+
+        Used by the platform's ``fetch_hermes_default_model`` helper to
+        discover the user's hermes-side configured default (provider +
+        model). Replaces the previous dashboard ``:9119/api/config`` call
+        which required a separate ``HERMES_WEB_SESSION_TOKEN`` that OSS
+        users typically don't configure.
+
+        Returns just the ``model`` sub-dict — narrower surface than the
+        full config (no API keys, no plugin settings).
+
+        Response shape::
+
+            {"model": {"provider": "opencode-go", "default": "mimo-v2.5",
+                       "base_url": "https://...", "api_mode": "..."}}
+
+        On any read failure (file missing, YAML invalid, etc.) returns
+        ``{"model": {}}`` with status 200 — callers degrade gracefully.
+        """
+        if (resp := _check_auth(request, auth_key)) is not None:
+            return resp
+        try:
+            import yaml
+            from hermes_constants import get_hermes_home
+        except Exception:
+            logger.exception("[myah-admin] config endpoint: failed to import deps")
+            return web.json_response({"model": {}}, status=200)
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return web.json_response({"model": {}}, status=200)
+
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            logger.exception("[myah-admin] config endpoint: failed to read config.yaml")
+            return web.json_response({"model": {}}, status=200)
+
+        model_block = cfg.get("model")
+        if not isinstance(model_block, dict):
+            return web.json_response({"model": {}}, status=200)
+
+        # Whitelist fields — never echo a key called "api_key" or similar
+        # secret-ish name. The hermes config.yaml model block currently
+        # has provider/default/base_url/api_mode only, all non-secret.
+        safe_model = {
+            "provider": str(model_block.get("provider") or ""),
+            "default": str(model_block.get("default") or ""),
+            "base_url": str(model_block.get("base_url") or ""),
+            "api_mode": str(model_block.get("api_mode") or ""),
+        }
+        return web.json_response({"model": safe_model})
+
     async def gateway_restart(request: "web.Request") -> "web.Response":
         """Busy-check + ``supervisorctl restart hermes``.
 
@@ -253,6 +415,8 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         "reload_mcp": reload_mcp,
         "disconnect_mcp": disconnect_mcp,
         "gateway_restart": gateway_restart,
+        "get_hermes_config": get_hermes_config,
+        "get_provider_catalog": get_provider_catalog,
     }
 
 
@@ -311,7 +475,15 @@ def register_runtime_admin_routes(
         "/myah/v1/admin/gateway/restart",
         handlers["gateway_restart"],
     )
+    app.router.add_get(
+        "/myah/v1/admin/config",
+        handlers["get_hermes_config"],
+    )
+    app.router.add_get(
+        "/myah/v1/admin/providers",
+        handlers["get_provider_catalog"],
+    )
 
     logger.info(
-        "[myah-admin] runtime-control routes registered (9 endpoints under /myah/v1/admin/)"
+        "[myah-admin] runtime-control routes registered (11 endpoints under /myah/v1/admin/)"
     )

@@ -13,11 +13,102 @@ plugin. Earlier phases (4b/4c) bootstrapped the package skeleton and the
 secrets tool. Phase 4f will follow with cron/status_hint/boot_md hooks.
 """
 
+import json
+import logging
+import os
+import urllib.error
+import urllib.request
 from typing import Any
 
 from .. import sentry_init
 from ..myah_tools import secrets_tool
 from .pre_dispatch_hook import myah_pre_gateway_dispatch
+
+log = logging.getLogger(__name__)
+
+
+def _bootstrap_user_id() -> None:
+    """Discover ``MYAH_USER_ID`` via the platform's ``/whoami`` endpoint.
+
+    Idempotent: a no-op if ``MYAH_USER_ID`` is already set (hosted Myah
+    injects it per-container at spawn time, so this branch is the OSS
+    self-hosted case where the user runs ``hermes gateway start`` on
+    their host without container spawning).
+
+    Without ``MYAH_USER_ID`` the cron→Myah webhook payload's ``user_id``
+    field is empty, which the platform's ``/api/v1/processes/webhook/run-complete``
+    handler rejects with HTTP 400. Auto-discovering it removes the manual
+    "copy your user_id from the platform UI to ~/.hermes/.env" friction.
+
+    Auth: uses ``MYAH_AGENT_BEARER_TOKEN`` (or its alias
+    ``MYAH_AGENT_TOKEN``). The OSS user pastes this once into both
+    ``platform/.env`` and ``~/.hermes/.env`` — same secret, two consumers.
+
+    Failure modes (all silent + logged):
+    - ``MYAH_PLATFORM_BASE_URL`` unset → cannot reach platform at all.
+    - Bearer token unset → platform refuses with 503.
+    - Network error → platform may be starting up; retry next plugin load.
+    - ``/whoami`` 404 → no users registered yet; user signs up first.
+    """
+    if os.environ.get("MYAH_USER_ID"):
+        return
+
+    base_url = os.environ.get("MYAH_PLATFORM_BASE_URL", "").strip().rstrip("/")
+    bearer = (
+        os.environ.get("MYAH_PLATFORM_BEARER")
+        or os.environ.get("MYAH_AGENT_BEARER_TOKEN")
+        or os.environ.get("MYAH_AGENT_TOKEN")
+        or ""
+    ).strip()
+
+    if not base_url:
+        log.info(
+            "MYAH_USER_ID unset and MYAH_PLATFORM_BASE_URL not configured; "
+            "cron webhook will be skipped until both are set"
+        )
+        return
+    if not bearer:
+        log.info(
+            "MYAH_USER_ID unset and no platform bearer token in env "
+            "(MYAH_AGENT_BEARER_TOKEN); /whoami bootstrap skipped"
+        )
+        return
+
+    url = f"{base_url}/api/v1/myah/whoami"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {bearer}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        log.warning(
+            "MYAH_USER_ID bootstrap: /whoami returned HTTP %s — "
+            "set MYAH_USER_ID manually if cron deliveries are needed",
+            exc.code,
+        )
+        return
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        log.warning("MYAH_USER_ID bootstrap: could not reach %s: %s", url, exc)
+        return
+
+    user_id = (data.get("user_id") or "").strip() if isinstance(data, dict) else ""
+    if user_id:
+        os.environ["MYAH_USER_ID"] = user_id
+        log.info("Discovered MYAH_USER_ID=%s via /whoami", user_id)
+        # NOTE: The platform's /whoami endpoint handles default_model sync
+        # itself (see platform/.../routers/myah.py). Plugin used to POST to
+        # /api/v1/users/user/default-model directly, but that endpoint
+        # requires JWT auth via get_verified_user — the plugin only has the
+        # agent bearer token. Sync now happens platform-side as a side
+        # effect of the /whoami call we just made.
+    else:
+        log.warning(
+            "MYAH_USER_ID bootstrap: /whoami returned no user_id; "
+            "the platform may have no registered users yet"
+        )
 
 # Platform-hint string injected by ``agent.prompt_builder.get_platform_hint``
 # when the agent is running on the Myah platform. This text used to live
@@ -40,6 +131,82 @@ def _validate_myah_config(config: Any) -> bool:
     adapter itself surfaces specific errors if it cannot start.
     """
     return True
+
+
+def _wire_secret_capture_callback() -> None:
+    """Register a global secret-capture callback with vanilla upstream.
+
+    Vanilla ``tools/skills_tool.set_secret_capture_callback`` accepts a
+    single-arg callable invoked with ``(name, prompt, metadata)``. The
+    plugin's adapter handles secrets per-stream via
+    ``MyahAdapter._secret_capture_callback`` — but that's a bound method
+    needing ``stream_id`` and an adapter instance.
+
+    This wrapper looks up the active adapter via the late-bound
+    ``adapter._LATEST_ADAPTER`` module attribute (set by
+    :meth:`MyahAdapter.start`) and routes to the right stream by
+    consulting the adapter's ``_session_streams`` mapping with the
+    contextvar-recorded session key. Single-adapter / single-process
+    assumption documented in :func:`register`.
+
+    Silent no-op if upstream's ``tools.skills_tool`` is unavailable
+    (e.g. older Hermes builds) — secrets simply won't prompt, which
+    matches the pre-Phase-5.1 behavior.
+    """
+    try:
+        from tools.skills_tool import set_secret_capture_callback
+    except ImportError:
+        log.debug(
+            "tools.skills_tool.set_secret_capture_callback unavailable; "
+            "secret prompts will not fire"
+        )
+        return
+
+    from . import adapter as _adapter_module
+
+    def _global_secret_callback(name: str, prompt: str, metadata: Any = None) -> dict:
+        """Vanilla-shaped wrapper. Routes to the active adapter+stream."""
+        adapter_inst = getattr(_adapter_module, "_LATEST_ADAPTER", None)
+        if adapter_inst is None:
+            log.warning(
+                "secret_capture_callback fired but no MyahAdapter is active; "
+                "auto-skipping secret %r", name
+            )
+            return {
+                "success": True,
+                "skipped": True,
+                "stored_as": name,
+                "validated": False,
+                "message": "No active Myah adapter to prompt for secret.",
+            }
+
+        # Resolve stream_id from the active session_key contextvar that
+        # vanilla approvals set inside the agent worker thread. Falls
+        # back to the most recently activated stream if multiple are
+        # tracked.
+        try:
+            from tools.approval import get_current_session_key
+        except ImportError:
+            session_key = ""
+        else:
+            session_key = get_current_session_key() or ""
+
+        stream_id = (
+            adapter_inst._session_streams.get(session_key, "")
+            if session_key
+            else ""
+        )
+        if not stream_id and adapter_inst._session_streams:
+            # Fallback: pick any active stream. Single-tenant assumption
+            # makes this safe; in multi-tenant we'd misroute.
+            stream_id = next(iter(adapter_inst._session_streams.values()))
+
+        return adapter_inst._secret_capture_callback(
+            name, prompt, metadata=metadata, stream_id=stream_id
+        )
+
+    set_secret_capture_callback(_global_secret_callback)
+    log.info("Myah plugin: registered secret_capture_callback with tools.skills_tool")
 
 
 def register(ctx: Any) -> None:
@@ -70,6 +237,62 @@ def register(ctx: Any) -> None:
     # registers the SentryHook adapter so Hermes runtime telemetry calls
     # (which only see agent.telemetry.TelemetryHook) route through it.
     sentry_init.setup_sentry()
+
+    # ── MYAH_USER_ID bootstrap (Phase 8.2 OSS) ──────────────────────────
+    # Hosted Myah injects MYAH_USER_ID per-container; OSS users would
+    # otherwise need to paste it manually. Auto-discover via /whoami
+    # if missing. Idempotent: no-op if MYAH_USER_ID is already set.
+    _bootstrap_user_id()
+
+    # ── F6 cron→chat delivery on stock vanilla (Phase E) ───────────
+    # Vanilla cron/scheduler.py doesn't call build_delivery_metadata,
+    # so MyahAdapter never sees job_id and never routes cron output to
+    # the platform webhook. The watcher observes the on-disk output
+    # convention as a workaround. The watcher start is wired as a
+    # pre_gateway_dispatch hook (lazy start) to avoid the
+    # asyncio.get_event_loop() deprecation in Python 3.12+ — the
+    # gateway's event loop is guaranteed running by the time any
+    # dispatch fires. Idempotent — silent no-op if
+    # MYAH_PLATFORM_BASE_URL is unset.
+    try:
+        from myah_hermes_plugin.runtime_extensions.cron_watcher import (
+            register_cron_watcher,
+        )
+        register_cron_watcher(ctx)
+    except Exception:
+        log.exception("Failed to register cron output watcher hook")
+    # ───────────────────────────────────────────────────────────────
+
+    # ── Phase F: structured streaming workaround for stock vanilla ─
+    # Vanilla _run_agent doesn't have the polymorphic
+    # get_structured_callbacks dispatch the fork carries, so MyahAdapter's
+    # structured streaming callbacks never wire up by default. The
+    # pre_llm_call hook below mutates AIAgent callbacks just-in-time
+    # before each LLM call to install them. Removable when upstream
+    # U-CB PR lands.
+    try:
+        from myah_hermes_plugin.runtime_extensions.streaming_callbacks import (
+            register_streaming_hook,
+        )
+        register_streaming_hook(ctx)
+    except Exception:
+        log.exception("Failed to register Phase F streaming hook")
+    # ───────────────────────────────────────────────────────────────
+
+    # ── Secret-capture global callback (Phase 5.1 — F4 vanilla support) ─
+    # Vanilla upstream's tools/skills_tool exposes
+    # set_secret_capture_callback(fn) — a single global registration
+    # point invoked when a tool needs the user to provide a secret.
+    # Without registering here, the agent silently auto-skips secret
+    # prompts because no callback is wired.
+    #
+    # Single-adapter assumption: the plugin runs at most one MyahAdapter
+    # per process (single-user agent container in hosted Myah; single-
+    # tenant in OSS). The wrapper below dispatches to the active
+    # adapter via _LATEST_ADAPTER which is set in MyahAdapter.start().
+    # If we ever ship multi-tenant in-process, replace this with a
+    # contextvar-keyed lookup.
+    _wire_secret_capture_callback()
 
     # ── pre_gateway_dispatch hook (Tier 2A Task 2A.4) ──────────────────
     # Replaces skip_user_authorization semantics that PR #20 removed.

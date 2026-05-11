@@ -101,6 +101,13 @@ def _myah_ext(mime: str, filename: str, default: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# Late-bound pointer to the most-recently-constructed MyahAdapter. Used
+# by the plugin's global secret-capture wrapper to dispatch into the
+# active adapter — see myah_platform/__init__._wire_secret_capture_callback
+# for the contract. Set in MyahAdapter.__init__; never cleared.
+_LATEST_ADAPTER: Optional["MyahAdapter"] = None
+
+
 class MyahAdapter(BasePlatformAdapter):
     """
     Gateway platform adapter for the Myah web frontend.
@@ -121,6 +128,16 @@ class MyahAdapter(BasePlatformAdapter):
         # ``_missing_`` hook to a cached pseudo-member with value="myah",
         # mirroring how ``IRCAdapter`` constructs its platform identifier.
         super().__init__(config, Platform("myah"))
+        # Late-bound module-level pointer used by the plugin's global
+        # secret-capture wrapper (myah_platform/__init__._wire_secret_capture_callback)
+        # to dispatch tools/skills_tool.set_secret_capture_callback's
+        # vanilla-shaped (name, prompt, metadata) call into this
+        # adapter's per-stream _secret_capture_callback. Single-adapter
+        # / single-process assumption — fine for hosted Myah's per-user
+        # container model and fine for OSS single-tenant; multi-tenant
+        # in-process would need a contextvar-keyed lookup instead.
+        global _LATEST_ADAPTER
+        _LATEST_ADAPTER = self
         # Auth key resolution order: config.extra.auth_key (yaml) →
         # MYAH_ADAPTER_AUTH_KEY env (legacy hosted-mode path that used to
         # be wired up by the deleted ``_apply_env_overrides`` block in
@@ -176,11 +193,52 @@ class MyahAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── GatewayRunner backref ─────────────────────────────────────
-        # The ``GatewayRunner._create_adapter`` path sets this attribute on
-        # plugin-registered adapters after instantiation (Phase 4d). Initialise
-        # to None so unit tests that bypass the runner factory and direct calls
-        # like ``MyahAdapter(config)`` don't trip on AttributeError.
+        # ``GatewayRunner._create_adapter`` sets this for *built-in* adapters
+        # (Discord, Webhook) but NOT for plugin-registered platforms — see
+        # ``gateway/run.py:4592-4594`` where ``platform_registry.create_adapter()``
+        # is returned directly without ``adapter.gateway_runner = self``. As a
+        # result, on stock hermes (both this branch and upstream pip-installed)
+        # the attribute stays ``None`` indefinitely, silently disabling:
+        #   - Phase B model override (``_handle_message_endpoint`` line ~354)
+        #   - per-message model attribution (``_dispatch_message`` finally)
+        #   - Phase F ``pre_llm_call`` hook (streaming_callbacks.py)
+        #
+        # The plugin self-discovers the runner via the module-level weakref
+        # ``gateway.run._gateway_runner_ref`` upstream exposes (lines 1109/1206
+        # of run.py). Same direct-access pattern Tier 2B established for
+        # ``_session_model_overrides`` / ``_agent_cache``. Removable when
+        # upstream sets ``gateway_runner`` on plugin adapters too — then
+        # ``self.gateway_runner`` becomes the cached fast-path.
         self.gateway_runner = None
+
+        # ── Phase F: plugin-side structured-streaming workaround ─────
+        # Reverse mapping populated in _handle_message_endpoint so the
+        # pre_llm_call hook can resolve session_key from chat_id.
+        self._chat_id_session_keys: Dict[str, str] = {}
+        # Set of session_keys for which our pre_llm_call hook installed
+        # structured streaming callbacks. send() consults this set to
+        # suppress the gateway's final "send full response" duplicate.
+        self._native_streaming_used: set[str] = set()
+        # Set of session_keys for which stream_delta callback actually
+        # fired (i.e. tokens were streamed). The post_llm_call hook in
+        # streaming_callbacks.py reads this to detect the gateway's
+        # response-suppression bug (gateway/run.py:14701 drops the
+        # agent's failed=True flag → gateway/run.py:15326 suppresses
+        # send-final → user sees "Thinking..." forever). When stream
+        # never fired but post_llm_call has a final response, the hook
+        # emits the response as a synthetic message.delta event so the
+        # user sees the error message inline.
+        self._stream_delta_invoked: set[str] = set()
+        # Set of stream_ids that received AT LEAST ONE message.delta
+        # event via any delivery path — stream_delta callback, slash
+        # command response via adapter.send, agent reply via send,
+        # cron live-preview, etc. Tracked at _push_event_sync time so
+        # all paths get unified accounting. The gateway-suppression
+        # workaround in _dispatch_message finally reads this instead
+        # of _stream_delta_invoked (which only covers the LLM streaming
+        # path and would false-positive on slash commands).
+        self._stream_had_content: set[str] = set()
+        # ─────────────────────────────────────────────────────────────
 
         # ── Route registration state ──────────────────────────────────
         # Tier 2A Task 2A.3 (2026-05-07): the adapter ALWAYS runs in
@@ -192,6 +250,41 @@ class MyahAdapter(BasePlatformAdapter):
         # §3 Task 2A.3.
         self._routes_registered = False
         self._runner_helper: Optional["MyahStandaloneRunner"] = None
+
+    # ── Runner self-discovery ───────────────────────────────────────────
+
+    def _resolve_runner(self):
+        """Return the active ``GatewayRunner`` or ``None``.
+
+        Fast path: ``self.gateway_runner`` was set externally (built-in
+        adapters get this from ``_create_adapter``; future hermes versions
+        may set it for plugin adapters too).
+
+        Fallback: read ``gateway.run._gateway_runner_ref`` — a module-level
+        weakref upstream populates at ``gateway/run.py:1206`` whenever the
+        ``GatewayRunner.__init__`` runs. Once resolved, cache the ref on
+        ``self.gateway_runner`` so subsequent calls take the fast path.
+
+        Returns ``None`` if no gateway is running (e.g. plugin imported in
+        isolation by a unit test). Callers must handle ``None`` gracefully
+        — same contract as the original ``self.gateway_runner`` attribute.
+        """
+        if self.gateway_runner is not None:
+            return self.gateway_runner
+        try:
+            from gateway.run import _gateway_runner_ref as _ref
+        except ImportError:
+            return None
+        try:
+            runner = _ref()
+        except Exception:
+            return None
+        if runner is not None:
+            # Cache so the next call short-circuits — same lifecycle as the
+            # GatewayRunner instance (a new runner replaces _gateway_runner_ref
+            # before this adapter could be re-used in the same process).
+            self.gateway_runner = runner
+        return runner
 
     # ── Auth ────────────────────────────────────────────────────────────
 
@@ -234,6 +327,16 @@ class MyahAdapter(BasePlatformAdapter):
         q = self._streams.get(stream_id)
         if q is None:
             return
+        # Track that a user-visible content event was delivered for this
+        # stream so the suppression-bug workaround in _dispatch_message's
+        # finally can distinguish "real failure with no output" from
+        # "slash command response delivered via adapter.send()". Without
+        # this tracking, slash commands like /model would falsely trigger
+        # the gateway-suppression warning because their response is
+        # emitted via send() → _push_event_sync directly, bypassing the
+        # stream_delta_callback path that _stream_delta_invoked tracks.
+        if event.get("event") == "message.delta":
+            self._stream_had_content.add(stream_id)
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
@@ -319,8 +422,11 @@ class MyahAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+        # Phase F: stash chat_id → session_key for the pre_llm_call hook
+        self._chat_id_session_keys[session_id] = session_key
+
         # ── Myah: apply one-shot model override if present ───────────
-        runner = self.gateway_runner
+        runner = self._resolve_runner()
         if _override_model and runner is not None:
             try:
                 from hermes_cli.model_switch import switch_model
@@ -345,6 +451,13 @@ class MyahAdapter(BasePlatformAdapter):
                     _current_provider = _existing_override.get('provider', _current_provider)
                     _current_base_url = _existing_override.get('base_url', _current_base_url)
 
+                logger.info(
+                    "[myah-modelswitch] requesting switch session=%s "
+                    "raw_input=%r explicit_provider=%r current_provider=%r "
+                    "current_model=%r",
+                    session_key, _override_model, _override_provider,
+                    _current_provider, _current_model,
+                )
                 _result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: switch_model(
@@ -359,6 +472,17 @@ class MyahAdapter(BasePlatformAdapter):
                         custom_providers=_cfg.get("custom_providers"),
                     ),
                 )
+                logger.info(
+                    "[myah-modelswitch] switch_model result session=%s "
+                    "success=%s new_model=%r target_provider=%r api_mode=%r "
+                    "error=%r",
+                    session_key,
+                    getattr(_result, "success", None),
+                    getattr(_result, "new_model", None),
+                    getattr(_result, "target_provider", None),
+                    getattr(_result, "api_mode", None),
+                    getattr(_result, "error_message", None),
+                )
                 if getattr(_result, "success", False):
                     # set_session_override evicts the cached agent atomically.
                     set_session_override_direct(runner, session_key, {
@@ -368,6 +492,11 @@ class MyahAdapter(BasePlatformAdapter):
                         "base_url": getattr(_result, "base_url", "") or "",
                         "api_mode": getattr(_result, "api_mode", "") or "",
                     })
+                    logger.info(
+                        "[myah-modelswitch] override written session=%s "
+                        "model=%s provider=%s",
+                        session_key, _result.new_model, _result.target_provider,
+                    )
                     # ── Myah: heal auth.json + .env via vanilla-style provider sync ────
                     # Synchronously updating auth.json:active_provider (and writing
                     # OPENROUTER_API_KEY to .env when applicable) whenever the user
@@ -397,20 +526,12 @@ class MyahAdapter(BasePlatformAdapter):
                     # ────────────────────────────────────────────────────────────────────
                 else:
                     # ── Myah: clear stale override + surface failure (Bug B follow-up) ──
-                    # Previously this branch only logged a warning, leaving any prior
-                    # session override in place. Subsequent turns would reuse the stale
-                    # model, producing "wrong model" 400s that only resolved by switching
-                    # away and back. Now we clear the override so the next turn falls
-                    # back to agent defaults, AND we return 400 to the platform so the
-                    # frontend can surface the failure to the user.
                     _err_msg = getattr(_result, "error_message", "unknown")
                     logger.warning(
                         f"[myah] one-shot model override failed for session {session_key}: {_err_msg}"
                     )
                     # Direct-access pattern (Tier 2B.0): same defensive style as
-                    # _runner_state.py helpers. Pops from the upstream-native
-                    # _session_model_overrides dict; getattr guards against the
-                    # unlikely case of upstream renaming the attribute.
+                    # _runner_state.py helpers.
                     try:
                         _overrides = getattr(runner, "_session_model_overrides", None)
                         if _overrides is not None:
@@ -421,14 +542,37 @@ class MyahAdapter(BasePlatformAdapter):
                             session_key,
                             exc_info=True,
                         )
-                    # Clean up the stream queue we created above (lines 290-293).
-                    self._streams.pop(stream_id, None)
-                    self._streams_created.pop(stream_id, None)
-                    return web.json_response(
-                        {"error": f"Failed to switch to model {_override_model}: {_err_msg}"},
-                        status=400,
-                    )
-                    # ────────────────────────────────────────────────────────────────────
+
+                    # ── OSS Issue #2: graceful fallback ──
+                    # In OSS mode the platform's user.default_model can be a
+                    # model name hermes can't resolve (e.g. openai/gpt-4o-mini
+                    # when the user only has openrouter+opencode-go pool).
+                    # Returning 400 fails the entire chat turn, which is too
+                    # strict — the user just wants their message answered by
+                    # whatever default the agent has. Fall through and let
+                    # the agent run with its existing default (override has
+                    # been cleared above so this is safe).
+                    import os as _os
+                    _is_oss = _os.environ.get("MYAH_DEPLOYMENT_MODE", "").strip().lower() == "oss"
+                    if _is_oss:
+                        logger.info(
+                            "[myah] OSS mode: falling back to agent default after "
+                            "unresolvable model %r (error: %s)",
+                            _override_model, _err_msg,
+                        )
+                        # Don't return — fall through to dispatch
+                    else:
+                        # Hosted: preserve strict 400-on-failure behaviour
+                        self._streams.pop(stream_id, None)
+                        self._streams_created.pop(stream_id, None)
+                        # Phase F: dispatch never spawns, so finally cleanup
+                        # never fires; pop the session-key map entry here.
+                        self._chat_id_session_keys.pop(session_id, None)
+                        return web.json_response(
+                            {"error": f"Failed to switch to model {_override_model}: {_err_msg}"},
+                            status=400,
+                        )
+                    # ────────────────────────────────────────
             except Exception:
                 logger.exception("[myah] one-shot model override error")
         # ────────────────────────────────────────────────────────────
@@ -617,7 +761,7 @@ class MyahAdapter(BasePlatformAdapter):
                 _attribution_model = ""
                 _attribution_provider = ""
                 try:
-                    runner = self.gateway_runner
+                    runner = self._resolve_runner()
                     if runner is not None:
                         attribution = get_cached_agent_attribution_direct(runner, session_key)
                         if attribution is not None:
@@ -631,6 +775,58 @@ class MyahAdapter(BasePlatformAdapter):
                 except Exception:
                     logger.debug("[myah] model attribution lookup failed", exc_info=True)
                 # ────────────────────────────────────────────────
+
+                # ── Phase F follow-up: gateway-suppression-bug workaround ──
+                # If the agent's LLM call failed (e.g. provider 402, fallback
+                # exhausted), the agent returns a response dict with
+                # ``failed=True`` and ``final_response="API call failed ..."``.
+                # But gateway/run.py:14701 constructs a new response dict
+                # WITHOUT preserving the ``failed`` field, so the suppression
+                # check at gateway/run.py:15326 sees failed=None → treats run
+                # as successful → sees native_streamed=True (set
+                # optimistically when our structured callbacks were wired) →
+                # sets already_sent=True → _process_message_background skips
+                # adapter.send entirely. User sees "Thinking..." forever.
+                #
+                # Detect this by checking ``_stream_had_content`` — a set of
+                # stream_ids that received at least one ``message.delta``
+                # via any delivery path (stream_delta callback, adapter.send
+                # for slash commands, agent reply via send, cron preview).
+                # If the stream got NO content events, the response was
+                # swallowed by the gateway bug — emit a generic warning so
+                # the user sees something instead of an empty Thinking
+                # spinner.
+                #
+                # Critical: we check ``_stream_had_content``, NOT just
+                # ``_stream_delta_invoked``. The latter only covers the
+                # LLM streaming path. Slash commands like /model deliver
+                # via adapter.send → _push_event_sync directly (no
+                # stream_delta callback), so checking only
+                # _stream_delta_invoked would false-positive on slash
+                # commands and append the warning to /model's response.
+                if stream_id not in self._stream_had_content:
+                    logger.warning(
+                        "[myah] gateway-suppression workaround firing for "
+                        "session %s (stream %s): no message.delta event "
+                        "was emitted, response would have been swallowed",
+                        session_key, stream_id,
+                    )
+                    self._push_event_sync(stream_id, {
+                        "event": "message.delta",
+                        "stream_id": stream_id,
+                        "run_id": stream_id,
+                        "timestamp": time.time(),
+                        "delta": (
+                            "⚠️ The agent's LLM call did not produce a "
+                            "response. This usually means the configured "
+                            "provider returned an error (rate limit, "
+                            "insufficient credits, authentication failure, "
+                            "etc.). Check `~/.hermes/logs/agent.log` for "
+                            "the specific provider error."
+                        ),
+                    })
+                # ──────────────────────────────────────────────────────────
+
                 self._push_event_sync(stream_id, {
                     "event": "run.completed",
                     "stream_id": stream_id,
@@ -654,6 +850,12 @@ class MyahAdapter(BasePlatformAdapter):
             self._chat_id_streams.pop(chat_id, None)
             self._session_streams.pop(session_key, None)
             self._stream_sessions.pop(stream_id, None)
+
+            # Phase F: clean up streaming workaround state
+            self._chat_id_session_keys.pop(chat_id, None)
+            self._native_streaming_used.discard(session_key)
+            self._stream_delta_invoked.discard(session_key)
+            self._stream_had_content.discard(stream_id)
 
     async def _handle_events_endpoint(self, request: "web.Request") -> "web.StreamResponse":
         """GET /myah/v1/events/{stream_id} — SSE event stream."""
@@ -1182,9 +1384,26 @@ class MyahAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass  # Loop closed
 
+        # Track that streaming actually fired for this session. The
+        # post_llm_call hook (streaming_callbacks.py) reads this set —
+        # if stream_delta never fired but post_llm_call has an
+        # assistant_response, the gateway's suppression bug
+        # (gateway/run.py:14701 drops the agent's failed=True flag, then
+        # gateway/run.py:15326 suppresses send-final because failed is
+        # falsy) is about to swallow the response. The hook then emits
+        # the response as a synthetic message.delta so the user sees
+        # the error instead of "Thinking..." forever.
+        _captured_session_key = session_key
+
         def _stream_delta(text):
             if text is None:
                 return  # Tool boundary signal — ignore for SSE
+            # Mark this session as "stream actually fired" so the
+            # post_llm_call hook knows the response was streamed normally
+            # and doesn't need to be re-emitted.
+            _invoked = getattr(self, "_stream_delta_invoked", None)
+            if _invoked is not None:
+                _invoked.add(_captured_session_key)
             _put({
                 "event": "message.delta",
                 "stream_id": stream_id,
@@ -1504,7 +1723,11 @@ class MyahAdapter(BasePlatformAdapter):
         from .runtime_admin import register_runtime_admin_routes
         register_runtime_admin_routes(
             app,
-            runner=self.gateway_runner,
+            # _resolve_runner discovers the runner lazily so plugin-platform
+            # adapters (where gateway_runner is never set by upstream) still
+            # get full admin functionality. None is acceptable too — admin
+            # routes that need it check defensively.
+            runner=self._resolve_runner(),
             auth_key=self._auth_key,
         )
         # ─────────────────────────────────────────────────────────────────
@@ -1702,6 +1925,28 @@ class MyahAdapter(BasePlatformAdapter):
                     )
             return await self._send_via_webhook(chat_id, content, metadata)
         # ────────────────────────────────────────────────────────
+
+        # ── Phase F: native-streaming dedup ────────────────────────
+        # When our pre_llm_call hook installed structured callbacks for
+        # this session (Phase F), the SSE stream already delivered
+        # tokens during the agent run. Vanilla's gateway calls
+        # adapter.send(chat_id, full_response) after streaming
+        # completes — that call would duplicate the assistant message.
+        # The fork's _native_streaming_used flag in _run_agent would
+        # have suppressed it; on vanilla we suppress it here.
+        session_key = self._chat_id_session_keys.get(chat_id)
+        if session_key and session_key in self._native_streaming_used:
+            self._native_streaming_used.discard(session_key)
+            logger.debug(
+                "Phase F: suppressed gateway final send for native-streamed "
+                "session=%s (chat_id=%s)",
+                session_key, chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id="suppressed-native-streaming",
+            )
+        # ──────────────────────────────────────────────────────────
 
         # ── Live chat replies: SSE-first ────────────────────
         stream_id = self._chat_id_streams.get(chat_id) if chat_id else None

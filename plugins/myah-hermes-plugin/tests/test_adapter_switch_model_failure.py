@@ -164,3 +164,62 @@ async def test_switch_model_failure_returns_400_with_error_message(fake_switch_f
     # Contract: {"error": "Failed to switch to model <name>: <reason>"}
     assert body['error'].startswith('Failed to switch to model B:')
     assert 'unsupported model B' in body['error']
+
+
+# ── OSS Issue #2 — graceful fallback when model name unresolvable ──────
+
+
+@pytest.mark.asyncio
+async def test_oss_unresolvable_model_falls_back_to_default(monkeypatch):
+    """OSS regression: the platform's user.default_model can be a model
+    the user's hermes pool doesn't have (e.g. openai/gpt-4o-mini when
+    they only have openrouter + opencode-go). In that case, the message
+    should still dispatch using the agent's existing default rather
+    than 400-failing the whole turn.
+    """
+    monkeypatch.setenv('MYAH_DEPLOYMENT_MODE', 'oss')
+    fake_mod, _ = _install_fake_model_switch(
+        success=False,
+        error_message="model 'openai/gpt-4o-mini' not in any configured provider's catalog",
+    )
+    try:
+        adapter, runner = _make_adapter_with_runner()
+
+        # Compute session_key the endpoint will derive so we can pre-seed.
+        from gateway.session import build_session_key
+        source = adapter.build_source(
+            chat_id='chat-1', chat_name=None, chat_type='dm',
+            user_id='user-1', user_name=None,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=adapter.config.extra.get('group_sessions_per_user', True),
+            thread_sessions_per_user=adapter.config.extra.get('thread_sessions_per_user', False),
+        )
+        # Pre-populate a stale override that should be cleared
+        runner._session_model_overrides[session_key] = {
+            'model': 'previous-default-model',
+            'provider': 'openrouter',
+        }
+
+        request = _make_message_request({
+            'message': 'hi',
+            'session_id': 'chat-1',
+            'user_id': 'user-1',
+            'model': 'openai/gpt-4o-mini',
+        })
+
+        # Patch auth + handle_message to short-circuit to dispatch
+        with patch.object(adapter, '_check_auth', return_value=None), \
+             patch.object(adapter, 'handle_message', new=AsyncMock(return_value=None)):
+            resp = await adapter._handle_message_endpoint(request)
+
+        # OSS-mode behavior: 202 (accepted), with a stream_id, AND the
+        # stale override should be cleared so the next turn falls back.
+        assert resp.status == 202, (
+            f'OSS expected graceful 202 dispatch despite unresolvable '
+            f'model, got {resp.status}: {resp.body!r}'
+        )
+        assert session_key not in runner._session_model_overrides
+    finally:
+        sys.modules.pop('hermes_cli.model_switch', None)

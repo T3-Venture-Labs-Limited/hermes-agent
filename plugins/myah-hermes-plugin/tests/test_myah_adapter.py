@@ -405,3 +405,153 @@ class TestStructuredCallbacks:
 
         assert q.empty()
         loop.close()
+
+
+# ── Runner self-discovery (ISSUE-001) ────────────────────────────────────────
+
+
+class TestResolveRunner:
+    """``_resolve_runner`` lazily discovers the gateway runner via the
+    upstream-exposed weakref ``gateway.run._gateway_runner_ref``. Necessary
+    because ``gateway/run.py:_create_adapter`` only sets
+    ``adapter.gateway_runner`` for built-in adapters (Discord/Webhook), not
+    for plugin-registered platforms — so the MyahAdapter's
+    ``self.gateway_runner`` would otherwise stay ``None`` forever, silently
+    disabling the Phase B model override and per-message attribution paths.
+    """
+
+    def test_resolve_runner_returns_cached_value_when_set(self):
+        """If ``gateway_runner`` was set externally (built-in path or older
+        hermes that auto-wires plugin adapters), use it directly without
+        consulting the weakref."""
+        adapter = _make_adapter()
+        sentinel = object()
+        adapter.gateway_runner = sentinel
+        assert adapter._resolve_runner() is sentinel
+
+    def test_resolve_runner_falls_back_to_weakref(self):
+        """When ``gateway_runner`` is None, read from
+        ``gateway.run._gateway_runner_ref`` and cache the result."""
+        import gateway.run as _gr
+
+        adapter = _make_adapter()
+        adapter.gateway_runner = None
+
+        sentinel = object()
+        original_ref = _gr._gateway_runner_ref
+        _gr._gateway_runner_ref = lambda: sentinel
+        try:
+            resolved = adapter._resolve_runner()
+        finally:
+            _gr._gateway_runner_ref = original_ref
+
+        assert resolved is sentinel
+        # Cached for the next call (gateway lifecycle = adapter lifecycle).
+        assert adapter.gateway_runner is sentinel
+
+    def test_resolve_runner_returns_none_when_no_gateway(self):
+        """No gateway running → weakref dereferences to None → return None.
+        Callers must handle this case gracefully."""
+        import gateway.run as _gr
+
+        adapter = _make_adapter()
+        adapter.gateway_runner = None
+        original_ref = _gr._gateway_runner_ref
+        _gr._gateway_runner_ref = lambda: None
+        try:
+            assert adapter._resolve_runner() is None
+        finally:
+            _gr._gateway_runner_ref = original_ref
+        # Must NOT cache None — a future call after the gateway starts must
+        # see the runner via the weakref again.
+        assert adapter.gateway_runner is None
+
+    def test_resolve_runner_handles_weakref_import_failure(self):
+        """If ``gateway.run`` can't be imported (extreme test isolation),
+        return None gracefully rather than raising."""
+        adapter = _make_adapter()
+        adapter.gateway_runner = None
+
+        import sys
+        saved = sys.modules.get("gateway.run")
+
+        class _Stub:
+            def __getattr__(self, name):
+                raise ImportError("simulated missing module")
+
+        sys.modules["gateway.run"] = _Stub()
+        try:
+            assert adapter._resolve_runner() is None
+        finally:
+            if saved is not None:
+                sys.modules["gateway.run"] = saved
+            else:
+                sys.modules.pop("gateway.run", None)
+
+
+# ── Stream content tracking (gateway-suppression false-positive guard) ─
+
+
+class TestStreamHadContent:
+    """``_stream_had_content`` is a per-stream_id set that flips True the
+    first time any ``message.delta`` event is pushed to the stream queue.
+
+    The ``_dispatch_message`` finally block reads this to decide whether
+    to emit the gateway-suppression-bug warning ("LLM call did not produce
+    a response"). Without unified tracking at ``_push_event_sync``, slash
+    commands like /model — which deliver content via ``adapter.send`` →
+    ``_push_event_sync`` directly, bypassing the LLM streaming path —
+    would false-positive and append the warning to every successful slash
+    response.
+    """
+
+    def test_message_delta_push_marks_stream_had_content(self):
+        adapter = _make_adapter()
+        stream_id = "s-test-1"
+        adapter._streams[stream_id] = asyncio.Queue()
+        adapter._push_event_sync(stream_id, {
+            "event": "message.delta",
+            "delta": "hello",
+        })
+        assert stream_id in adapter._stream_had_content
+
+    def test_non_delta_events_do_not_mark_stream_had_content(self):
+        """Reasoning, status, tool events do NOT count as 'real content'.
+        The user only sees them as 'Thinking...' or tool cards — without
+        a message.delta the chat bubble stays empty."""
+        adapter = _make_adapter()
+        stream_id = "s-test-2"
+        adapter._streams[stream_id] = asyncio.Queue()
+        for ev_type in (
+            "reasoning.delta",
+            "status",
+            "tool.started",
+            "tool.completed",
+            "run.completed",
+            "run.failed",
+        ):
+            adapter._push_event_sync(stream_id, {"event": ev_type, "ts": 0})
+        assert stream_id not in adapter._stream_had_content
+
+    def test_unknown_stream_id_does_not_explode(self):
+        """If the stream_id is unknown (queue not present), _push_event_sync
+        must early-return without raising and without adding to the
+        tracker."""
+        adapter = _make_adapter()
+        adapter._push_event_sync("not-a-real-stream", {
+            "event": "message.delta", "delta": "x",
+        })
+        assert "not-a-real-stream" not in adapter._stream_had_content
+
+    def test_repeated_pushes_idempotent(self):
+        """Set semantics — multiple pushes for the same stream don't blow
+        up; the stream is in the set once."""
+        adapter = _make_adapter()
+        stream_id = "s-test-3"
+        adapter._streams[stream_id] = asyncio.Queue()
+        for _ in range(5):
+            adapter._push_event_sync(stream_id, {
+                "event": "message.delta", "delta": "tok",
+            })
+        # set behavior — only one entry per stream_id
+        assert adapter._stream_had_content == {stream_id}
