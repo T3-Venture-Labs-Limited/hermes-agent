@@ -29,12 +29,13 @@ requires-python = ">=3.11"
 #   pip install <plugin-source>
 # See CHANGELOG.md for the SHA verified against this plugin version.
 dependencies = [
-    # hermes-agent is not yet on PyPI as of plugin v1.0.0. When it ships,
-    # this becomes "hermes-agent>=0.11,<0.12" matching the verified
-    # version. Until then, callers install hermes-agent themselves
-    # (see CHANGELOG.md and agent/Dockerfile.stock for the canonical
-    # SHA-pin pattern).
     "aiohttp>=3.9,<4",
+    # Pinned to upstream's faa13e49f (= Tier 2C base) until hermes-agent
+    # reaches PyPI. Users with a newer compatible install (e.g. main HEAD)
+    # won't conflict — pip respects already-installed compatible versions.
+    # When hermes-agent reaches PyPI, this becomes "hermes-agent>=0.11,<0.12".
+    # See CHANGELOG.md for the SHA verified against this plugin version.
+    "hermes-agent[messaging,cron,honcho,mcp,voice,pty,web] @ git+https://github.com/NousResearch/Hermes-Agent@faa13e49f81480771ceeb55991bb0c27edf1a5fb",
 ]
 
 [project.optional-dependencies]
