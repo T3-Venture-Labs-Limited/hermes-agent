@@ -198,6 +198,61 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response({"ok": True, "name": name})
 
+    async def get_hermes_config(request: "web.Request") -> "web.Response":
+        """Return the hermes ``config.yaml`` model block.
+
+        Used by the platform's ``fetch_hermes_default_model`` helper to
+        discover the user's hermes-side configured default (provider +
+        model). Replaces the previous dashboard ``:9119/api/config`` call
+        which required a separate ``HERMES_WEB_SESSION_TOKEN`` that OSS
+        users typically don't configure.
+
+        Returns just the ``model`` sub-dict — narrower surface than the
+        full config (no API keys, no plugin settings).
+
+        Response shape::
+
+            {"model": {"provider": "opencode-go", "default": "mimo-v2.5",
+                       "base_url": "https://...", "api_mode": "..."}}
+
+        On any read failure (file missing, YAML invalid, etc.) returns
+        ``{"model": {}}`` with status 200 — callers degrade gracefully.
+        """
+        if (resp := _check_auth(request, auth_key)) is not None:
+            return resp
+        try:
+            import yaml
+            from hermes_constants import get_hermes_home
+        except Exception:
+            logger.exception("[myah-admin] config endpoint: failed to import deps")
+            return web.json_response({"model": {}}, status=200)
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return web.json_response({"model": {}}, status=200)
+
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            logger.exception("[myah-admin] config endpoint: failed to read config.yaml")
+            return web.json_response({"model": {}}, status=200)
+
+        model_block = cfg.get("model")
+        if not isinstance(model_block, dict):
+            return web.json_response({"model": {}}, status=200)
+
+        # Whitelist fields — never echo a key called "api_key" or similar
+        # secret-ish name. The hermes config.yaml model block currently
+        # has provider/default/base_url/api_mode only, all non-secret.
+        safe_model = {
+            "provider": str(model_block.get("provider") or ""),
+            "default": str(model_block.get("default") or ""),
+            "base_url": str(model_block.get("base_url") or ""),
+            "api_mode": str(model_block.get("api_mode") or ""),
+        }
+        return web.json_response({"model": safe_model})
+
     async def gateway_restart(request: "web.Request") -> "web.Response":
         """Busy-check + ``supervisorctl restart hermes``.
 
@@ -253,6 +308,7 @@ def _make_handlers(runner: "GatewayRunner", auth_key: Optional[str]):
         "reload_mcp": reload_mcp,
         "disconnect_mcp": disconnect_mcp,
         "gateway_restart": gateway_restart,
+        "get_hermes_config": get_hermes_config,
     }
 
 
@@ -311,7 +367,11 @@ def register_runtime_admin_routes(
         "/myah/v1/admin/gateway/restart",
         handlers["gateway_restart"],
     )
+    app.router.add_get(
+        "/myah/v1/admin/config",
+        handlers["get_hermes_config"],
+    )
 
     logger.info(
-        "[myah-admin] runtime-control routes registered (9 endpoints under /myah/v1/admin/)"
+        "[myah-admin] runtime-control routes registered (10 endpoints under /myah/v1/admin/)"
     )
