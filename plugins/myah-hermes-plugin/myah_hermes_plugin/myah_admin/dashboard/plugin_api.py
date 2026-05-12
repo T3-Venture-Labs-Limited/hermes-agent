@@ -49,6 +49,7 @@ from fastapi import APIRouter
 
 from . import (
     _common,  # noqa: F401  — registered for side effects (sub-routers depend on its module-level singletons)
+    _env,
     _providers,
     _sessions_and_lifecycle,
     _skills_plugins_mcp,
@@ -83,3 +84,4 @@ router.include_router(_soul_and_config.router)
 router.include_router(_skills_plugins_mcp.router)
 router.include_router(_providers.router)
 router.include_router(_sessions_and_lifecycle.router)
+router.include_router(_env.router)
