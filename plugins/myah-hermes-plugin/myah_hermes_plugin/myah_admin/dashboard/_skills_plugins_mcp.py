@@ -190,10 +190,16 @@ router = APIRouter(dependencies=[Depends(require_session_token)])
 
 # ── Skills ──────────────────────────────────────────────────────────────────
 #
-# The legacy GET /skills (list) is intentionally NOT ported — Hermes ships
-# its own ``GET /api/skills`` endpoint that lists skills uniformly across
-# CLI / dashboard / gateway. The legacy single-skill GET has no Hermes
-# equivalent and is ported below.
+# Hermes ships its own ``GET /api/skills`` endpoint that lists skills
+# uniformly across CLI / dashboard / gateway. The single-skill GET has no
+# Hermes equivalent and is ported below.
+#
+# Phase 7.7 plugin migration (2026-05-12): the platform's list-skills call
+# is being migrated to /api/plugins/myah-admin/skills via a loopback
+# proxy in a follow-up PR (see _proxy.proxy_to_native). The legacy
+# ``GET /skills`` list endpoint stays unimplemented in this file — the
+# loopback wrapper lives at the bottom under "Toolsets / Skills (loopback
+# to upstream)" rather than reimplementing the listing here.
 
 
 @router.get('/skills/{name}')
@@ -504,9 +510,11 @@ async def remove_mcp(name: str) -> dict[str, Any]:
 
 # ── Toolsets (write side only) ──────────────────────────────────────────────
 #
-# The legacy GET /toolsets is intentionally NOT ported — Hermes ships
-# ``GET /api/tools/toolsets`` natively. Only the toggle write handler
-# moves here.
+# Hermes ships ``GET /api/tools/toolsets`` natively. The read-side
+# loopback wrapper that the platform consumes lives at the bottom of
+# this file under "Toolsets / Skills (loopback to upstream)" (Phase 7.7
+# plugin migration, 2026-05-12). This block keeps the toggle (write)
+# handler that writes ``config.yaml``'s ``disabled_toolsets`` list.
 
 
 @router.patch('/toolsets/{name}')
@@ -539,3 +547,26 @@ async def toggle_toolset(name: str, body: ToggleToolsetBody) -> dict[str, Any]:
         )
 
     return {'name': name, 'enabled': body.enabled}
+
+
+# ── Toolsets / Skills (loopback to upstream) ───────────────────────────────
+# Phase 7.7 plugin migration (2026-05-12): the platform used to hit upstream
+# /api/tools/toolsets + /api/skills directly via the dashboard auth gate.
+# That broke when production flipped to the stock image (no env-var token
+# override). We now proxy through the plugin's auth-exempt namespace; the
+# upstream handler stays the source of truth for shape + capabilities.
+# See docs/superpowers/specs/2026-05-12-plugin-dashboard-migration-design.md.
+
+from ._proxy import proxy_to_native  # noqa: E402
+
+
+@router.get('/toolsets')
+async def get_toolsets() -> list[dict]:
+    """Plugin-namespace mirror of /api/tools/toolsets (web_server.py:2745).
+
+    Forwards via the loopback proxy so upstream's toolset resolution stays
+    the source of truth. Lives under /api/plugins/myah-admin/* so the
+    dashboard's auth middleware exempts it from the random _SESSION_TOKEN
+    check — the proxy supplies that token internally.
+    """
+    return await proxy_to_native('GET', '/api/tools/toolsets')
