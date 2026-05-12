@@ -478,3 +478,34 @@ async def put_global_model(
         "provider": result.target_provider,
         "warning": getattr(result, "warning_message", None) or None,
     }
+
+
+# ── Sessions list + messages (Phase 7.7 plugin migration — loopback) ──────
+# See docs/superpowers/specs/2026-05-12-plugin-dashboard-migration-design.md.
+
+from ._proxy import proxy_to_native  # noqa: E402
+
+
+@router.get("/sessions")
+async def list_sessions(limit: int = 50, offset: int = 0) -> dict:
+    """Plugin-namespace mirror of GET /api/sessions.
+
+    Lists sessions from upstream's SessionDB. Upstream returns
+    ``{sessions, total, limit, offset}`` — we pass it through unchanged.
+    """
+    return await proxy_to_native(
+        "GET", "/api/sessions", params={"limit": limit, "offset": offset},
+    )
+
+
+@router.get("/sessions/{session_id}/messages")
+async def get_session_messages_proxy(session_id: str) -> dict:
+    """Plugin-namespace mirror of GET /api/sessions/{id}/messages.
+
+    Upstream's resolve_session_id + SessionDB.get_messages stay the source
+    of truth — we never re-implement. Upstream returns
+    ``{session_id, messages}``.
+    """
+    return await proxy_to_native(
+        "GET", f"/api/sessions/{session_id}/messages",
+    )
