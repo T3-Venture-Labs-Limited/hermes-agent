@@ -554,3 +554,36 @@ async def get_last_reseed(
         content=_json.dumps(result),
         media_type="application/json",
     )
+
+
+# ── Config endpoints (Phase 7.7 plugin migration — loopback) ──────────────
+# See docs/superpowers/specs/2026-05-12-plugin-dashboard-migration-design.md.
+
+from ._proxy import proxy_to_native  # noqa: E402
+
+
+@router.get('/config')
+async def get_full_config() -> dict:
+    """Plugin-namespace mirror of GET /api/config.
+
+    Upstream's _normalize_config_for_web + _* key stripping
+    (web_server.py:856) stays the source of truth — we never re-implement.
+    """
+    return await proxy_to_native('GET', '/api/config')
+
+
+@router.put('/config')
+async def put_full_config(body: dict) -> dict:
+    """Plugin-namespace mirror of PUT /api/config.
+
+    Upstream's _denormalize_config_from_web (web_server.py:1161) stays
+    the source of truth. Body shape: ``{"config": <dict>}`` per upstream's
+    ConfigUpdate model.
+    """
+    return await proxy_to_native('PUT', '/api/config', json_body=body)
+
+
+@router.get('/config/schema')
+async def get_config_schema() -> dict:
+    """Plugin-namespace mirror of GET /api/config/schema."""
+    return await proxy_to_native('GET', '/api/config/schema')
