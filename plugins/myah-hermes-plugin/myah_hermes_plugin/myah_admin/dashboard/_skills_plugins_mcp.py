@@ -570,3 +570,13 @@ async def get_toolsets() -> list[dict]:
     check — the proxy supplies that token internally.
     """
     return await proxy_to_native('GET', '/api/tools/toolsets')
+
+
+@router.get('/skills')
+async def list_skills() -> list[dict]:
+    """Plugin-namespace mirror of GET /api/skills (web_server.py:2720).
+
+    Forwards via the loopback proxy so upstream's skill resolution stays
+    the source of truth.
+    """
+    return await proxy_to_native('GET', '/api/skills')
