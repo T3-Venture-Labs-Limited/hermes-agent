@@ -381,3 +381,56 @@ async def delete_all_credentials(provider_id: str) -> dict:
         remove_env_value(env_var)
 
     return {"ok": True}
+
+
+# ── OAuth device-flow loopback handlers (Phase 7.7 plugin migration) ────────
+# See docs/superpowers/specs/2026-05-12-plugin-dashboard-migration-design.md.
+
+from ._proxy import proxy_to_native  # noqa: E402
+
+
+class _OAuthSubmitBody(BaseModel):
+    session_id: str
+    code: str
+
+
+@router.post(
+    '/providers/oauth/{provider_id}/start',
+    dependencies=[Depends(require_session_token)],
+)
+async def oauth_start(provider_id: str) -> dict:
+    """Plugin-namespace mirror of POST /api/providers/oauth/{id}/start."""
+    return await proxy_to_native('POST', f'/api/providers/oauth/{provider_id}/start')
+
+
+@router.get(
+    '/providers/oauth/{provider_id}/poll/{session_id}',
+    dependencies=[Depends(require_session_token)],
+)
+async def oauth_poll(provider_id: str, session_id: str) -> dict:
+    """Plugin-namespace mirror of GET /api/providers/oauth/{id}/poll/{session_id}."""
+    return await proxy_to_native(
+        'GET', f'/api/providers/oauth/{provider_id}/poll/{session_id}',
+    )
+
+
+@router.post(
+    '/providers/oauth/{provider_id}/submit',
+    dependencies=[Depends(require_session_token)],
+)
+async def oauth_submit(provider_id: str, body: _OAuthSubmitBody) -> dict:
+    """Plugin-namespace mirror of POST /api/providers/oauth/{id}/submit (PKCE)."""
+    return await proxy_to_native(
+        'POST',
+        f'/api/providers/oauth/{provider_id}/submit',
+        json_body=body.model_dump(),
+    )
+
+
+@router.delete(
+    '/providers/oauth/sessions/{session_id}',
+    dependencies=[Depends(require_session_token)],
+)
+async def oauth_cancel(session_id: str) -> dict:
+    """Plugin-namespace mirror of DELETE /api/providers/oauth/sessions/{id}."""
+    return await proxy_to_native('DELETE', f'/api/providers/oauth/sessions/{session_id}')

@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
 
 [project.entry-points."hermes_agent.plugins"]
 # Per Hermes plugin docs (website/docs/guides/build-a-hermes-plugin.md):
